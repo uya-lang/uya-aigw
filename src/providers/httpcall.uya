@@ -92,9 +92,15 @@ export fn htc_call_free(call: &HtcCall) void {
     // TLS-09E：`tlsx_read_deadline_async`（事件通知版）已经能按 deadline 读到 TLS 记录
     // （实测 4 条 record 全部读到并解密），但流式路径组装出来仍是 events=0，说明问题在
     // 记录重组/SSE 这一侧，不在等待原语。定位完成前保持无超时读，保证 e2e 绿。
-    _ = deadline;
-    const n: usize = try @await tlsx_read_async(&call.conn,
-        &call.body.ptr[call.body.len], room);
+    // `deadline` 是**空闲时长**（毫秒，0 = 不设超时）：流式每个事件给一份预算，
+    // 到点返回 0 让上层收尾；非流式仍走无超时读，由连接级超时兜底。
+    var n: usize = 0;
+    if deadline == 0 {
+        n = try @await tlsx_read_async(&call.conn, &call.body.ptr[call.body.len], room);
+    } else {
+        n = try @await tlsx_read_deadline_async(&call.conn,
+            &call.body.ptr[call.body.len], room, deadline);
+    }
     if n == 0 {
         return 0;
     }

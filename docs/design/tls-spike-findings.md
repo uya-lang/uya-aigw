@@ -159,3 +159,32 @@ socket 状态/已缓冲数据之间。下一步应打印 `sys_poll` 的返回值
 
 代码现状：`tlsx_read_deadline_async` 保持事件通知实现（未接入 `htc_read_more_async`），
 `httpcall` 走无超时读，e2e `PROV-ALL-OK`。
+### 真正根因（已修复）：`@async_fn` 嵌套太深，Waker IO 槽耗尽
+
+把 `async_wait_readable` 的 **Pending 路径**跑起来之后，错误稳定复现在「需要等」的时刻，
+数据已在内核缓冲里时却能直接读成功。原因是 Waker IO 槽是有限资源
+（`WAKER_IO_SLOT_MAX = 4`），而当时的调用链是：
+
+```
+htc_next_event_async → htc_read_more_async → tlsx_read_deadline_async
+                     → tlsx_fill_deadline_async → tlsx_wait_readable_idle_async
+                     → async_wait_readable        (这里要注册槽)
+```
+
+六层 `@async_fn`，等真正需要注册等待时槽已经被上层占满，于是立刻返回错误 → 上层看到
+`rr=0` → `events=0`。四种「换个等待原语」的尝试都因此失败——换的是等待方式，没换嵌套深度。
+
+修复：把等待、record 分帧、解密**压进同一个 `@async_fn`**
+（`tlsx_read_deadline_async`），链路降到四层
+（`next_event → read_more → read_deadline → async_wait_readable`），并在函数内用
+同步 `https_read_some` 读取、would-block 时才 `@await async_wait_readable`。
+
+验证（`tests/provider_spike.sh`）：
+
+```
+PROV-OK stream events=4 done=1
+PROV-OK stall events=1 idle_timeout=1 elapsed=2041   # 上游发一条后不再发，2 s 空闲预算到点返回
+PROV-ALL-OK
+```
+
+`stall` 用例是真正的验收点：上游半开时不挂住，按空闲预算收尾。

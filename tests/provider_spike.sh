@@ -40,7 +40,7 @@ PY
 )
 
 cat > "$TMP/srv.py" <<'PY'
-import http.server, ssl, sys
+import http.server, ssl, sys, time
 port, cert, key = int(sys.argv[1]), sys.argv[2], sys.argv[3]
 
 class H(http.server.BaseHTTPRequestHandler):
@@ -57,6 +57,18 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length", "0"))
         self.rfile.read(n)
+        stall = self.path == "/v1/stall"
+        if self.headers.get("Accept") == "text/event-stream" and stall:
+            # TLS-09E：发一条事件后就**不再发**（模拟上游半开），客户端必须靠空闲超时收尾
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            payload = b"data: {\"i\":0}\n\n"
+            self.wfile.write(("%x\r\n" % len(payload)).encode() + payload + b"\r\n")
+            self.wfile.flush()
+            time.sleep(30)
+            return
         if self.headers.get("Accept") == "text/event-stream":
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")

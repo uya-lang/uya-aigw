@@ -388,74 +388,75 @@ export @async_fn fn tlsx_read_async(c: &TlsxConn, out: &byte, max: usize) Future
     }
 }
 
-/// 等 fd 可读（事件通知，非轮询）：1=可读，0=超时，-1=错误。
-/// 用 std 的 readiness substrate `async_wait_readable`：它注册 Waker，由事件循环回调，
-/// 到 deadline 自己返回 `error.AsyncDeadlineExceeded`。
-@async_fn fn tlsx_wait_readable_idle_async(fd: i32, deadline: u64) Future<!i32> {
-    const w: !usize = @await async_wait_readable(fd, deadline);
-    _ = w catch |_| {
-        return 0;                   // AsyncDeadlineExceeded / Cancelled：本轮结束
-    };
-    return 1;
-}
-
-/// 在 deadline（绝对毫秒，0 = 不设超时）内把 buf[0..need] 填满；超时/对端关闭返回 false。
-@async_fn fn tlsx_fill_deadline_async(fd: i32, buf: &byte, need: usize,
-    deadline: u64) Future<!bool> {
-    var have: usize = 0;
-    while have < need {
-        const w: i32 = try @await tlsx_wait_readable_idle_async(fd, deadline);
-        if w != 1 {
-            return false;
-        }
-        while have < need {
-            const rr: !usize = https_read_some(fd, &buf[have], need - have);
-            const n: usize = rr catch |err| {
-                if @error_id(err) == @error_id(error.ReadWouldBlock) {
-                    break;                  // 假唤醒：回去再等一次
-                }
-                return false;
-            };
-            if n == 0 {
-                return false;
-            }
-            have = have +% n;
-        }
-    }
-    return true;
-}
-
-/// 带空闲超时的应用数据读（TLS-09E）。`idle_ms` 是**时长**（0 = 不设超时）。
-/// 返回 0 表示「本轮结束」（超时、关闭、alert 都算）。
+/// 带空闲超时的应用数据读（TLS-09E）。
+///
+/// `idle_ms` 是**时长**，0 表示不设超时；返回 0 表示「本轮结束」（超时/关闭/alert）。
+///
+/// 关键设计：
+/// 1. **等待走事件通知**：`async_wait_readable` 注册 Waker，由事件循环回调，到点返回
+///    `error.AsyncDeadlineExceeded`；不用轮询、不占 CPU。
+/// 2. **所有逻辑压在一个 @async_fn 里**：`async_wait_readable` 的 Pending 路径要占一个
+///    Waker IO 槽，而槽是有限资源（`WAKER_IO_SLOT_MAX = 4`）；多层 `@async_fn` 嵌套
+///    （next_event → read_more → deadline → fill → wait）会在真正需要等的时候把槽耗光，
+///    表现为「数据已到就能读、需要等就立刻返回 0」——这正是早先四种写法全部 events=0 的
+///    原因（findings §9）。摊平后只剩 next_event → read_more → 本函数 → wait 四层。
+/// 3. 读用同步 `https_read_some`：它直接读 socket，would-block 返回
+///    `error.ReadWouldBlock`，此时回去等事件即可。
 export @async_fn fn tlsx_read_deadline_async(c: &TlsxConn, out: &byte, max: usize,
     idle_ms: u64) Future<!usize> {
     if idle_ms == 0 {
         return try @await tlsx_read_async(c, out, max);
     }
     var deadline: u64 = 0;
-    if idle_ms != 0 {
-        const now: u64 = now_ms() catch |_| { 0 as u64; };
-        if now != 0 {
-            deadline = now +% idle_ms;
-        }
+    const now: u64 = now_ms() catch |_| { 0 as u64; };
+    if now != 0 {
+        deadline = now +% idle_ms;
     }
     var rec: [byte: TLSX_REC_MAX] = [0: TLSX_REC_MAX];
     while true {
-        const okh: bool = try @await tlsx_fill_deadline_async(c.fd, &rec[0], 5, deadline);
-        if !okh {
-            return 0 as usize;
-        }
-        const len: usize = ((rec[3] as usize) * 256) + (rec[4] as usize);
-        if (5 as usize) +% len > TLSX_REC_MAX {
-            return error.ConnectionClosed;
-        }
-        if len > 0 {
-            const okp: bool = try @await tlsx_fill_deadline_async(c.fd, &rec[5], len, deadline);
-            if !okp {
+        var have: usize = 0;
+        var need: usize = 5;
+        var rl: usize = 0;
+        while true {
+            if have >= need {
+                if need == (5 as usize) {
+                    const len: usize = ((rec[3] as usize) * 256) + (rec[4] as usize);
+                    if (5 as usize) +% len > TLSX_REC_MAX {
+                        return error.ConnectionClosed;
+                    }
+                    rl = (5 as usize) +% len;
+                    need = rl;
+                    continue;
+                }
+                break;
+            }
+            var blocked: bool = false;
+            var failed: bool = false;
+            var n: usize = 0;
+            const rr: !usize = https_read_some(c.fd, &rec[have], need - have);
+            n = rr catch |err| {
+                if @error_id(err) == @error_id(error.ReadWouldBlock) {
+                    blocked = true;
+                } else {
+                    failed = true;
+                }
+                0 as usize;
+            };
+            if failed {
                 return 0 as usize;
             }
+            if blocked {
+                const w: !usize = @await async_wait_readable(c.fd, deadline);
+                _ = w catch |_| {
+                    return 0 as usize;      // 超时或取消
+                };
+                continue;
+            }
+            if n == 0 {
+                return 0 as usize;          // 对端关闭
+            }
+            have = have +% n;
         }
-        const rl: usize = (5 as usize) +% len;
         const rtype: byte = rec[0];
         var plen: usize = 0;
         var cons: usize = 0;
