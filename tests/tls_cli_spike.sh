@@ -46,7 +46,9 @@ UYA_ROOT="$UYA_ROOT" "$UYA" build \
   src/foundation/buf.uya src/net/rsav.uya src/net/x509min.uya src/net/chainx.uya \
   src/net/urlx.uya src/net/dnsx.uya src/net/tcpx.uya src/net/tlsx.uya src/net/tlsx_conn.uya \
   src/net/httpc.uya src/net/ssex.uya src/net/httpc_pool.uya src/net/proxyx.uya \
-  src/providers/http.uya src/providers/httpcall.uya src/cli/tls_cmd.uya src/app.uya \
+  src/providers/http.uya src/providers/httpcall.uya src/cli/tls_cmd.uya \
+  src/core/money.uya src/core/reqlog.uya src/core/dbx.uya \
+  src/net/httpsrv.uya src/net/serve.uya src/app.uya \
   -o build/aigw
 
 OUT=$(./build/aigw tls probe localhost --port "$PORT" --ca "$TMP/root.pem")
