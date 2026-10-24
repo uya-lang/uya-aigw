@@ -1,0 +1,95 @@
+// src/net/tcpx.uya — 非阻塞 TCP 连接（供内置 HTTP/TLS 供应商使用）
+//
+// 分工：
+//  - 本模块只负责「建 socket → 设选项 → 非阻塞 connect → 超时/错误归类 → 返回 fd」；
+//  - 非阻塞 connect 的等待复用 std.async 的 async_connect（already nonblocking + writable wait）；
+//  - 同步包装 tcpx_connect_v4 仅供 CLI/测试/启动期使用，请求路径用 tcpx_connect_v4_async。
+//
+// 错误分类（与 TLS/HTTP 层分开，修法不同）：
+//  - error.TcpConnectFailed：socket/connect 失败（拒绝、无路由等）；
+//  - error.TcpTimeout：等可写超时；
+//  - error.TcpBadAddress：地址长度/参数非法。
+
+use std.async;
+use std.time;
+use libc.syscall;
+
+export error TcpConnectFailed;
+export error TcpTimeout;
+export error TcpBadAddress;
+
+// Linux 的 SO_KEEPALIVE / SO_ERROR（libc.syscall 未导出，按平台常量补）。
+const TCPX_SO_ERROR: i32 = 4;
+const TCPX_SO_KEEPALIVE: i32 = 9;
+
+/// 把 IPv4 + 端口写成 16 字节 sockaddr_in（小端 family、大端端口）。
+export fn tcpx_sockaddr_v4(ip: &const byte, port: u16, out: &byte) void {
+    var i: usize = 0;
+    while i < 16 {
+        out[i] = 0;
+        i = i + 1;
+    }
+    out[0] = 2; // AF_INET
+    out[1] = 0;
+    out[2] = (port / 256) as byte;
+    out[3] = (port % (256 as u16)) as byte;
+    out[4] = ip[0];
+    out[5] = ip[1];
+    out[6] = ip[2];
+    out[7] = ip[3];
+}
+
+export fn tcpx_set_nonblocking(fd: i32) !void {
+    const flags: i32 = try sys_fcntl(fd, F_GETFL, 0);
+    _ = try sys_fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+export fn tcpx_set_nodelay(fd: i32) void {
+    var one: i32 = 1;
+    _ = sys_setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one as &void, 4) catch |_| { 0; };
+}
+
+export fn tcpx_set_keepalive(fd: i32) void {
+    var one: i32 = 1;
+    _ = sys_setsockopt(fd, SOL_SOCKET, TCPX_SO_KEEPALIVE, &one as &void, 4) catch |_| { 0; };
+}
+
+export fn tcpx_close(fd: i32) void {
+    if fd >= 0 {
+        _ = sys_close(fd) catch |_| { 0; };
+    }
+}
+
+/// 异步连接 IPv4。deadline_ms 为绝对毫秒（0 表示不设超时）；失败时内部关闭 fd。
+export @async_fn fn tcpx_connect_v4_async(ip: &const byte, port: u16,
+    deadline_ms: u64) Future<!i32> {
+    if port == 0 {
+        return error.TcpBadAddress;
+    }
+    const fd: i32 = try sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    tcpx_set_nodelay(fd);
+    tcpx_set_keepalive(fd);
+    var addr: [byte: 16] = [0: 16];
+    tcpx_sockaddr_v4(ip, port, &addr[0]);
+    const r: !i32 = @await async_connect(fd, &addr[0] as &void, 16 as u32, deadline_ms);
+    const okfd: i32 = r catch |err| {
+        tcpx_close(fd);
+        return err;
+    };
+    return okfd;
+}
+
+/// 同步包装：仅供 CLI/测试/启动期使用。timeout_ms=0 表示不设超时。
+export fn tcpx_connect_v4(ip: &const byte, port: u16, timeout_ms: u32) !i32 {
+    if port == 0 {
+        return error.TcpBadAddress;
+    }
+    var deadline: u64 = 0;
+    if timeout_ms > 0 {
+        const now: u64 = try now_ms();
+        deadline = now +% (timeout_ms as u64);
+    }
+    const fut: Future<!i32> = tcpx_connect_v4_async(ip, port, deadline);
+    const fd: i32 = try block_on<i32>(fut);
+    return fd;
+}

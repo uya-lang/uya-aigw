@@ -1,0 +1,86 @@
+// tests/test_tcpx.uya — 非阻塞 TCP 连接单元测试（本机回环，不依赖外网）
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+use libc.syscall;
+
+fn make_listener(port_out: &u16) !i32 {
+    const fd: i32 = try sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    var one: i32 = 1;
+    _ = sys_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one as &void, 4) catch |_| { 0; };
+    var ip: [byte: 4] = [0: 4];
+    ip[0] = 127;
+    ip[3] = 1;
+    var addr: [byte: 16] = [0: 16];
+    tcpx_sockaddr_v4(&ip[0], 0, &addr[0]);
+    _ = try sys_bind(fd, &addr[0] as &void, 16 as u32);
+    _ = try sys_listen(fd, 8);
+    var out: [byte: 16] = [0: 16];
+    var olen: u32 = 16;
+    _ = try sys_getsockname(fd, &out[0] as &void, &olen);
+    port_out[0] = ((out[2] as u16) *% 256) +% (out[3] as u16);
+    return fd;
+}
+
+fn test_sockaddr_v4() !void {
+    var ip: [byte: 4] = [0: 4];
+    ip[0] = 1;
+    ip[1] = 2;
+    ip[2] = 3;
+    ip[3] = 4;
+    var addr: [byte: 16] = [0: 16];
+    tcpx_sockaddr_v4(&ip[0], 0x1234, &addr[0]);
+    try assert_eq_i32(addr[0] as i32, 2);
+    try assert_eq_i32(addr[1] as i32, 0);
+    try assert_eq_i32(addr[2] as i32, 0x12);
+    try assert_eq_i32(addr[3] as i32, 0x34);
+    try assert_eq_i32(addr[4] as i32, 1);
+    try assert_eq_i32(addr[7] as i32, 4);
+}
+
+fn test_connect_ok() !void {
+    var port: u16 = 0;
+    const lfd: i32 = try make_listener(&port);
+    defer { tcpx_close(lfd); }
+    try assert_eq_bool(port > (0 as u16), true);
+
+    var ip: [byte: 4] = [0: 4];
+    ip[0] = 127;
+    ip[3] = 1;
+    const cfd: i32 = try tcpx_connect_v4(&ip[0], port, 2000);
+    try assert_eq_bool(cfd >= 0, true);
+    tcpx_close(cfd);
+}
+
+fn test_connect_refused() !void {
+    var port: u16 = 0;
+    const lfd: i32 = try make_listener(&port);
+    tcpx_close(lfd);
+
+    var ip: [byte: 4] = [0: 4];
+    ip[0] = 127;
+    ip[3] = 1;
+    var failed: bool = false;
+    _ = tcpx_connect_v4(&ip[0], port, 500) catch |_| {
+        failed = true;
+        0;
+    };
+    try assert_eq_bool(failed, true);
+}
+
+fn test_bad_port() !void {
+    var ip: [byte: 4] = [0: 4];
+    ip[0] = 127;
+    ip[3] = 1;
+    var failed: bool = false;
+    _ = tcpx_connect_v4(&ip[0], 0, 100) catch |_| {
+        failed = true;
+        0;
+    };
+    try assert_eq_bool(failed, true);
+}
+
+test "sockaddr_v4" { run_test("sockaddr_v4", test_sockaddr_v4); }
+test "connect_ok" { run_test("connect_ok", test_connect_ok); }
+test "connect_refused" { run_test("connect_refused", test_connect_refused); }
+test "bad_port" { run_test("bad_port", test_bad_port); }

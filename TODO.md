@@ -24,7 +24,6 @@ Phase A0 (SQLite spike) 可与 Phase T 并行 ─────┘
 
 | ID | 任务 | 验收 | 依赖 |
 |---|---|---|---|
-| TLS-03 | `src/net/tcpx.uya`：非阻塞 connect、`SO_ERROR`、超时、keepalive | 拒绝/超时/IPv6 用例；失败分类正确 | TLS-01 |
 | TLS-04 | `src/net/tlsx.uya`：上下文、四档信任、TOFU/pin 存储、指纹 | pin 匹配/不匹配；TOFU 变更报警；`none` 需显式开关 | TLS-03 |
 | TLS-05 | **spike**：`https_handshake_async` + 读写接入自建事件循环 | 1k 并发流不阻塞；取消可回收；记录结论 | TLS-04 |
 | TLS-06 | `src/net/httpc.uya`：请求构造、响应解析、chunked、1xx、限长 | Content-Length/chunked/EOF/畸形响应用例 | TLS-05 |
