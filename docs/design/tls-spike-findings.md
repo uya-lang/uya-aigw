@@ -211,9 +211,46 @@ $ curl -sv http://127.0.0.1:18994/healthz
    `.value`）。必须先 `const rf: !T = @await f();`，再 `const v: T = rf catch |_| {...};`。
 3. `Future<!void>` 的 async 函数在 `_ = @await f() catch ...` 里同样会炸，改成 `Future<!i32>`。
 
-脚本化回归（`tests/serve_smoke.sh`）最后一版仍在「起服务→curl」这一步失败（手工同样二进制却正常，
-怀疑脚本里的就绪探测与 `set -e` 组合），因此本任务**未提交**，代码已回退，等下一轮补上再进
-`run_all.sh`。
+脚本里那轮「起服务→curl」失败的真因是**上一轮遗留的 `aigw serve` 进程占着端口**，
+加上 `[ -x build/aigw ]` 在构建失败时仍会用旧二进制通过检查（见下面运维教训）。修正后
+`tests/serve_smoke.sh` 已进 `run_all.sh`，输出 `SERVE-ALL-OK`。
+
+### A1 服务端：单线程 epoll 事件循环（2026-10-24 重写）
+
+首版是「串行 accept + 每连接 `@await` 到底」，能回包但一个连接卡住就堵住整台服务器。
+A1 的验收是 **64 MiB body / 512 并发 SSE / 线程数恒 1**，所以第二轮把连接模型换成
+显式状态机（`src/net/serve.uya`）：
+
+```
+HEAD ──有包体──► BODY ──排空──► WRITE ──写完──► HEAD（keep-alive）
+  └──────────────无包体──────────────────────────► SSE（chunked 慢推，20 事件/20 ms）
+```
+
+要点：
+
+- **不用 `@async_fn` 写连接**。等待点合并到一个 epoll 事件里，没有嵌套、不抢 Waker 的
+  4 个 IO 槽（TLS-09E 那条约束的放大版）。
+- 槽表是模块级 `var [SrvConn: 1024]`（.bss，按需提交），每槽 16 KiB 读 + 8 KiB 写。
+- 包体从不整块驻留：Content-Length 与 chunked 都按「缓冲区里有多少消费多少」推进，
+  64 MiB 只用了固定缓冲。
+- SSE 用 chunked，一轮事件发完补 `0\r\n\r\n` 并 close；验收脚本开 512 条连接同时读，
+  0.5 s 全绿（串行要几分钟，能过即真并发）。
+- 停机：`signal(SIGTERM/SIGINT)` 只置标志，主循环摘掉监听 → 空闲连接直接关、在途连接
+  `keep=false` 自然收尾 → 最多等 2 s，返回 0。`SIGPIPE` 置 `SIG_IGN`（对端提前断开不能打死进程）。
+- 验收脚本另外断言 `Threads: 1`（`/proc/<pid>/status`）与 SIGTERM 退出码 0。
+
+本轮新踩的两个 Uya 0.11 后端坑（都已绕开，值得回上游修）：
+
+1. `libc.syscall` 没有导出 `EPOLLERR`/`EPOLLHUP`（只有 `EPOLLIN`/`EPOLLOUT`/`EPOLL_CTL_*`），
+   直接用会得到 `‘EPOLLHUP’ undeclared`。→ 本地按 Linux 值补常量（0x008 / 0x010）。
+2. `const x: usize = if a < b { a } else { b as usize };` —— **分支里带 `as` 强制转换**时，
+   生成的 C 是
+   `({ const size_t __uya_ifexpr_0; if (...) { __uya_ifexpr_0 = a; } else { __uya_ifexpr_0 = (size_t)b; } ... })`，
+   对只读变量赋值，编译失败。两个分支都是裸标识符时不触发。→ 改成 `var x = a; if (...) { x = b as usize; }`。
+
+另外，上一轮那条「`&"lit"[0]` 生成非法 C / 切片字面量赋给变量生成 `&(struct ...)`」的
+编译器 bug 已在 uya 侧修掉（`fix(codegen): 切片表达式的 & 生成切片值而不是取地址`，已进 uya `main`），
+`src/net/serve.uya` 里保留的 `srv_ptr` 只剩可读性意义，不再是必需。
 ### A1 服务端：Uya 0.11 的三条硬约束（实测，含踩坑过程）
 
 写 `src/net/serve.uya`（监听 + keep-alive + 包体排空 + 路由）时撞到三件事，

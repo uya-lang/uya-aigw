@@ -32,7 +32,6 @@ Phase A0 (SQLite spike) 可与 Phase T 并行 ─────┘
 
 | ID | 任务 | 验收 | 依赖 |
 |---|---|---|---|
-| A1 | 单线程 epoll 事件循环、0.0.0.0 监听、动态不限 body、SSE、优雅停机（**头部解析/响应写出已完成**：`src/net/httpsrv.uya`） | 64 MiB body；512 并发 SSE；线程数恒 1 | A0 |
 | A2 | schema/迁移 + users/keys/OTP/会话 + rate card + schedule 解析 + 每日备份 + journal | 登录→建 key→调用；时段单测；备份/恢复冒烟 | A1 |
 | A3 | 插件池：常驻、min/max、idle 回收、崩溃退避、cancel、ping/pong | 复用、缩容、崩溃恢复 | A1 |
 | A4 | chat 流/非流、快路径、tools、usage、分时 cost/price、批量落库 | SSE 对齐；金额与 preview 一致；落库不影响 p99 | A2/A3/TLS-09 |

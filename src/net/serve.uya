@@ -1,51 +1,159 @@
-// src/net/serve.uya — A1 的服务端骨架：监听 + keep-alive + 请求体排空 + 路由
+// src/net/serve.uya — A1 单线程 epoll 事件循环（监听 / 连接状态机 / SSE / 优雅停机）
 //
-// 覆盖的能力（用户验收里能先做的部分）：
-//   - `0.0.0.0:port` 监听，`--port 0` 由内核选端口（回归脚本用）
-//   - 每连接 keep-alive 循环：Content-Length 与 chunked 请求体都完整排空，
-//     保证同一个连接上的下一个请求不会读到上一个的包体
-//   - `Expect: 100-continue`：先回 100 再收 body
-//   - 请求体可以大于缓冲区（分片丢弃，不占内存），为后面 64 MiB 验收铺路
-//   - `/healthz`、`/v1/models`（占位）、其余 404、解析失败 400
+// 与首版（每连接 `@await` 到底、串行 accept）的区别：连接不再变成协程，而是
+// **显式状态机**。一个线程、一个 epoll、一张连接槽表，事件来了推进对应槽的状态：
 //
-// 还没做：并发（当前串行 accept，一个连接处理完才接下一个）、SSE 长连接、
-// 优雅停机的信号处理。这些留到 A1 后续，本文件只保证「能起、能回、不串包」。
+//   HEAD ──头部解析完成、有包体──► BODY ──排空──► WRITE ──写完──► HEAD（keep-alive）
+//     └────────────无包体──────────┴──────────────► SSE（chunked 分块慢推）
 //
-// 两个 Uya 0.11 的坑，本文件刻意绕开（详见 docs/design/tls-spike-findings.md §10）：
-//   1. `@async_fn` 里把**切片字面量**赋给局部变量或 `@await` 帧参数，会生成
-//      `x = &slice_tmp`（指针赋给结构体）：能编译，运行时拿到零缓冲。
-//      → 所有响应体/类型串都提升成模块级 `const`，异步函数里只引用标识符。
-//   2. `@await f() catch |_| {}` 写成表达式会生成非法 C。
-//      → 一律拆成 `const rf: !T = @await f();` + `const v: T = rf catch |_| ...;`
+// 为什么不用 `@async_fn` 写连接：TLS-09E 之后已知 `@async_fn` 的等待点是共享
+// Waker 的 4 个 IO 槽，嵌套一深就会在真正需要等待时耗尽；一个连接一个 future
+// 再叠 512 路并发，等于把这条约束放大 512 倍。状态机把「等待」退化成一个
+// epoll 事件，没有嵌套、没有槽位竞争。
 //
-// 异步嵌套深度守则（TLS-09E 的教训）：`serve_loop_async`(1) → `serve_conn_async`(2)
-// → `srv_fill`/`srv_send`(3) → `async_fd_read_future`/`async_fd_write_all`(4)。
-// 不要再往里加 `@async_fn` 层，否则 Waker IO 槽会在真正需要等待时耗尽。
+// 三条 Uya 0.11 硬约束仍然适用（详见 docs/design/tls-spike-findings.md §10）：
+//   1. 切片字面量赋给局部变量/常量曾经生成 `&(struct uya_slice_X){...}`（已修，
+//      但为了可读性这里只在模块级常量上用切片字面量）。
+//   2. 位运算两侧类型必须一致（`EPOLLIN as u32` 之类）。
+//   3. `i32` 溢出用 `+%`/`-%`；数组下标一律显式判界。
+//
+// 线程数恒 1：本文件不创建线程、不调用任何阻塞等待（accept/recv/send 全部
+// 非阻塞，唯一会阻塞的是 `epoll_wait` 的毫秒超时）。
 
 use libc.syscall;
+use libc.signal;
+use libc.errno;
 
-/// 单个连接的读写缓冲。请求体不需要整块驻留，所以 16 KiB 足够。
-export const SRV_REQ_CAP: usize = 16384;
+/// 单连接读缓冲。请求头必须一次装下；包体按块流式排空，不需要整块驻留。
+export const SRV_IO_CAP: usize = 16384;
+/// 单连接待写缓冲（响应头 + 一块包体/一个 SSE 事件）。
+export const SRV_OUT_CAP: usize = 8192;
+/// 同时在线连接上限：验收要求 512 并发 SSE，留一倍余量给探活/管理请求。
+export const SRV_MAX_CONNS: usize = 1024;
 export const SRV_BACKLOG: i32 = 128;
+
+/// 一次 `epoll_wait` 最多取回的事件数。
+const SRV_EV_MAX: i32 = 64;
+/// 有 SSE 在推、或正在停机时的轮询粒度（同时是 SSE 事件的定时精度）。
+const SRV_TICK_MS: i32 = 5;
+/// 全空闲时的轮询粒度（主要用于发现信号导致的停机）。
+const SRV_IDLE_MS: i32 = 200;
+/// 优雅停机的最长等待：超过就强行关连接。
+const SRV_SHUTDOWN_MS: u64 = 2000;
+/// A1 自测流：每个连接推多少个事件、相邻事件间隔多少毫秒。
+const SRV_SSE_EVENTS: u32 = 20;
+const SRV_SSE_GAP_MS: u64 = 20;
+/// `CLOCK_MONOTONIC`（libc.pthread 里有同名常量，这里不引入整个模块）。
+const SRV_CLOCK_MONOTONIC: i32 = 1;
+/// libc.syscall 只导出了 EPOLLIN/EPOLLOUT/EPOLL_CTL_*，err/hup 位在这里补齐。
+const SRV_EPOLLERR: u32 = 0x008;
+const SRV_EPOLLHUP: u32 = 0x010;
+
+// 连接状态
+const ST_FREE: i32 = 0;
+const ST_HEAD: i32 = 1;
+const ST_BODY: i32 = 2;
+const ST_WRITE: i32 = 3;
+const ST_SSE: i32 = 4;
+
+// chunked 包体解析阶段
+const CH_SIZE: i32 = 0;
+const CH_DATA: i32 = 1;
+const CH_CRLF: i32 = 2;
+const CH_TRAILER: i32 = 3;
+
+// 路由编号（解析头部时定下来，包体排空后直接按编号回包）
+const ROUTE_404: i32 = 0;
+const ROUTE_HEALTH: i32 = 1;
+const ROUTE_MODELS: i32 = 2;
+const ROUTE_SSE: i32 = 3;
+
+// 固定回包体（切片字面量放模块级常量：编译器已修，但这样也不会碰异步帧退化）
+const SRV_JSON_HEALTH: &[byte] = &"{\"ok\":true}"[0: 11];
+const SRV_JSON_MODELS: &[byte] = &"{\"object\":\"list\",\"data\":[]}"[0: 27];
+const SRV_JSON_404: &[byte] = &"{\"error\":\"not found\"}"[0: 21];
+const SRV_JSON_400: &[byte] = &"{\"error\":\"bad request\"}"[0: 23];
+const SRV_JSON_431: &[byte] = &"{\"error\":\"head too large\"}"[0: 26];
+const SRV_CTYPE_JSON: &[byte] = &"application/json"[0: 16];
+const SRV_CTYPE_SSE: &[byte] = &"text/event-stream"[0: 17];
+const SRV_SSE_LINE: &[byte] = &"data: {}\n\n"[0: 10];
 
 export error ListenFailed;
 export error BadIp;
 
-/// 从切片取底层指针。存在的唯一理由：`@async_fn` 的参数不能用切片类型
-/// （异步帧字段赋值会退化成「指针赋给结构体」），而 `&"x"[0]` 又会生成非法 C：
-/// 所以字面量统一走这个普通函数（普通调用的切片实参是合法的）。
-fn srv_ptr(s: &[byte]) &const byte {
-    return s.ptr;
-}
-
+/// 服务计数。`active`/`max_active` 用来验证并发度，`rejected` 记录槽位打满。
 export struct ServeStats {
     conns: u64,
     requests: u64,
     bad: u64,
+    active: u64,
+    max_active: u64,
+    sse: u64,
+    rejected: u64,
 }
 
-/// 点分十进制 → 打包的 4 字节（高位在前）。返回值而不是写 `&byte` 出参，
-/// 是为了绕开「异步链路里指针出参可能被丢写」这一整类问题。
+/// 一条连接的完整状态。槽表是模块级 `var`（.bss，按需提交），不放栈上。
+struct SrvConn {
+    fd: i32,
+    state: i32,
+    // 读缓冲：`[in_pos, in_len)` 是尚未消费的字节
+    in: [byte: SRV_IO_CAP],
+    in_len: usize,
+    in_pos: usize,
+    // 写缓冲：`[out_pos, out_len)` 是尚未发出的字节
+    out: [byte: SRV_OUT_CAP],
+    out_len: usize,
+    out_pos: usize,
+    route: i32,
+    keep: bool,
+    is_head_req: bool,
+    // 包体
+    body_left: u64,
+    chunked: bool,
+    chunk_left: u64,
+    chunk_phase: i32,
+    // SSE
+    sse_left: u32,
+    sse_next: u64,
+}
+
+var g_conns: [SrvConn: SRV_MAX_CONNS] = [];
+var g_stop: i32 = 0;
+var g_listen_fd: i32 = 0 - 1;
+var g_epfd: i32 = 0 - 1;
+
+/// SIGTERM/SIGINT 只置一个标志：真正的收尾在主循环里做（信号处理里不能分配、不能加锁）。
+fn srv_on_signal(signum: i32) void {
+    _ = signum;
+    g_stop = 1;
+}
+
+fn srv_stop_requested() i32 {
+    return g_stop;
+}
+
+/// 单调时钟毫秒。取不到时返回 0（SSE 会退化成每轮都推，不影响正确性）。
+fn srv_now_ms() u64 {
+    var ts: TimeSpec = TimeSpec{};
+    const r: !i32 = sys_clock_gettime(SRV_CLOCK_MONOTONIC, &ts);
+    _ = r catch {
+        return 0;
+    };
+    const secs: u64 = (ts.tv_sec as u64) * (1000 as u64);
+    const nanos: u64 = (ts.tv_nsec as u64) / (1000000 as u64);
+    return secs + nanos;
+}
+
+/// 从切片取底层指针（普通函数：`&"lit"[a: n]` 做普通调用实参是安全的）。
+fn srv_ptr(s: &[byte]) &const byte {
+    return s.ptr;
+}
+
+// ---------------------------------------------------------------
+// 监听
+// ---------------------------------------------------------------
+
+/// 点分十进制 → 打包的 4 字节（高位在前）。返回值而不是写 `&byte` 出参。
 export fn serve_parse_ipv4(s: &[byte]) !u32 {
     var octet: usize = 0;
     var val: u32 = 0;
@@ -80,7 +188,7 @@ export fn serve_parse_ipv4(s: &[byte]) !u32 {
     return packed;
 }
 
-/// 建监听 socket 并 listen。失败统一折叠成 `error.ListenFailed`。
+/// 建监听 socket 并 listen（非阻塞）。失败统一折叠成 `error.ListenFailed`。
 export fn serve_listen(ip: &[byte], port: u16) !i32 {
     const packed: u32 = serve_parse_ipv4(ip) catch |_| {
         return error.BadIp;
@@ -91,7 +199,6 @@ export fn serve_listen(ip: &[byte], port: u16) !i32 {
         _ = sys_close(fd) catch {};
         return error.ListenFailed;
     };
-    // 写进**本地数组**（不是指针出参），再交给 sockaddr 序列化。
     var ipb: [byte: 4] = [0: 4];
     ipb[0] = ((packed >> 24) & 255u32) as byte;
     ipb[1] = ((packed >> 16) & 255u32) as byte;
@@ -121,332 +228,700 @@ export fn serve_port(fd: i32) u16 {
     return ((out[2] as u16) * 256) + (out[3] as u16);
 }
 
-/// 回一个完整响应。1=成功，-1=出错。
-@async_fn fn srv_send(fd: i32, status: i32, body: &const byte, n: usize,
-    keep: bool) Future<!i32> {
-    var hdr: [byte: 512] = [0: 512];
-    const hn: usize = hsrv_resp_head(&hdr[0], 512, status, &"application/json"[0: 16], 16,
-        n as i64, false, keep);
-    const wh: !usize = @await async_fd_write_all(fd, &hdr[0], hn);
-    const rw: usize = wh catch |_| {
-        return -1;
-    };
-    if rw == 0 {
-        return -1;
-    }
-    if n > 0 {
-        const wb: !usize = @await async_fd_write_all(fd, body, n);
-        const rb: usize = wb catch |_| {
-            return -1;
-        };
-        if rb == 0 {
-            return -1;
+// ---------------------------------------------------------------
+// 槽表
+// ---------------------------------------------------------------
+
+fn srv_slot_of(fd: i32) i32 {
+    var i: usize = 0;
+    while i < SRV_MAX_CONNS {
+        if g_conns[i].fd == fd && g_conns[i].state != ST_FREE {
+            return i as i32;
         }
+        i = i + 1;
     }
-    return 1;
+    return 0 - 1;
 }
 
-/// 保证 `len[0] >= want`（`want <= SRV_REQ_CAP`）。1=凑够，0=对端关闭，-1=出错。
-@async_fn fn srv_fill(fd: i32, buf: &byte, len: &usize, want: usize) Future<!i32> {
-    if want > SRV_REQ_CAP {
-        return -1;
-    }
-    while len[0] < want {
-        if len[0] >= SRV_REQ_CAP {
-            return -1;
+fn srv_alloc_slot() i32 {
+    var i: usize = 0;
+    while i < SRV_MAX_CONNS {
+        if g_conns[i].state == ST_FREE {
+            return i as i32;
         }
-        const rf: !usize = @await async_fd_read_future(fd, &buf[len[0]],
-            SRV_REQ_CAP - len[0]);
-        const n: usize = rf catch |_| {
-            return -1;
-        };
-        if n == 0 {
-            return 0;
-        }
-        len[0] = len[0] +% n;
+        i = i + 1;
     }
-    return 1;
+    return 0 - 1;
 }
 
-/// 把 `buf[pos..len]` 移到缓冲区开头（不涉及 IO，所以是普通函数）。
-fn srv_compact(buf: &[byte], len: &usize, pos: &usize) void {
-    if pos[0] == 0 {
+fn srv_active_count() u64 {
+    var n: u64 = 0;
+    var i: usize = 0;
+    while i < SRV_MAX_CONNS {
+        if g_conns[i].state != ST_FREE {
+            n = n +% 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn srv_close_slot(slot: i32) void {
+    if slot < 0 || (slot as usize) >= SRV_MAX_CONNS {
+        return;
+    }
+    const i: usize = slot as usize;
+    const fd: i32 = g_conns[i].fd;
+    if fd >= 0 {
+        _ = sys_epoll_ctl_del(g_epfd, fd) catch {};
+        tcpx_close(fd);
+    }
+    g_conns[i].fd = 0 - 1;
+    g_conns[i].state = ST_FREE;
+    g_conns[i].in_len = 0;
+    g_conns[i].in_pos = 0;
+    g_conns[i].out_len = 0;
+    g_conns[i].out_pos = 0;
+    g_conns[i].sse_left = 0;
+    g_conns[i].chunked = false;
+    g_conns[i].body_left = 0;
+    g_conns[i].chunk_left = 0;
+    g_conns[i].chunk_phase = CH_SIZE;
+}
+
+/// 调整 fd 的 epoll 关注事件：平时只关心可读，有待写数据时加 EPOLLOUT。
+fn srv_set_interest(c: &SrvConn, want_write: bool) void {
+    var evs: u32 = EPOLLIN as u32;
+    if want_write {
+        evs = evs | (EPOLLOUT as u32);
+    }
+    var ev: EpollEvent = epoll_event_with_fd(evs, c.fd);
+    _ = sys_epoll_ctl(g_epfd, EPOLL_CTL_MOD, c.fd, &ev) catch {};
+}
+
+// ---------------------------------------------------------------
+// 缓冲与解析小工具
+// ---------------------------------------------------------------
+
+/// 把 `[in_pos, in_len)` 挪到缓冲区开头。
+fn srv_compact(c: &SrvConn) void {
+    if c.in_pos == 0 {
         return;
     }
     var n: usize = 0;
-    var i: usize = pos[0];
-    while i < len[0] {
-        if i >= SRV_REQ_CAP {
-            break;
-        }
-        if n >= SRV_REQ_CAP {
-            break;
-        }
-        const v: byte = buf[i];
-        buf[n] = v;
+    var i: usize = c.in_pos;
+    while i < c.in_len && n < SRV_IO_CAP {
+        const v: byte = c.in[i];
+        c.in[n] = v;
         n = n + 1;
         i = i + 1;
     }
-    len[0] = n;
-    pos[0] = 0;
+    c.in_len = n;
+    c.in_pos = 0;
 }
 
-fn srv_find_crlf(buf: &byte, len: usize) i64 {
-    var i: usize = 0;
-    while i + 1 < len {
-        if i + 1 >= SRV_REQ_CAP {
-            return -1;
+/// 从 `from` 起找 CRLF，返回其下标；没有返回 -1。
+fn srv_find_crlf(c: &SrvConn, from: usize) i64 {
+    var i: usize = from;
+    while i + 1 < c.in_len {
+        if i + 1 >= SRV_IO_CAP {
+            return 0 - 1;
         }
-        if buf[i] == (13 as byte) && buf[i + 1] == (10 as byte) {
+        if c.in[i] == (13 as byte) && c.in[i + 1] == (10 as byte) {
             return i as i64;
         }
         i = i + 1;
     }
-    return -1;
+    return 0 - 1;
 }
 
-/// chunk 大小行（十六进制）。`;` 之后是扩展，忽略。
-fn srv_hex_size(buf: &byte, end: usize) i64 {
+/// 解析 `[from, end)` 的十六进制块长度（`;` 之后是扩展，忽略）。
+fn srv_hex_size(c: &SrvConn, from: usize, end: usize) i64 {
     var v: i64 = 0;
     var any: bool = false;
-    var i: usize = 0;
-    while i < end {
-        if i >= SRV_REQ_CAP {
-            return -1;
-        }
-        const c: byte = buf[i];
-        var d: i64 = -1;
-        if c >= ('0' as byte) && c <= ('9' as byte) {
-            d = (c as i64) - 48;
-        } else if c >= ('a' as byte) && c <= ('f' as byte) {
-            d = (c as i64) - 87;
-        } else if c >= ('A' as byte) && c <= ('F' as byte) {
-            d = (c as i64) - 55;
-        } else if c == (';' as byte) {
+    var i: usize = from;
+    while i < end && i < SRV_IO_CAP {
+        const ch: byte = c.in[i];
+        var d: i64 = 0 - 1;
+        if ch >= ('0' as byte) && ch <= ('9' as byte) {
+            d = (ch as i64) - 48;
+        } else if ch >= ('a' as byte) && ch <= ('f' as byte) {
+            d = (ch as i64) - 87;
+        } else if ch >= ('A' as byte) && ch <= ('F' as byte) {
+            d = (ch as i64) - 55;
+        } else if ch == (';' as byte) {
             break;
         } else {
-            return -1;
+            return 0 - 1;
         }
         v = v *% 16 +% d;
         if v < 0 {
-            return -1;
+            return 0 - 1;
         }
         any = true;
         i = i + 1;
     }
     if !any {
-        return -1;
+        return 0 - 1;
     }
     return v;
 }
 
-/// 排空 chunked 请求体。`pos` 是当前读到缓冲区里的位置，返回时包体已消费完。
-@async_fn fn srv_drain_chunked(fd: i32, buf: &byte, len: &usize,
-    pos: &usize) Future<!i32> {
-    while true {
-        srv_compact(buf[0: SRV_REQ_CAP], len, pos);
-        var crlf: i64 = srv_find_crlf(buf, len[0]);
-        while crlf < 0 {
-            const r: i32 = try @await srv_fill(fd, buf, len, len[0] +% 1);
-            if r <= 0 {
-                return r;
-            }
-            crlf = srv_find_crlf(buf, len[0]);
+fn srv_path_is(req: &HsrvReq, lit: &[byte]) bool {
+    if req.path_len < lit.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < lit.len {
+        if i >= HSRV_PATH_MAX {
+            return false;
         }
-        if crlf < 0 {
-            return -1;
+        if req.path[i] != lit[i] {
+            return false;
         }
-        const cl: usize = crlf as usize;
-        const size: i64 = srv_hex_size(buf, cl);
-        if size < 0 {
-            return -1;
+        i = i + 1;
+    }
+    if req.path_len == lit.len {
+        return true;
+    }
+    const q: usize = lit.len;
+    var next_is_query: bool = false;
+    if q < HSRV_PATH_MAX {
+        next_is_query = req.path[q] == ('?' as byte);
+    }
+    return next_is_query;
+}
+
+fn srv_route_of(req: &HsrvReq) i32 {
+    if srv_path_is(req, &"/healthz"[0: 8]) {
+        return ROUTE_HEALTH;
+    }
+    if srv_path_is(req, &"/v1/models"[0: 10]) {
+        return ROUTE_MODELS;
+    }
+    if srv_path_is(req, &"/v1/_sse"[0: 8]) {
+        return ROUTE_SSE;
+    }
+    return ROUTE_404;
+}
+
+// ---------------------------------------------------------------
+// 响应构造
+// ---------------------------------------------------------------
+
+fn srv_put(out: &byte, cap: usize, off: &usize, data: &[byte]) bool {
+    var i: usize = 0;
+    while i < data.len {
+        if off[0] >= cap {
+            return false;
         }
-        pos[0] = cl +% 2;
-        if size == 0 {
-            // 末尾 trailer：读到空行为止
-            while true {
-                if pos[0] + 1 < len[0] && pos[0] + 1 < SRV_REQ_CAP
-                    && buf[pos[0]] == (13 as byte) && buf[pos[0] + 1] == (10 as byte) {
-                    pos[0] = pos[0] +% 2;
-                    return 1;
-                }
-                const cr: i64 = srv_find_crlf(buf, len[0]);
-                if cr >= 0 {
-                    const cvu: usize = cr as usize;
-                    if cvu >= pos[0] {
-                        pos[0] = cvu +% 2;
-                        continue;
-                    }
-                }
-                const r: i32 = try @await srv_fill(fd, buf, len, len[0] +% 1);
-                if r <= 0 {
-                    return r;
-                }
-            }
+        out[off[0]] = data[i];
+        off[0] = off[0] + 1;
+        i = i + 1;
+    }
+    return true;
+}
+
+/// 组装静态回包（头 + body），并进入 WRITE。
+fn srv_static(c: &SrvConn, status: i32, body: &[byte], keep: bool) void {
+    const n: usize = hsrv_resp_head(&c.out[0], SRV_OUT_CAP, status, &SRV_CTYPE_JSON[0: 16], 16,
+        body.len as i64, false, keep);
+    var off: usize = n;
+    _ = srv_put(&c.out[0], SRV_OUT_CAP, &off, body);
+    c.out_len = off;
+    c.out_pos = 0;
+    c.state = ST_WRITE;
+}
+
+/// 按解析出来的路由号出响应。
+fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    if c.is_head_req {
+        srv_static(c, 200, &"x"[0: 0], keep);
+        return;
+    }
+    if c.route == ROUTE_HEALTH {
+        stats.requests = stats.requests +% 1;
+        srv_static(c, 200, SRV_JSON_HEALTH, keep);
+        return;
+    }
+    if c.route == ROUTE_MODELS {
+        stats.requests = stats.requests +% 1;
+        srv_static(c, 200, SRV_JSON_MODELS, keep);
+        return;
+    }
+    if c.route == ROUTE_SSE {
+        stats.requests = stats.requests +% 1;
+        stats.sse = stats.sse +% 1;
+        const hn: usize = hsrv_resp_head(&c.out[0], SRV_OUT_CAP, 200, &SRV_CTYPE_SSE[0: 17], 17,
+            0 as i64, true, true);
+        var off: usize = hn;
+        off = off +% hsrv_chunk(&c.out[off], SRV_OUT_CAP - off, SRV_SSE_LINE, SRV_SSE_LINE.len);
+        c.out_len = off;
+        c.out_pos = 0;
+        c.sse_left = SRV_SSE_EVENTS -| 1;
+        c.sse_next = srv_now_ms() +% SRV_SSE_GAP_MS;
+        c.state = ST_SSE;
+        return;
+    }
+    stats.requests = stats.requests +% 1;
+    srv_static(c, 404, SRV_JSON_404, keep);
+}
+
+// ---------------------------------------------------------------
+// 状态机
+// ---------------------------------------------------------------
+
+/// 排空包体：1=排完，0=还要更多数据，-1=协议错误。
+fn srv_body_step(c: &SrvConn) i32 {
+    if !c.chunked {
+        const avail: usize = c.in_len -| c.in_pos;
+        if avail == 0 {
+            return 0;
+        }
+        // 不用 `const x = if ... else ...`：分支带 `as` 强制转换时会生成
+        // `const size_t __uya_ifexpr_N;` 再赋值（只读变量赋值，编译不过）。
+        var take: usize = avail;
+        if (avail as u64) > c.body_left {
+            take = c.body_left as usize;
+        }
+        c.in_pos = c.in_pos +% take;
+        c.body_left = c.body_left -% (take as u64);
+        if c.body_left == 0 {
             return 1;
         }
-        // 分片丢弃包体：允许单块大于缓冲区
-        var rem: usize = size as usize;
-        while rem > 0 {
-            if pos[0] < len[0] {
-                const avail: usize = len[0] - pos[0];
-                const take: usize = if avail < rem { avail } else { rem };
-                pos[0] = pos[0] +% take;
-                rem = rem -% take;
-            } else {
-                len[0] = 0;
-                pos[0] = 0;
-                const r: i32 = try @await srv_fill(fd, buf, len, 1);
-                if r <= 0 {
-                    return r;
-                }
-            }
-        }
-        // 块末尾的 CRLF
-        const e: i32 = try @await srv_fill(fd, buf, len, pos[0] +% 2);
-        if e <= 0 {
-            return e;
-        }
-        pos[0] = pos[0] +% 2;
+        return 0;
     }
+    var guard: i32 = 0;
+    while guard < 1000000 {
+        guard = guard + 1;
+        if c.chunk_phase == CH_SIZE {
+            const crlf: i64 = srv_find_crlf(c, c.in_pos);
+            if crlf < 0 {
+                return 0;
+            }
+            const cl: usize = crlf as usize;
+            const sz: i64 = srv_hex_size(c, c.in_pos, cl);
+            if sz < 0 {
+                return 0 - 1;
+            }
+            c.in_pos = cl +% 2;
+            if sz == 0 {
+                c.chunk_phase = CH_TRAILER;
+            } else {
+                c.chunk_left = sz as u64;
+                c.chunk_phase = CH_DATA;
+            }
+            continue;
+        }
+        if c.chunk_phase == CH_DATA {
+            const avail: usize = c.in_len -| c.in_pos;
+            if avail == 0 {
+                return 0;
+            }
+            var take: usize = avail;
+            if (avail as u64) > c.chunk_left {
+                take = c.chunk_left as usize;
+            }
+            c.in_pos = c.in_pos +% take;
+            c.chunk_left = c.chunk_left -% (take as u64);
+            if c.chunk_left == 0 {
+                c.chunk_phase = CH_CRLF;
+            }
+            continue;
+        }
+        if c.chunk_phase == CH_CRLF {
+            if c.in_len -| c.in_pos < 2 {
+                return 0;
+            }
+            c.in_pos = c.in_pos +% 2;
+            c.chunk_phase = CH_SIZE;
+            continue;
+        }
+        // CH_TRAILER：读到空行为止
+        const crlf2: i64 = srv_find_crlf(c, c.in_pos);
+        if crlf2 < 0 {
+            return 0;
+        }
+        const cl2: usize = crlf2 as usize;
+        if cl2 == c.in_pos {
+            c.in_pos = c.in_pos +% 2;
+            return 1;
+        }
+        c.in_pos = cl2 +% 2;
+    }
+    return 0 - 1;
+}
+
+/// 把待写数据尽量发出去：1=发完，0=对端暂时写不动，-1=出错。
+fn srv_flush(c: &SrvConn) i32 {
+    while c.out_pos < c.out_len {
+        const r: !isize = sys_send(c.fd, &c.out[c.out_pos], c.out_len - c.out_pos, 0);
+        const n: isize = r catch |err| {
+            const eid: i32 = @error_id(err) as i32;
+            if eid == EAGAIN || eid == EWOULDBLOCK {
+                return 0;
+            }
+            return 0 - 1;
+        };
+        if n <= 0 {
+            return 0 - 1;
+        }
+        c.out_pos = c.out_pos +% (n as usize);
+    }
+    c.out_pos = 0;
+    c.out_len = 0;
     return 1;
 }
 
-/// 处理一个连接上的所有请求。返回 0 正常结束。
-@async_fn fn serve_conn_async(fd: i32, stats: &ServeStats) Future<!i32> {
-    var buf: [byte: SRV_REQ_CAP] = [0: SRV_REQ_CAP];
-    var len: usize = 0;
-    while true {
-        // 1) 凑齐请求头
-        var req: HsrvReq = HsrvReq{};
-        while true {
-            const pr: i32 = hsrv_parse_head(&buf[0], len, HSRV_HEAD_MAX, &req);
-            if pr == 1 {
-                break;
+/// 推进一个连接，直到「需要更多数据」或「等待可写」。
+fn srv_drive(c: &SrvConn, stats: &ServeStats) void {
+    var guard: i32 = 0;
+    while guard < 256 {
+        guard = guard + 1;
+        if c.state == ST_HEAD {
+            srv_compact(c);
+            var req: HsrvReq = HsrvReq{};
+            const pr: i32 = hsrv_parse_head(&c.in[0], c.in_len, SRV_IO_CAP, &req);
+            if pr == 0 {
+                if c.in_len >= SRV_IO_CAP {
+                    stats.bad = stats.bad +% 1;
+                    srv_static(c, 431, SRV_JSON_431, false);
+                    continue;
+                }
+                srv_set_interest(c, false);
+                return;
             }
             if pr < 0 {
                 stats.bad = stats.bad +% 1;
-                const sr: !i32 = @await srv_send(fd, 400,
-                    srv_ptr(&"{\"error\":\"bad request\"}"[0: 23]), 23, false);
-                _ = sr catch |_| { 0; };
-                return 0;
+                srv_static(c, 400, SRV_JSON_400, false);
+                continue;
             }
-            const rf: i32 = try @await srv_fill(fd, &buf[0], &len, len +% 1);
-            if rf <= 0 {
-                return 0;
+            c.keep = req.keep_alive;
+            c.route = srv_route_of(&req);
+            c.is_head_req = req.method_len == 4 && req.method[0] == ('H' as byte);
+            c.in_pos = req.head_len;
+            c.chunked = req.chunked;
+            c.chunk_left = 0;
+            c.chunk_phase = CH_SIZE;
+            c.body_left = 0;
+            if !req.chunked && req.content_length > 0 {
+                c.body_left = req.content_length as u64;
             }
+            if req.expect_continue && (req.chunked || req.content_length > 0) {
+                // 尽力而为：25 字节几乎不会半发；半发也只能等客户端自己超时重发
+                const cont: !isize = sys_send(c.fd, srv_ptr(&"HTTP/1.1 100 Continue\r\n\r\n"[0: 25]), 25, 0);
+                _ = cont catch |_| {
+                    0 as isize;
+                };
+            }
+            if c.chunked || c.body_left > 0 {
+                c.state = ST_BODY;
+                continue;
+            }
+            srv_begin_response(c, stats);
+            continue;
         }
-
-        // 2) 100-continue：先给中间响应再收包体
-        if req.expect_continue && (req.content_length > 0 || req.chunked) {
-            const wc: !usize = @await async_fd_write_all(fd,
-                srv_ptr(&"HTTP/1.1 100 Continue\r\n\r\n"[0: 25]), 25);
-            const rc0: usize = wc catch |_| {
-                return 0;
-            };
-            if rc0 == 0 {
-                return 0;
+        if c.state == ST_BODY {
+            const bd: i32 = srv_body_step(c);
+            if bd == 0 {
+                srv_set_interest(c, false);
+                return;
             }
+            if bd < 0 {
+                stats.bad = stats.bad +% 1;
+                srv_static(c, 400, SRV_JSON_400, false);
+                continue;
+            }
+            srv_begin_response(c, stats);
+            continue;
         }
-
-        // 3) 排空包体
-        var pos: usize = req.head_len;
-        if req.chunked {
-            const dr: i32 = try @await srv_drain_chunked(fd, &buf[0], &len, &pos);
-            if dr <= 0 {
-                return 0;
+        if c.state == ST_WRITE {
+            const fr: i32 = srv_flush(c);
+            if fr == 0 {
+                srv_set_interest(c, true);
+                return;
             }
-        } else if req.content_length > 0 {
-            var left: usize = req.content_length as usize;
-            while left > 0 {
-                if pos < len {
-                    const avail: usize = len - pos;
-                    const take: usize = if avail < left { avail } else { left };
-                    pos = pos +% take;
-                    left = left -% take;
-                } else {
-                    len = 0;
-                    pos = 0;
-                    const rf: i32 = try @await srv_fill(fd, &buf[0], &len, 1);
-                    if rf <= 0 {
-                        return 0;
-                    }
+            if fr < 0 {
+                srv_close_slot(srv_slot_of(c.fd));
+                return;
+            }
+            if !c.keep {
+                srv_close_slot(srv_slot_of(c.fd));
+                return;
+            }
+            c.state = ST_HEAD;
+            c.is_head_req = false;
+            c.route = ROUTE_404;
+            continue;
+        }
+        if c.state == ST_SSE {
+            if c.out_len > c.out_pos {
+                const fr2: i32 = srv_flush(c);
+                if fr2 == 0 {
+                    srv_set_interest(c, true);
+                    return;
+                }
+                if fr2 < 0 {
+                    srv_close_slot(srv_slot_of(c.fd));
+                    return;
                 }
             }
+            if c.sse_left > 0 {
+                srv_set_interest(c, false);
+                return;
+            }
+            // 事件推完：补最后一个 chunk，然后按 keep=false 收尾
+            c.out_pos = 0;
+            c.out_len = hsrv_chunk_last(&c.out[0], SRV_OUT_CAP);
+            c.keep = false;
+            c.state = ST_WRITE;
+            continue;
         }
-
-        // 4) 路由（每个分支直接调 `srv_send`，不在异步函数里构造切片局部变量）
-        stats.requests = stats.requests +% 1;
-        const keep: bool = req.keep_alive;
-        const is_head: bool = req.method_len == 4 && req.method[0] == ('H' as byte);
-        var is_health: bool = false;
-        if req.path_len == 8 && req.path[0] == ('/' as byte)
-            && req.path[1] == ('h' as byte) && req.path[2] == ('e' as byte)
-            && req.path[3] == ('a' as byte) && req.path[4] == ('l' as byte)
-            && req.path[5] == ('t' as byte) && req.path[6] == ('h' as byte)
-            && req.path[7] == ('z' as byte) {
-            is_health = true;
-        }
-        var is_models: bool = false;
-        if req.path_len == 10 && req.path[0] == ('/' as byte)
-            && req.path[1] == ('v' as byte) && req.path[2] == ('1' as byte)
-            && req.path[3] == ('/' as byte) && req.path[4] == ('m' as byte)
-            && req.path[5] == ('o' as byte) && req.path[6] == ('d' as byte)
-            && req.path[7] == ('e' as byte) && req.path[8] == ('l' as byte)
-            && req.path[9] == ('s' as byte) {
-            is_models = true;
-        }
-        // 每个分支只算「状态码 + 包体指针 + 长度」，真正的 @await 只在一个地方：
-        // 0.11 的后端在 if/else 里放多个 `try @await` 时会生成重复的 C 标签。
-        var st: i32 = 404;
-        var bn: usize = 22;
-        var bp: &const byte = srv_ptr(&"{\"error\":\"not found\"}"[0: 22]);
-        if is_head {
-            st = 200;
-            bn = 0;
-            bp = srv_ptr(&"x"[0: 0]);
-        } else if is_health {
-            st = 200;
-            bn = 11;
-            bp = srv_ptr(&"{\"ok\":true}"[0: 11]);
-        } else if is_models {
-            st = 200;
-            bn = 27;
-            bp = srv_ptr(&"{\"object\":\"list\",\"data\":[]}"[0: 27]);
-        }
-        const rs: i32 = try @await srv_send(fd, st, bp, bn, keep);
-        if rs <= 0 {
-            return 0;
-        }
-        if !keep {
-            return 0;
-        }
-        // 5) 处理完的字节丢掉，剩余的留给下一个请求（pipeline）
-        srv_compact(buf[0: SRV_REQ_CAP], &len, &pos);
+        srv_close_slot(srv_slot_of(c.fd));
+        return;
     }
-    return 0;
 }
 
-/// accept 循环。`stop_after` 为 0 表示常驻；否则处理这么多连接后返回（回归用）。
-export @async_fn fn serve_loop_async(listen_fd: i32, stats: &ServeStats,
-    stop_after: u64) Future<!i32> {
-    while true {
-        if stop_after != 0 && stats.conns >= stop_after {
-            return 0;
+/// 可读事件：尽量读到 EAGAIN，然后推进状态机。
+fn srv_on_readable(c: &SrvConn, stats: &ServeStats) void {
+    var guard: i32 = 0;
+    while guard < 1024 {
+        guard = guard + 1;
+        if c.state == ST_FREE {
+            return;
         }
-        const af: !i32 = @await async_accept(listen_fd);
-        const cfd: i32 = af catch |_| {
+        if c.state == ST_SSE {
+            return;
+        }
+        srv_compact(c);
+        if c.in_len >= SRV_IO_CAP {
+            srv_drive(c, stats);
+            if c.state == ST_FREE {
+                return;
+            }
+            if c.state != ST_HEAD && c.state != ST_BODY {
+                return;
+            }
+            if c.in_len >= SRV_IO_CAP {
+                stats.bad = stats.bad +% 1;
+                srv_static(c, 431, SRV_JSON_431, false);
+                srv_drive(c, stats);
+                return;
+            }
             continue;
+        }
+        if c.in_len >= SRV_IO_CAP {
+            return;
+        }
+        const r: !isize = sys_recv(c.fd, &c.in[c.in_len], SRV_IO_CAP - c.in_len, 0);
+        const n: isize = r catch |err| {
+            const eid: i32 = @error_id(err) as i32;
+            if eid == EAGAIN || eid == EWOULDBLOCK {
+                srv_drive(c, stats);
+                return;
+            }
+            srv_close_slot(srv_slot_of(c.fd));
+            return;
         };
-        if cfd < 0 {
-            continue;
+        if n == 0 {
+            srv_close_slot(srv_slot_of(c.fd));
+            return;
         }
-        stats.conns = stats.conns +% 1;
+        c.in_len = c.in_len +% (n as usize);
+        srv_drive(c, stats);
+        if c.state == ST_WRITE {
+            return;
+        }
+    }
+}
+
+/// epoll 事件分发。
+fn srv_on_event(fd: i32, evs: u32, stats: &ServeStats) void {
+    const slot: i32 = srv_slot_of(fd);
+    if slot < 0 || (slot as usize) >= SRV_MAX_CONNS {
+        return;
+    }
+    const c: &SrvConn = &g_conns[slot as usize];
+    if (evs & (SRV_EPOLLERR | SRV_EPOLLHUP)) != 0 {
+        srv_close_slot(slot);
+        return;
+    }
+    if (evs & (EPOLLOUT as u32)) != 0 && c.out_len > c.out_pos {
+        srv_drive(c, stats);
+        if c.state == ST_FREE {
+            return;
+        }
+    }
+    if (evs & (EPOLLIN as u32)) != 0 {
+        srv_on_readable(c, stats);
+    }
+}
+
+fn srv_accept_all(stats: &ServeStats) void {
+    var guard: i32 = 0;
+    while guard < 256 {
+        guard = guard + 1;
+        const slot: i32 = srv_alloc_slot();
+        if slot < 0 || (slot as usize) >= SRV_MAX_CONNS {
+            stats.rejected = stats.rejected +% 1;
+            return;
+        }
+        var alen: u32 = 16;
+        var peer: [byte: 16] = [0: 16];
+        const acc: !i32 = sys_accept(g_listen_fd, &peer[0] as &void, &alen);
+        const cfd: i32 = acc catch |_| {
+            return;
+        };
         tcpx_set_nodelay(cfd);
         tcpx_set_nonblocking(cfd) catch |_| {};
-        const rc: !i32 = @await serve_conn_async(cfd, stats);
-        _ = rc catch |_| { 0; };
-        tcpx_close(cfd);
+        const i: usize = slot as usize;
+        g_conns[i].fd = cfd;
+        g_conns[i].state = ST_HEAD;
+        g_conns[i].in_len = 0;
+        g_conns[i].in_pos = 0;
+        g_conns[i].out_len = 0;
+        g_conns[i].out_pos = 0;
+        g_conns[i].route = ROUTE_404;
+        g_conns[i].keep = false;
+        g_conns[i].is_head_req = false;
+        g_conns[i].body_left = 0;
+        g_conns[i].chunked = false;
+        g_conns[i].chunk_left = 0;
+        g_conns[i].chunk_phase = CH_SIZE;
+        g_conns[i].sse_left = 0;
+        g_conns[i].sse_next = 0;
+        var ev: EpollEvent = epoll_event_with_fd(EPOLLIN as u32, cfd);
+        const ar: !i32 = sys_epoll_ctl(g_epfd, EPOLL_CTL_ADD, cfd, &ev);
+        _ = ar catch |_| {
+            g_conns[i].fd = 0 - 1;
+            g_conns[i].state = ST_FREE;
+            _ = sys_close(cfd) catch {};
+            continue;
+        };
+        stats.conns = stats.conns +% 1;
+        stats.active = stats.active +% 1;
+        if stats.active > stats.max_active {
+            stats.max_active = stats.active;
+        }
     }
-    return 0;
+}
+
+/// SSE 定时推进：到点的连接补一个 chunk，再交给状态机去发。
+fn srv_tick_sse(now: u64, stats: &ServeStats) void {
+    var i: usize = 0;
+    while i < SRV_MAX_CONNS {
+        const c: &SrvConn = &g_conns[i];
+        if c.state == ST_SSE && c.sse_left > 0 && now >= c.sse_next && c.out_len == c.out_pos {
+            c.out_pos = 0;
+            c.out_len = hsrv_chunk(&c.out[0], SRV_OUT_CAP, SRV_SSE_LINE, SRV_SSE_LINE.len);
+            c.sse_left = c.sse_left -| 1;
+            c.sse_next = now +% SRV_SSE_GAP_MS;
+            srv_drive(c, stats);
+        }
+        i = i + 1;
+    }
+}
+
+/// 停机扫尾：空闲连接直接关，有在途响应的标记 keep=false 让它自然收尾。
+fn srv_shutdown_sweep() void {
+    var i: usize = 0;
+    while i < SRV_MAX_CONNS {
+        if g_conns[i].state != ST_FREE {
+            if g_conns[i].state == ST_HEAD && g_conns[i].in_len == 0
+                && g_conns[i].out_len == g_conns[i].out_pos {
+                srv_close_slot(i as i32);
+            } else {
+                g_conns[i].keep = false;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+/// 单线程事件循环。`lfd` 由 `serve_listen` 建好（非阻塞）。
+/// 收到 SIGTERM/SIGINT 后：停止 accept → 等空闲连接关闭/在途请求收尾（最多 2 s）→ 返回 0。
+export fn serve_run(lfd: i32, stats: &ServeStats) !i32 {
+    _ = signal(SIGTERM, &srv_on_signal as &void);
+    _ = signal(SIGINT, &srv_on_signal as &void);
+    _ = signal(SIGPIPE, SIG_IGN as &void);
+    _ = SIGTERM;
+    g_stop = 0;
+    g_listen_fd = lfd;
+    var i: usize = 0;
+    while i < SRV_MAX_CONNS {
+        g_conns[i].fd = 0 - 1;
+        g_conns[i].state = ST_FREE;
+        g_conns[i].in_len = 0;
+        g_conns[i].in_pos = 0;
+        g_conns[i].out_len = 0;
+        g_conns[i].out_pos = 0;
+        g_conns[i].sse_left = 0;
+        g_conns[i].chunk_phase = CH_SIZE;
+        i = i + 1;
+    }
+    const epfd: i32 = try sys_epoll_create1(EPOLL_CLOEXEC);
+    g_epfd = epfd;
+    var lev: EpollEvent = epoll_event_with_fd(EPOLLIN as u32, lfd);
+    _ = try sys_epoll_ctl(epfd, EPOLL_CTL_ADD, lfd, &lev);
+
+    var events: [EpollEvent: 64] = [];
+    var stopping: i32 = 0;
+    var stop_at: u64 = 0;
+    var rc: i32 = 0;
+    while true {
+        if srv_stop_requested() != 0 && stopping == 0 {
+            stopping = 1;
+            stop_at = srv_now_ms() +% SRV_SHUTDOWN_MS;
+            if g_listen_fd >= 0 {
+                _ = sys_epoll_ctl_del(epfd, g_listen_fd) catch {};
+                _ = sys_close(g_listen_fd) catch {};
+                g_listen_fd = 0 - 1;
+            }
+            srv_shutdown_sweep();
+        }
+        const now: u64 = srv_now_ms();
+        srv_tick_sse(now, stats);
+        stats.active = srv_active_count();
+        if stopping != 0 {
+            if stats.active == 0 || now >= stop_at {
+                break;
+            }
+        }
+        var tmo: i32 = SRV_IDLE_MS;
+        if stats.sse > 0 || stopping != 0 {
+            tmo = SRV_TICK_MS;
+        }
+        const waited: !i32 = sys_epoll_wait(epfd, &events[0], SRV_EV_MAX, tmo);
+        const n: i32 = waited catch |_| {
+            continue;
+        };
+        var k: i32 = 0;
+        while k < n {
+            const fd: i32 = epoll_event_fd(&events[k as usize]);
+            const evs: u32 = events[k as usize].events;
+            if fd == g_listen_fd {
+                srv_accept_all(stats);
+            } else {
+                srv_on_event(fd, evs, stats);
+            }
+            k = k + 1;
+        }
+    }
+    // 收尾：关掉所有还挂着的连接与 epoll
+    var j: usize = 0;
+    while j < SRV_MAX_CONNS {
+        if g_conns[j].state != ST_FREE {
+            srv_close_slot(j as i32);
+        }
+        j = j + 1;
+    }
+    if g_listen_fd >= 0 {
+        _ = sys_close(g_listen_fd) catch {};
+        g_listen_fd = 0 - 1;
+    }
+    _ = sys_close(epfd) catch {};
+    g_epfd = 0 - 1;
+    rc = 0;
+    return rc;
 }

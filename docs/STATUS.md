@@ -23,8 +23,13 @@
   amalgamation（离线不可得），见 TODO A0。
 - A4（日志部分）：`src/core/reqlog.uya`，一行 `k=v` 的每请求日志（含 cost/tok-s），
   `tests/test_reqlog.uya` 全过。
+- A1（服务端）：`src/net/serve.uya` 单线程 epoll 状态机（1024 槽）、64 MiB 包体流式排空、
+  chunked SSE、SIGTERM 优雅停机；`tests/serve_smoke.sh` 断言 512 并发 SSE、线程数=1、
+  停机退出码 0（`SERVE-ALL-OK`）。
 
 ## 下一步
+
+0. ~~A1 事件循环~~（已完成：单线程 epoll + 512 并发 SSE + 优雅停机）
 
 1. ~~TLS-09 → TLS-10 → TLS-11~~（已完成；TLS-09E 流式读超时未落地，findings §9）
 2. Phase A：A0 SQLite+money spike、A1 事件循环、A2 schema/认证/备份 … A9 文档/e2e

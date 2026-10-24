@@ -32,7 +32,7 @@ fn usage() i32 {
     return 2;
 }
 
-/// `aigw serve`：起服务、打印实际端口、跑 event loop。
+/// `aigw serve`：起服务、打印实际端口、跑单线程 epoll 事件循环。
 /// `--port 0` 让内核挑端口（回归脚本靠这条读取真实端口）。
 fn serve_main(host: &[byte], port: u16) i32 {
     const lfd: i32 = serve_listen(host, port) catch |_| {
@@ -41,11 +41,10 @@ fn serve_main(host: &[byte], port: u16) i32 {
     };
     printf("listen port=%d\n" as *byte, serve_port(lfd) as i32);
     var stats: ServeStats = ServeStats{};
-    const rc: !i32 = block_on<i32>(serve_loop_async(lfd, &stats, 0));
-    const r: i32 = rc catch |_| {
-        -1;
+    // serve_run 自己负责关闭 lfd（停机时先摘监听再关）
+    const r: i32 = serve_run(lfd, &stats) catch |_| {
+        1;
     };
-    tcpx_close(lfd);
     return r;
 }
 

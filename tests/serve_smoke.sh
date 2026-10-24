@@ -86,13 +86,43 @@ SEQ=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}:%{num_connects},' "$BAS
       --next -s --max-time 5 -o /dev/null -w '%{http_code}:%{num_connects},' "$BASE/nope")
 [ "$SEQ" = "200:1,200:0,404:0," ] || fail "keep-alive seq=$SEQ"
 
-# 5) 64 KiB 包体（大于 16 KiB 读缓冲）→ 排空后再发一条必须仍然正确
-head -c 65536 /dev/zero | tr '\0' 'a' >"$TMP/big.txt"
-BIG=$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' \
+# 5) 64 MiB 包体（远大于 16 KiB 读缓冲）→ 排空后再发一条必须仍然正确
+head -c 67108864 /dev/zero | tr '\0' 'a' >"$TMP/big.txt"
+BIG=$(curl -s --max-time 30 -o /dev/null -w '%{http_code}' \
       -H 'Content-Type: application/json' --data-binary @"$TMP/big.txt" "$BASE/nope")
 [ "$BIG" = "404" ] || fail "big body status=$BIG"
 AFTER=$(curl -s --max-time 5 "$BASE/healthz")
 [ "$AFTER" = '{"ok":true}' ] || fail "after big body=[$AFTER]"
 
 kill -0 "$PID" 2>/dev/null || fail "server died"
-echo "SERVE-ALL-OK port=$PORT"
+
+# 6) 线程数恒 1：并发全部走 epoll，进程内没有第二个线程
+THREADS=$(awk '/^Threads:/ {print $2}' "/proc/$PID/status" 2>/dev/null)
+[ "$THREADS" = "1" ] || fail "threads=$THREADS (expect 1)"
+
+# 7) 512 并发 SSE：每条连接 20 个事件，全部并行推完
+ulimit -n 4096 2>/dev/null || true
+SSE_OUT=$(python3 tests/serve_sse_load.py "$PORT" 512 20 2>&1) || fail "sse load: $SSE_OUT"
+case "$SSE_OUT" in
+  SSE-OK*) ;;
+  *) fail "sse load: $SSE_OUT" ;;
+esac
+
+# 8) 并发压完以后服务仍然正常（槽位已回收）
+AFTER2=$(curl -s --max-time 5 "$BASE/healthz")
+[ "$AFTER2" = '{"ok":true}' ] || fail "after sse body=[$AFTER2]"
+
+# 9) 优雅停机：SIGTERM → 3 s 内以 0 退出（不是被信号打死）
+kill -TERM "$PID"
+WAITED=0
+while kill -0 "$PID" 2>/dev/null; do
+  WAITED=$((WAITED + 1))
+  [ "$WAITED" -gt 60 ] && fail "server did not exit within 3s after SIGTERM"
+  sleep 0.05
+done
+wait "$PID"
+RC=$?
+PID=""
+[ "$RC" = "0" ] || fail "graceful exit code=$RC (expect 0)"
+
+echo "SERVE-ALL-OK port=$PORT $SSE_OUT threads=$THREADS"
