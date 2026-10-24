@@ -1,0 +1,161 @@
+// tests/test_tlsx.uya — TLS 信任判定单元测试（无网络）
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+fn eq_bytes(a: &[byte], b: &[byte]) !void {
+    try assert_eq_i32(@len(a), @len(b));
+    var i: usize = 0;
+    while i < a.len {
+        try assert_eq_i32(a[i] as i32, b[i] as i32);
+        i = i + 1;
+    }
+}
+
+fn fill_h(dst: &byte) void {
+    const h: &[byte] = &"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"[0: 64];
+    var i: usize = 0;
+    while i < 64 {
+        dst[i] = h[i];
+        i = i + 1;
+    }
+}
+
+fn toupper_hex(b: byte) byte {
+    if b >= ('a' as byte) && b <= ('f' as byte) {
+        return (b -% 32) as byte;
+    }
+    return b;
+}
+
+fn test_sha256_known() !void {
+    var out: [byte: 64] = [0: 64];
+    tlsx_sha256_hex(&"abc"[0: 3], 3, &out[0]);
+    const h: &[byte] = &"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"[0: 64];
+    try eq_bytes(&out[0: 64], h);
+}
+
+fn test_leaf_fingerprint() !void {
+    var msg: [byte: 14] = [0: 14];
+    msg[0] = 11;
+    msg[3] = 10;
+    msg[6] = 7;
+    msg[9] = 4;
+    msg[10] = 0x30;
+    msg[11] = 0x82;
+    msg[12] = 0x01;
+    msg[13] = 0x02;
+
+    var out: [byte: 64] = [0: 64];
+    try assert_eq_bool(tlsx_leaf_fingerprint(&msg[0], 14, &out[0]), true);
+
+    var der: [byte: 4] = [0: 4];
+    der[0] = 0x30;
+    der[1] = 0x82;
+    der[2] = 0x01;
+    der[3] = 0x02;
+    var expect: [byte: 64] = [0: 64];
+    tlsx_sha256_hex(&der[0], 4, &expect[0]);
+    try eq_bytes(&out[0: 64], &expect[0: 64]);
+
+    try assert_eq_bool(tlsx_leaf_fingerprint(&msg[0], 5, &out[0]), false);
+}
+
+fn test_pin_match() !void {
+    var obs: [byte: 64] = [0: 64];
+    fill_h(&obs[0]);
+
+    var pins: [byte: 128] = [0: 128];
+    var i: usize = 0;
+    while i < 64 {
+        pins[i] = obs[i];
+        pins[64 + i] = obs[i];
+        i = i + 1;
+    }
+
+    try assert_eq_bool(tlsx_pin_match(&obs[0: 64], &pins[0: 64], 1), true);
+    try assert_eq_bool(tlsx_pin_match(&obs[0: 64], &pins[0: 128], 2), true);
+
+    var up: [byte: 64] = [0: 64];
+    i = 0;
+    while i < 64 {
+        up[i] = toupper_hex(obs[i]);
+        i = i + 1;
+    }
+    try assert_eq_bool(tlsx_pin_match(&up[0: 64], &pins[0: 64], 1), true);
+
+    var bad: [byte: 64] = [0: 64];
+    i = 0;
+    while i < 64 {
+        bad[i] = obs[i];
+        i = i + 1;
+    }
+    bad[0] = 'c' as byte;
+    try assert_eq_bool(tlsx_pin_match(&bad[0: 64], &pins[0: 64], 1), false);
+    try assert_eq_bool(tlsx_pin_match(&obs[0: 64], &pins[0: 64], 0), false);
+}
+
+fn test_tofu_store() !void {
+    var h1: [byte: 64] = [0: 64];
+    fill_h(&h1[0]);
+
+    var h2: [byte: 64] = [0: 64];
+    var i: usize = 0;
+    while i < 64 {
+        h2[i] = h1[i];
+        i = i + 1;
+    }
+    h2[0] = 'c' as byte;
+
+    var h3: [byte: 64] = [0: 64];
+    i = 0;
+    while i < 64 {
+        h3[i] = h1[i];
+        i = i + 1;
+    }
+    h3[0] = 'd' as byte;
+
+    const host: &[byte] = &"example.com"[0: 11];
+    const path: &[byte] = &"/tmp/aigw_tlsx_test.tsv"[0: 23];
+
+    var p: TlsxPins = TlsxPins{};
+    tlsx_pins_init(&p);
+    try assert_eq_i32(tlsx_tofu_check(&p, host, &h1[0]), 0);
+    try assert_eq_i32(tlsx_tofu_decide(&p, host, &h1[0], false, true, 1000), 2);
+    try assert_eq_i32(tlsx_host_pin_count(&p, host) as i32, 1);
+    try assert_eq_i32(tlsx_tofu_check(&p, host, &h1[0]), 1);
+
+    // 同一域名第二张证书：链校验不通过 -> 拒绝
+    try assert_eq_i32(tlsx_tofu_decide(&p, host, &h2[0], false, true, 1500), -1);
+    try assert_eq_i32(tlsx_host_pin_count(&p, host) as i32, 1);
+    // 链校验通过 -> 追加
+    try assert_eq_i32(tlsx_tofu_decide(&p, host, &h2[0], true, true, 1600), 2);
+    try assert_eq_i32(tlsx_host_pin_count(&p, host) as i32, 2);
+    try assert_eq_i32(tlsx_tofu_check(&p, host, &h2[0]), 1);
+    try assert_eq_i32(tlsx_tofu_check(&p, host, &h1[0]), 1);
+
+    // 第三张：同样只有链校验通过才追加
+    try assert_eq_i32(tlsx_tofu_decide(&p, host, &h3[0], false, true, 1700), -1);
+    try assert_eq_i32(tlsx_tofu_decide(&p, host, &h3[0], true, true, 1800), 2);
+    try assert_eq_i32(tlsx_host_pin_count(&p, host) as i32, 3);
+
+    // 落盘/重载保留多条
+    try tlsx_pins_save(path, &p);
+    var p2: TlsxPins = TlsxPins{};
+    try tlsx_pins_load(path, &p2);
+    try assert_eq_i32(p2.count as i32, 3);
+    try assert_eq_i32(tlsx_tofu_check(&p2, host, &h1[0]), 1);
+    try assert_eq_i32(tlsx_tofu_check(&p2, host, &h2[0]), 1);
+    try assert_eq_i32(tlsx_tofu_check(&p2, host, &h3[0]), 1);
+
+    // 新 host：不学习 -> NOT_FOUND；首用记录 -> LEARNED
+    const host2: &[byte] = &"other.com"[0: 9];
+    try assert_eq_i32(tlsx_tofu_decide(&p2, host2, &h1[0], false, false, 2000), 0);
+    try assert_eq_i32(tlsx_tofu_decide(&p2, host2, &h1[0], false, true, 2000), 2);
+    try assert_eq_i32(tlsx_tofu_check(&p2, host2, &h1[0]), 1);
+}
+
+test "sha256_known" { run_test("sha256_known", test_sha256_known); }
+test "leaf_fingerprint" { run_test("leaf_fingerprint", test_leaf_fingerprint); }
+test "pin_match" { run_test("pin_match", test_pin_match); }
+test "tofu_store" { run_test("tofu_store", test_tofu_store); }

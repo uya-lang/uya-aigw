@@ -1,0 +1,468 @@
+// src/net/tlsx.uya — TLS 信任判定：指纹、pin、TOFU 存储
+//
+// 本模块只做「拿到 leaf 证书之后怎么判」：
+//  - leaf 证书从 TLS handshake flight 的 Certificate 消息（type 11）里取；
+//  - 指纹 = leaf DER 的 SHA-256 小写 hex（64 字符）；
+//  - pin：与配置的一个或多个指纹逐字节比（大小写折叠）；
+//  - TOFU：主机 -> 指纹的本地库（TSV，每行一条），首次记录、之后必须一致；
+//  - chain/none 的判定在 TLS-05 与握手层对接（本模块提供常量与入口）。
+//
+// 文件格式（data/tls_pins.tsv，0600）：
+//   host<TAB>sha256_hex<TAB>first_seen_ms<TAB>updated_at_ms
+// 不用 JSON：少一个解析器，少一类 bug；字段里不会出现 TAB/换行（主机名与 hex 都受限）。
+
+use tls.crypto.sha256;
+use std.io.file;
+
+export error TlsxNoLeaf;
+export error TlsxPinMismatch;
+export error TlsxTofuMismatch;
+export error TlsxIo;
+export error TlsxBadFile;
+
+export const TLSX_MODE_PIN: u8 = 1;
+export const TLSX_MODE_TOFU: u8 = 2;
+export const TLSX_MODE_CHAIN: u8 = 3;
+export const TLSX_MODE_NONE: u8 = 4;
+
+export const TLSX_MAX_PINS: usize = 4;
+export const TLSX_PIN_HEX_LEN: usize = 64;
+export const TLSX_HOST_MAX: usize = 253;
+export const TLSX_MAX_ENTRIES: usize = 64;
+export const TLSX_TOFU_FILE_MAX: usize = 65536;
+
+export const TLSX_TOFU_NOT_FOUND: i32 = 0;
+export const TLSX_TOFU_MATCH: i32 = 1;
+export const TLSX_TOFU_MISMATCH: i32 = -1;
+export const TLSX_TOFU_LEARNED: i32 = 2;
+
+export struct TlsxPinEntry {
+    host: [byte: TLSX_HOST_MAX],
+    host_len: usize,
+    sha: [byte: TLSX_PIN_HEX_LEN],
+    first_seen_ms: u64,
+    updated_at_ms: u64,
+    used: bool,
+}
+
+export struct TlsxPins {
+    entries: [TlsxPinEntry: TLSX_MAX_ENTRIES],
+    count: usize,
+}
+
+fn tlsx_lower(b: byte) byte {
+    if b >= ('A' as byte) && b <= ('Z' as byte) {
+        return (b +% 32) as byte;
+    }
+    return b;
+}
+
+fn tlsx_eq_nocase(a: &[byte], b: &[byte]) bool {
+    if a.len != b.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < a.len {
+        if tlsx_lower(a[i]) != tlsx_lower(b[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn tlsx_hex_digit(v: byte) byte {
+    if v < 10 {
+        return ('0' as byte +% v);
+    }
+    return ('a' as byte +% (v -% 10));
+}
+
+/// 计算 data 的 SHA-256，输出 64 字符小写 hex。
+export fn tlsx_sha256_hex(data: &const byte, len: usize, out: &byte) void {
+    var digest: [byte: 32] = [0: 32];
+    sha256(data, len, &digest[0]);
+    var i: usize = 0;
+    while i < 32 {
+        const b: byte = digest[i];
+        out[i * 2] = tlsx_hex_digit(b / (16 as byte));
+        out[i * 2 + 1] = tlsx_hex_digit(b % (16 as byte));
+        i = i + 1;
+    }
+}
+
+/// 从 handshake flight（消息流：type(1)+len(3)+body）里取 leaf 证书并算指纹。
+/// 成功返回 true；没有 Certificate 消息或长度畸形返回 false。
+export fn tlsx_leaf_fingerprint(flight: &const byte, flight_len: usize, out: &byte) bool {
+    var mp: usize = 0;
+    while mp +% 4 <= flight_len {
+        const mtype: byte = flight[mp];
+        const mlen: usize = ((flight[mp + 1] as usize) * 65536)
+            + ((flight[mp + 2] as usize) * 256)
+            + (flight[mp + 3] as usize);
+        if mp +% 4 +% mlen > flight_len {
+            return false;
+        }
+        if mtype == (11 as byte) && mlen >= 7 {
+            const body: usize = mp + 4;
+            const list_len: usize = ((flight[body] as usize) * 65536)
+                + ((flight[body + 1] as usize) * 256)
+                + (flight[body + 2] as usize);
+            if list_len >= 3 && body +% 3 +% list_len <= mp +% 4 +% mlen {
+                const cl: usize = body + 3;
+                const cert_len: usize = ((flight[cl] as usize) * 65536)
+                    + ((flight[cl + 1] as usize) * 256)
+                    + (flight[cl + 2] as usize);
+                if cert_len > 0 && cl +% 3 +% cert_len <= body +% 3 +% list_len {
+                    const der: &const byte = &flight[cl + 3];
+                    tlsx_sha256_hex(der, cert_len, out);
+                    return true;
+                }
+            }
+        }
+        mp = mp +% 4 +% mlen;
+    }
+    return false;
+}
+
+/// pin 比对：observed 为 64 字符 hex；pins 为 count 个 64 字符 hex 拼接。
+export fn tlsx_pin_match(observed: &[byte], pins: &[byte], pin_count: usize) bool {
+    if observed.len != TLSX_PIN_HEX_LEN || pin_count == 0 {
+        return false;
+    }
+    var i: usize = 0;
+    while i < pin_count {
+        const off: usize = i * TLSX_PIN_HEX_LEN;
+        if off +% TLSX_PIN_HEX_LEN > pins.len {
+            return false;
+        }
+        var k: usize = 0;
+        var eq: bool = true;
+        while k < TLSX_PIN_HEX_LEN {
+            if tlsx_lower(observed[k]) != tlsx_lower(pins[off + k]) {
+                eq = false;
+                break;
+            }
+            k = k + 1;
+        }
+        if eq {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+export fn tlsx_pins_init(p: &TlsxPins) void {
+    var i: usize = 0;
+    while i < TLSX_MAX_ENTRIES {
+        p.entries[i].host_len = 0;
+        p.entries[i].first_seen_ms = 0;
+        p.entries[i].updated_at_ms = 0;
+        p.entries[i].used = false;
+        i = i + 1;
+    }
+    p.count = 0;
+}
+
+fn tlsx_parse_u64(s: &[byte], out: &u64) bool {
+    if s.len == 0 || s.len > 20 {
+        return false;
+    }
+    var v: u64 = 0;
+    var i: usize = 0;
+    while i < s.len {
+        const c: byte = s[i];
+        if c < ('0' as byte) || c > ('9' as byte) {
+            return false;
+        }
+        v = v *% 10u64 +% ((c as u64) - 48u64);
+        i = i + 1;
+    }
+    out[0] = v;
+    return true;
+}
+
+fn tlsx_append_bytes(out: &byte, cap: usize, off: &usize, src: &const byte, src_len: usize) bool {
+    if off[0] +% src_len > cap {
+        return false;
+    }
+    var i: usize = 0;
+    while i < src_len {
+        out[off[0] + i] = src[i];
+        i = i + 1;
+    }
+    off[0] = off[0] + src_len;
+    return true;
+}
+
+fn tlsx_append_u64(out: &byte, cap: usize, off: &usize, v: u64) bool {
+    var tmp: [byte: 20] = [0: 20];
+    var n: usize = 0;
+    var x: u64 = v;
+    if x == 0 {
+        tmp[0] = '0' as byte;
+        n = 1;
+    } else {
+        while x > 0 && n < 20 {
+            tmp[n] = ('0' as byte) +% ((x % 10u64) as byte);
+            x = x / 10u64;
+            n = n + 1;
+        }
+    }
+    if off[0] +% n > cap {
+        return false;
+    }
+    var i: usize = 0;
+    while i < n {
+        out[off[0] + i] = tmp[n - 1 - i];
+        i = i + 1;
+    }
+    off[0] = off[0] + n;
+    return true;
+}
+
+/// 加载 TOFU 库；文件不存在视为空库（不是错误）。
+export fn tlsx_pins_load(path: &const byte, p: &TlsxPins) !void {
+    tlsx_pins_init(p);
+    const f: File = file_open(path, 0, 0) catch |_| {
+        return;
+    };
+    var buf: [byte: TLSX_TOFU_FILE_MAX] = [0: TLSX_TOFU_FILE_MAX];
+    var total: usize = 0;
+    while total < TLSX_TOFU_FILE_MAX {
+        const n: isize = file_read(&f, &buf[total], TLSX_TOFU_FILE_MAX - total);
+        if n <= 0 {
+            break;
+        }
+        total = total +% (n as usize);
+    }
+    file_close(&f) catch |_| {
+        return;
+    };
+    var pos: usize = 0;
+    while pos < total && p.count < TLSX_MAX_ENTRIES {
+        var end: usize = pos;
+        while end < total && buf[end] != ('\n' as byte) {
+            end = end + 1;
+        }
+        var le: usize = end;
+        if le > pos {
+            const li: usize = le - 1;
+            if li < TLSX_TOFU_FILE_MAX && buf[li] == ('\r' as byte) {
+                le = li;
+            }
+        }
+        if le > pos {
+            var f1: usize = pos;
+            while f1 < le && f1 < TLSX_TOFU_FILE_MAX && buf[f1] != ('\t' as byte) {
+                f1 = f1 + 1;
+            }
+            var f2: usize = f1 + 1;
+            while f2 < le && f2 < TLSX_TOFU_FILE_MAX && buf[f2] != ('\t' as byte) {
+                f2 = f2 + 1;
+            }
+            var f3: usize = f2 + 1;
+            while f3 < le && f3 < TLSX_TOFU_FILE_MAX && buf[f3] != ('\t' as byte) {
+                f3 = f3 + 1;
+            }
+            const host_len: usize = f1 - pos;
+            const sha_len: usize = f2 - (f1 + 1);
+            if host_len > 0 && host_len <= TLSX_HOST_MAX && sha_len == TLSX_PIN_HEX_LEN {
+                var first: u64 = 0;
+                var updated: u64 = 0;
+                const ok1: bool = tlsx_parse_u64(buf[f2 + 1: f3 - (f2 + 1)], &first);
+                const ok2: bool = tlsx_parse_u64(buf[f3 + 1: le - (f3 + 1)], &updated);
+                if ok1 && ok2 {
+                    const e: &TlsxPinEntry = &p.entries[p.count];
+                    var k: usize = 0;
+                    while k < host_len {
+                        e.host[k] = tlsx_lower(buf[pos + k]);
+                        k = k + 1;
+                    }
+                    e.host_len = host_len;
+                    k = 0;
+                    while k < TLSX_PIN_HEX_LEN {
+                        e.sha[k] = tlsx_lower(buf[f1 + 1 + k]);
+                        k = k + 1;
+                    }
+                    e.first_seen_ms = first;
+                    e.updated_at_ms = updated;
+                    e.used = true;
+                    p.count = p.count + 1;
+                }
+            }
+        }
+        pos = end +% 1;
+    }
+    return;
+}
+
+/// 保存 TOFU 库（覆盖写，0600）。
+export fn tlsx_pins_save(path: &const byte, p: &const TlsxPins) !void {
+    var buf: [byte: 32768] = [0: 32768];
+    var off: usize = 0;
+    var i: usize = 0;
+    while i < p.count && i < TLSX_MAX_ENTRIES {
+        const e: &const TlsxPinEntry = &p.entries[i];
+        if e.used {
+            if !tlsx_append_bytes(&buf[0], 32768, &off, e.host[0: e.host_len], e.host_len) {
+                return error.TlsxIo;
+            }
+            if !tlsx_append_bytes(&buf[0], 32768, &off, &"\t"[0: 1], 1) {
+                return error.TlsxIo;
+            }
+            if !tlsx_append_bytes(&buf[0], 32768, &off, &e.sha[0], TLSX_PIN_HEX_LEN) {
+                return error.TlsxIo;
+            }
+            if !tlsx_append_bytes(&buf[0], 32768, &off, &"\t"[0: 1], 1) {
+                return error.TlsxIo;
+            }
+            if !tlsx_append_u64(&buf[0], 32768, &off, e.first_seen_ms) {
+                return error.TlsxIo;
+            }
+            if !tlsx_append_bytes(&buf[0], 32768, &off, &"\t"[0: 1], 1) {
+                return error.TlsxIo;
+            }
+            if !tlsx_append_u64(&buf[0], 32768, &off, e.updated_at_ms) {
+                return error.TlsxIo;
+            }
+            if !tlsx_append_bytes(&buf[0], 32768, &off, &"\n"[0: 1], 1) {
+                return error.TlsxIo;
+            }
+        }
+        i = i + 1;
+    }
+    const f: File = try file_open(path, 1 | 64 | 512, 384);
+    var written: usize = 0;
+    while written < off {
+        const n: usize = try file_write(&f, &buf[written], off - written);
+        if n == 0 {
+            break;
+        }
+        written = written +% n;
+    }
+    file_close(&f) catch |_| {
+        return;
+    };
+    if written != off {
+        return error.TlsxIo;
+    }
+    return;
+}
+
+/// 查主机指纹：同一 host 可以有多条（证书轮换/多 CA/multi-DC）。
+/// 任一条 sha 命中 => MATCH；host 存在但一条都不命中 => MISMATCH；host 不在库里 => NOT_FOUND。
+export fn tlsx_tofu_check(p: &const TlsxPins, host: &[byte], sha: &const byte) i32 {
+    var host_seen: bool = false;
+    var i: usize = 0;
+    while i < p.count && i < TLSX_MAX_ENTRIES {
+        const e: &const TlsxPinEntry = &p.entries[i];
+        if e.used && e.host_len == host.len && tlsx_eq_nocase(e.host[0: e.host_len], host) {
+            host_seen = true;
+            var k: usize = 0;
+            var same: bool = true;
+            while k < TLSX_PIN_HEX_LEN {
+                if tlsx_lower(e.sha[k]) != tlsx_lower(sha[k]) {
+                    same = false;
+                    break;
+                }
+                k = k + 1;
+            }
+            if same {
+                return TLSX_TOFU_MATCH;
+            }
+        }
+        i = i + 1;
+    }
+    if host_seen {
+        return TLSX_TOFU_MISMATCH;
+    }
+    return TLSX_TOFU_NOT_FOUND;
+}
+
+/// 该 host 在库里已有几条指纹（测试与运维用）。
+export fn tlsx_host_pin_count(p: &const TlsxPins, host: &[byte]) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while i < p.count && i < TLSX_MAX_ENTRIES {
+        const e: &const TlsxPinEntry = &p.entries[i];
+        if e.used && e.host_len == host.len && tlsx_eq_nocase(e.host[0: e.host_len], host) {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// TOFU 判定（对应用户要求：同一域名支持多证书，新证书必须链校验通过）：
+///   - 已知 sha：直接通过（MATCH）；
+///   - 新 host：首用记录（LEARNED，无先验，风险见设计文档）；
+///   - 已知 host 的新 sha：只有 chain_ok 才追加（LEARNED），否则拒绝（MISMATCH）；
+///   - allow_learn=false：只查不学（NOT_FOUND/MISMATCH 原样返回）。
+export fn tlsx_tofu_decide(p: &TlsxPins, host: &[byte], sha: &const byte,
+    chain_ok: bool, allow_learn: bool, now_ms: u64) i32 {
+    const r: i32 = tlsx_tofu_check(p, host, sha);
+    if r == TLSX_TOFU_MATCH {
+        return TLSX_TOFU_MATCH;
+    }
+    if !allow_learn {
+        return r;
+    }
+    if r == TLSX_TOFU_NOT_FOUND {
+        _ = tlsx_tofu_upsert(p, host, sha, now_ms);
+        return TLSX_TOFU_LEARNED;
+    }
+    if !chain_ok {
+        return TLSX_TOFU_MISMATCH;
+    }
+    _ = tlsx_tofu_upsert(p, host, sha, now_ms);
+    return TLSX_TOFU_LEARNED;
+}
+
+/// 写入/更新一条记录：1=新增，2=更新，0=库满。
+export fn tlsx_tofu_upsert(p: &TlsxPins, host: &[byte], sha: &const byte, now_ms: u64) i32 {
+    if host.len == 0 || host.len > TLSX_HOST_MAX {
+        return 0;
+    }
+    var i: usize = 0;
+    while i < p.count && i < TLSX_MAX_ENTRIES {
+        const e: &TlsxPinEntry = &p.entries[i];
+        if e.used && e.host_len == host.len && tlsx_eq_nocase(e.host[0: e.host_len], host) {
+            var k: usize = 0;
+            var same: bool = true;
+            while k < TLSX_PIN_HEX_LEN {
+                if tlsx_lower(e.sha[k]) != tlsx_lower(sha[k]) {
+                    same = false;
+                    break;
+                }
+                k = k + 1;
+            }
+            if same {
+                e.updated_at_ms = now_ms;
+                return 2;
+            }
+        }
+        i = i + 1;
+    }
+    if p.count >= TLSX_MAX_ENTRIES {
+        return 0;
+    }
+    const e: &TlsxPinEntry = &p.entries[p.count];
+    var k: usize = 0;
+    while k < host.len {
+        e.host[k] = tlsx_lower(host[k]);
+        k = k + 1;
+    }
+    e.host_len = host.len;
+    k = 0;
+    while k < TLSX_PIN_HEX_LEN {
+        e.sha[k] = tlsx_lower(sha[k]);
+        k = k + 1;
+    }
+    e.first_seen_ms = now_ms;
+    e.updated_at_ms = now_ms;
+    e.used = true;
+    p.count = p.count + 1;
+    return 1;
+}
