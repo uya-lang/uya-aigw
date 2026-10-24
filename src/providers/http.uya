@@ -257,3 +257,52 @@ export fn httpp_error_json(status: i32, kind: &const byte, kind_len: usize,
     if !buf_append_cstr(out, "\"}}" as &const byte) { return false; }
     return true;
 }
+
+export fn httpp_set_host(cfg: &HttppConfig, host: &const byte, host_len: usize) bool {
+    if host_len == 0 || host_len > HTTPP_HOST_MAX {
+        return false;
+    }
+    if !httpp_copy(&cfg.host[0], HTTPP_HOST_MAX, host, host_len) {
+        return false;
+    }
+    cfg.host_len = host_len;
+    return true;
+}
+
+/// 构造供应商请求（chat / responses 通用）：base_path + path + 鉴权 + Accept + body。
+export fn httpp_build_request(cfg: &const HttppConfig, method: &const byte, method_len: usize,
+    path: &const byte, path_len: usize, body: &const byte, body_len: usize,
+    stream: bool, out: &Buf) bool {
+    if !buf_append(out, method, method_len) { return false; }
+    if !buf_append_cstr(out, " " as &const byte) { return false; }
+    if cfg.base_path_len > 0 {
+        if !buf_append(out, &cfg.base_path[0], cfg.base_path_len) { return false; }
+    }
+    if path_len > 0 {
+        if path[0] != (47 as byte) {
+            if !buf_append_cstr(out, "/" as &const byte) { return false; }
+        }
+        if !buf_append(out, path, path_len) { return false; }
+    }
+    if !buf_append_cstr(out, " HTTP/1.1\r\nHost: " as &const byte) { return false; }
+    if !buf_append(out, &cfg.host[0], cfg.host_len) { return false; }
+    if cfg.port != 443 && cfg.port != 80 {
+        if !buf_append_cstr(out, ":" as &const byte) { return false; }
+        if !buf_append_u64(out, cfg.port as u64) { return false; }
+    }
+    if !buf_append_cstr(out, "\r\n" as &const byte) { return false; }
+    if !httpp_auth_line(cfg, out) { return false; }
+    if !buf_append_cstr(out, "Content-Type: application/json\r\nAccept: " as &const byte) { return false; }
+    if stream {
+        if !buf_append_cstr(out, "text/event-stream" as &const byte) { return false; }
+    } else {
+        if !buf_append_cstr(out, "application/json" as &const byte) { return false; }
+    }
+    if !buf_append_cstr(out, "\r\nContent-Length: " as &const byte) { return false; }
+    if !buf_append_u64(out, body_len as u64) { return false; }
+    if !buf_append_cstr(out, "\r\nConnection: keep-alive\r\n\r\n" as &const byte) { return false; }
+    if body_len > 0 {
+        if !buf_append(out, body, body_len) { return false; }
+    }
+    return true;
+}

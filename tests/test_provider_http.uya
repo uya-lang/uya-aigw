@@ -78,3 +78,22 @@ test "secret_file" { run_test("secret_file", test_secret_file); }
 test "alias" { run_test("alias", test_alias); }
 test "auth" { run_test("auth", test_auth); }
 test "error_json" { run_test("error_json", test_error_json); }
+
+fn test_build_request() !void {
+    var cfg: HttppConfig = httpp_empty();
+    try assert_eq_bool(httpp_set_host(&cfg, &"api.x"[0: 5], 5), true);
+    cfg.port = 443;
+    cfg.auth_type = HTTPP_AUTH_BEARER;
+    _ = httpp_set_secret(&cfg, &"literal:sk-1"[0: 12], 12);
+    var b: Buf = buf_new(512);
+    defer { buf_free(&b); }
+    try assert_eq_bool(httpp_build_request(&cfg, &"POST"[0: 4], 4,
+        &"/chat/completions"[0: 17], 17, &"{}"[0: 2], 2, true, &b), true);
+    const v: &[byte] = b.ptr[0: b.len];
+    try assert_eq_bool(find_sub(v, &"POST /chat/completions HTTP/1.1"[0: 31], 0) >= 0, true);
+    try assert_eq_bool(find_sub(v, &"Host: api.x"[0: 11], 0) >= 0, true);
+    try assert_eq_bool(find_sub(v, &"Authorization: Bearer sk-1"[0: 26], 0) >= 0, true);
+    try assert_eq_bool(find_sub(v, &"Accept: text/event-stream"[0: 25], 0) >= 0, true);
+    try assert_eq_bool(find_sub(v, &"Content-Length: 2"[0: 17], 0) >= 0, true);
+}
+test "build_request" { run_test("build_request", test_build_request); }
