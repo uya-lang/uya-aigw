@@ -1,0 +1,241 @@
+// src/core/reqlog.uya — 每请求日志记录（一行一条，key=value）
+//
+// 字段对齐运维样例：Request ID、状态码、stop reason、endpoint、method、流式、
+// protocol、product、TTFT、model、provider、reasoning effort、max tokens、
+// input/output/cache-read tokens、cost、身份（邮箱 + user id）、client session、
+// UA、location、请求头摘要，另加 tok/s。
+//
+// 写法：定长字段 + `k=v` 用空格分隔；值里的空格/等号/换行替换成 `_`，
+// 这样日志永远是**一行**，`cut -d' ' -fN` 与 `grep` 都可靠。
+
+export const RL_FIELD_MAX: usize = 96;
+
+export struct RlFld {
+    buf: [byte: RL_FIELD_MAX],
+    len: usize,
+}
+
+export struct ReqLog {
+    request_id: RlFld,
+    endpoint: RlFld,
+    method: RlFld,
+    protocol: RlFld,
+    product: RlFld,
+    model: RlFld,
+    provider: RlFld,
+    stop_reason: RlFld,
+    reasoning_effort: RlFld,
+    user_email: RlFld,
+    user_id: RlFld,
+    client_session: RlFld,
+    user_agent: RlFld,
+    location: RlFld,
+    headers: RlFld,
+    status: i32,
+    stream: bool,
+    ttft_ms: u64,
+    duration_ms: u64,
+    max_tokens: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    cost_nano: i64,
+}
+
+fn rl_sanitize(dst: &RlFld, src: &const byte, n: usize) void {
+    var i: usize = 0;
+    while i < n && i < RL_FIELD_MAX {
+        var c: byte = src[i];
+        if c == (32 as byte) || c == (61 as byte) || c == (10 as byte) || c == (13 as byte)
+            || c == (9 as byte) || c == (34 as byte) {
+            c = '_' as byte;
+        }
+        dst.buf[i] = c;
+        i = i + 1;
+    }
+    dst.len = i;
+}
+
+export fn reqlog_init(r: &ReqLog) void {
+    r.status = 0;
+    r.stream = false;
+    r.ttft_ms = 0;
+    r.duration_ms = 0;
+    r.max_tokens = 0;
+    r.input_tokens = 0;
+    r.output_tokens = 0;
+    r.cache_read_tokens = 0;
+    r.cost_nano = 0;
+}
+
+export fn reqlog_set_request_id(r: &ReqLog, s: &[byte]) void {
+    rl_sanitize(&r.request_id, s.ptr, s.len);
+}
+export fn reqlog_set_endpoint(r: &ReqLog, s: &[byte]) void {
+    rl_sanitize(&r.endpoint, s.ptr, s.len);
+}
+export fn reqlog_set_method(r: &ReqLog, s: &[byte]) void {
+    rl_sanitize(&r.method, s.ptr, s.len);
+}
+export fn reqlog_set_protocol(r: &ReqLog, s: &[byte]) void {
+    rl_sanitize(&r.protocol, s.ptr, s.len);
+}
+export fn reqlog_set_product(r: &ReqLog, s: &[byte]) void {
+    rl_sanitize(&r.product, s.ptr, s.len);
+}
+export fn reqlog_set_model(r: &ReqLog, s: &[byte]) void {
+    rl_sanitize(&r.model, s.ptr, s.len);
+}
+export fn reqlog_set_provider(r: &ReqLog, s: &[byte]) void {
+    rl_sanitize(&r.provider, s.ptr, s.len);
+}
+export fn reqlog_set_stop_reason(r: &ReqLog, s: &[byte]) void {
+    rl_sanitize(&r.stop_reason, s.ptr, s.len);
+}
+export fn reqlog_set_reasoning_effort(r: &ReqLog, s: &[byte]) void {
+    rl_sanitize(&r.reasoning_effort, s.ptr, s.len);
+}
+export fn reqlog_set_user(r: &ReqLog, email: &[byte], id: &[byte]) void {
+    rl_sanitize(&r.user_email, email.ptr, email.len);
+    rl_sanitize(&r.user_id, id.ptr, id.len);
+}
+export fn reqlog_set_client_session(r: &ReqLog, s: &[byte]) void {
+    rl_sanitize(&r.client_session, s.ptr, s.len);
+}
+export fn reqlog_set_user_agent(r: &ReqLog, s: &[byte]) void {
+    rl_sanitize(&r.user_agent, s.ptr, s.len);
+}
+export fn reqlog_set_location(r: &ReqLog, s: &[byte]) void {
+    rl_sanitize(&r.location, s.ptr, s.len);
+}
+export fn reqlog_set_headers(r: &ReqLog, s: &[byte]) void {
+    rl_sanitize(&r.headers, s.ptr, s.len);
+}
+
+/// 成本：输入/输出/缓存命中三档费率（nano / 1M tokens）。
+export fn reqlog_compute_cost(r: &ReqLog, in_rate: i64, out_rate: i64, cache_rate: i64) void {
+    var c: i64 = money_cost_nano(r.input_tokens, in_rate);
+    c = money_add(c, money_cost_nano(r.output_tokens, out_rate));
+    c = money_add(c, money_cost_nano(r.cache_read_tokens, cache_rate));
+    r.cost_nano = c;
+}
+
+/// 速度（tokens/秒 × 100，四舍五入）；时长为 0 时返回 0。
+export fn reqlog_toks_x100(r: &const ReqLog) i64 {
+    if r.duration_ms == 0 {
+        return 0;
+    }
+    return aigw_mul_div_round(r.output_tokens, 100000 as i64, r.duration_ms as i64);
+}
+
+fn rl_push(out: &byte, cap: usize, off: &usize, b: byte) bool {
+    if off[0] >= cap {
+        return false;
+    }
+    out[off[0]] = b;
+    off[0] = off[0] + 1;
+    return true;
+}
+
+fn rl_str(out: &byte, cap: usize, off: &usize, s: &[byte]) bool {
+    var i: usize = 0;
+    while i < s.len {
+        if !rl_push(out, cap, off, s[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn rl_i64(out: &byte, cap: usize, off: &usize, v: i64) bool {
+    var tmp: [byte: 24] = [0: 24];
+    var n: usize = 0;
+    var x: i64 = v;
+    var neg: bool = false;
+    if x < 0 {
+        neg = true;
+        x = 0 -% x;
+    }
+    if x == 0 {
+        tmp[0] = '0' as byte;
+        n = 1;
+    } else {
+        while x > 0 && n < 24 {
+            tmp[n] = ('0' as byte) +% ((x % (10 as i64)) as byte);
+            x = x / (10 as i64);
+            n = n + 1;
+        }
+    }
+    if neg && !rl_push(out, cap, off, '-' as byte) {
+        return false;
+    }
+    var i: usize = n;
+    while i > 0 {
+        if !rl_push(out, cap, off, tmp[i - 1]) {
+            return false;
+        }
+        i = i - 1;
+    }
+    return true;
+}
+
+fn rl_kv(out: &byte, cap: usize, off: &usize, k: &[byte], v: &const RlFld) bool {
+    if v.len == 0 {
+        return true;
+    }
+    if off[0] > 0 && !rl_push(out, cap, off, 32) {
+        return false;
+    }
+    if !rl_str(out, cap, off, k) {
+        return false;
+    }
+    if !rl_push(out, cap, off, 61) {   // '='
+        return false;
+    }
+    return rl_str(out, cap, off, v.buf[0: v.len]);
+}
+
+fn rl_kv_num(out: &byte, cap: usize, off: &usize, k: &[byte], v: i64) bool {
+    if off[0] > 0 && !rl_push(out, cap, off, 32) {
+        return false;
+    }
+    if !rl_str(out, cap, off, k) {
+        return false;
+    }
+    if !rl_push(out, cap, off, 61) {
+        return false;
+    }
+    return rl_i64(out, cap, off, v);
+}
+
+/// 渲染成一行；返回写入长度（可能被 cap 截断，但保证是合法前缀）。
+export fn reqlog_format(out: &byte, cap: usize, r: &const ReqLog) usize {
+    var off: usize = 0;
+    _ = rl_kv(out, cap, &off, &"request_id="[0: 10], &r.request_id);
+    _ = rl_kv_num(out, cap, &off, &"status="[0: 6], r.status as i64);
+    _ = rl_kv(out, cap, &off, &"endpoint="[0: 8], &r.endpoint);
+    _ = rl_kv(out, cap, &off, &"method="[0: 6], &r.method);
+    _ = rl_kv_num(out, cap, &off, &"stream="[0: 6], (r.stream as i64));
+    _ = rl_kv(out, cap, &off, &"protocol="[0: 8], &r.protocol);
+    _ = rl_kv(out, cap, &off, &"product="[0: 7], &r.product);
+    _ = rl_kv_num(out, cap, &off, &"ttft_ms="[0: 7], r.ttft_ms as i64);
+    _ = rl_kv_num(out, cap, &off, &"duration_ms="[0: 11], r.duration_ms as i64);
+    _ = rl_kv(out, cap, &off, &"model="[0: 5], &r.model);
+    _ = rl_kv(out, cap, &off, &"provider="[0: 8], &r.provider);
+    _ = rl_kv(out, cap, &off, &"stop="[0: 4], &r.stop_reason);
+    _ = rl_kv(out, cap, &off, &"effort="[0: 6], &r.reasoning_effort);
+    _ = rl_kv_num(out, cap, &off, &"max_tokens="[0: 10], r.max_tokens);
+    _ = rl_kv_num(out, cap, &off, &"input="[0: 5], r.input_tokens);
+    _ = rl_kv_num(out, cap, &off, &"output="[0: 6], r.output_tokens);
+    _ = rl_kv_num(out, cap, &off, &"cache_read="[0: 10], r.cache_read_tokens);
+    _ = rl_kv_num(out, cap, &off, &"cost_nano="[0: 9], r.cost_nano);
+    _ = rl_kv_num(out, cap, &off, &"toks_x100="[0: 9], reqlog_toks_x100(r));
+    _ = rl_kv(out, cap, &off, &"email="[0: 5], &r.user_email);
+    _ = rl_kv(out, cap, &off, &"user="[0: 5], &r.user_id);
+    _ = rl_kv(out, cap, &off, &"session="[0: 7], &r.client_session);
+    _ = rl_kv(out, cap, &off, &"ua="[0: 2], &r.user_agent);
+    _ = rl_kv(out, cap, &off, &"loc="[0: 3], &r.location);
+    _ = rl_kv(out, cap, &off, &"headers="[0: 7], &r.headers);
+    return off;
+}

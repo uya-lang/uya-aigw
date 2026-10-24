@@ -1,0 +1,87 @@
+// tests/test_reqlog.uya — 每请求日志行单测
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+fn build(r: &ReqLog) void {
+    reqlog_init(r);
+    reqlog_set_request_id(r, &"01a16b51-b558-74b1-8901-b5082b4bdda5"[0: 36]);
+    reqlog_set_endpoint(r, &"/v1/chat/completions"[0: 20]);
+    reqlog_set_method(r, &"POST"[0: 4]);
+    reqlog_set_protocol(r, &"openai-chat"[0: 11]);
+    reqlog_set_product(r, &"uya-agent"[0: 9]);
+    reqlog_set_model(r, &"deepseek-v4.1-flash"[0: 19]);
+    reqlog_set_provider(r, &"OpenCode"[0: 8]);
+    reqlog_set_stop_reason(r, &"end_turn"[0: 8]);
+    reqlog_set_reasoning_effort(r, &"high"[0: 4]);
+    reqlog_set_user(r, &"funnywwh@qq.com"[0: 15], &"user_01M4ZQP0"[0: 12]);
+    reqlog_set_client_session(r, &"sess-1"[0: 6]);
+    reqlog_set_user_agent(r, &"uya-agent/0.1.1 (deepseek-harness-compatible)"[0: 44]);
+    reqlog_set_location(r, &"Shanghai"[0: 8]);
+    reqlog_set_headers(r, &"x-request-id:01a16b51"[0: 19]);
+    r.status = 200;
+    r.stream = true;
+    r.ttft_ms = 1040;
+    r.duration_ms = 4200;
+    r.max_tokens = 4096;
+    r.input_tokens = 301;
+    r.output_tokens = 688;
+    r.cache_read_tokens = 175488;
+}
+
+fn test_format_has_all_fields() !void {
+    var r: ReqLog = ReqLog{};
+    build(&r);
+    var b: Buf = buf_new(4096);
+    defer { buf_free(&b); }
+    const n: usize = reqlog_format(b.ptr, b.cap, &r);
+    b.len = n;
+    const v: &[byte] = b.ptr[0: b.len];
+    // 关键字与取值（长度均在调试输出中核对过）
+    try assert_eq_bool(find_sub(v, &"request_id=01a16b51"[0: 19], 0) >= 0, true);
+    try assert_eq_bool(find_sub(v, &"status=200"[0: 10], 0) >= 0, true);
+    try assert_eq_bool(find_sub(v, &"stream=1"[0: 8], 0) >= 0, true);
+    try assert_eq_bool(find_sub(v, &"provider=OpenCode"[0: 17], 0) >= 0, true);
+    try assert_eq_bool(find_sub(v, &"cache_read="[0: 11], 0) >= 0, true);
+    try assert_eq_bool(find_sub(v, &"email=funnywwh@qq.com"[0: 21], 0) >= 0, true);
+    try assert_eq_bool(find_sub(v, &"headers="[0: 8], 0) >= 0, true);
+    // 一行：没有换行
+    try assert_eq_bool(find_sub(v, &"\n"[0: 1], 0) < 0, true);
+    try assert_eq_i32(n as i32, b.len as i32);
+}
+
+fn test_sanitize() !void {
+    var r: ReqLog = ReqLog{};
+    reqlog_init(&r);
+    reqlog_set_user_agent(&r, &"a b=c\td"[0: 7]);
+    var b: Buf = buf_new(512);
+    defer { buf_free(&b); }
+    const n: usize = reqlog_format(b.ptr, b.cap, &r);
+    b.len = n;
+    const v: &[byte] = b.ptr[0: b.len];
+    try assert_eq_bool(find_sub(v, &"ua=a_b_c_d"[0: 10], 0) >= 0, true);
+    try assert_eq_bool(find_sub(v, &" "[0: 1], 0) >= 0, true);
+}
+
+fn test_cost_and_speed() !void {
+    var r: ReqLog = ReqLog{};
+    build(&r);
+    // in 301 × 2_000_000/1M = 602；out 688 × 6_000_000/1M = 4128；
+    // cache 175488 × 50_000/1M = 8774.4 → 8774
+    reqlog_compute_cost(&r, 2000000, 6000000, 50000);
+    try assert_eq_i32(r.cost_nano as i32, 13504);
+    // 688 tokens / 4.2s = 163.8 tok/s → x100 = 16381
+    try assert_eq_i32(reqlog_toks_x100(&r) as i32, 16381);
+}
+
+fn test_zero_duration() !void {
+    var r: ReqLog = ReqLog{};
+    reqlog_init(&r);
+    r.output_tokens = 100;
+    try assert_eq_i32(reqlog_toks_x100(&r) as i32, 0);
+}
+
+test "format_has_all_fields" { run_test("format_has_all_fields", test_format_has_all_fields); }
+test "sanitize" { run_test("sanitize", test_sanitize); }
+test "cost_and_speed" { run_test("cost_and_speed", test_cost_and_speed); }
+test "zero_duration" { run_test("zero_duration", test_zero_duration); }
