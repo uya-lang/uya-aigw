@@ -22,6 +22,6 @@ run src/net/httpc_pool.uya tests/test_httpc_pool.uya
 run src/foundation/buf.uya src/providers/http.uya tests/test_provider_http.uya
 run src/foundation/buf.uya src/net/proxyx.uya tests/test_proxyx.uya
 
-echo "== tls spike"
-./tests/tls_spike.sh 2>&1 | grep -a "TLS-SPIKE-OK"
+echo "== provider e2e (TLS + chain + CL/chunked/SSE)"
+./tests/provider_spike.sh 2>&1 | grep -a "PROV-ALL-OK"
 echo "ALL GREEN"

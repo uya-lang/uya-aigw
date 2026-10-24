@@ -96,3 +96,14 @@ TLS-SPIKE-OK n=31
 - 信任：SAN 主机名 + `chainx` 完整链校验，失败 fail-closed。
 
 已知限制：本实现按 TLS 1.2 路径验证（`s_server -tls1_2`）；TLS 1.3 路径尚未覆盖，TLS-06 前补测。
+## 8. 后续修正（TLS-09）
+
+- **应用数据必须走 record 层**：`tlsx_read_async`/`tlsx_write_async` 早期直接用了
+  `https_read_some_async`/`https_write_all_async`（裸 TLS 记录），导致明文被当密文发出、
+  服务端报 `record layer failure`。现改为 `ssl_read`/`ssl_write`。
+- **第二 flight 必须经状态机**：Finished 是加密记录，只有 `record_decrypt` 才能把
+  `read_seq` 推到 1，否则后续应用数据全部解不开。做法：把 CCS+Finished 拼回一条 flight，
+  置 `hs.state = HS_STATE_WAIT_SERVER_FINISHED` 后调用 `ssl_handshake_step`。
+- **非应用记录要丢弃**：NewSessionTicket 等解密后按记录类型跳过，alert 视为关闭。
+- `tests/tls_spike.sh`（s_server）已被 `tests/provider_spike.sh`（本机 Python TLS 上游，
+  覆盖 非流式/ chunked / SSE）取代，后者进入 `tests/run_all.sh`。

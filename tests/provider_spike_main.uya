@@ -145,6 +145,8 @@ fn step_stream(ctx: &HtcCtx, cfg: &const HttppConfig, now: u64) i32 {
         events = events + 1;
         if sse_is_done(&call.sse) {
             saw_done = true;
+            sse_consume(&call.sse);
+            break;          // SSE 以 [DONE] 收尾；上游随后可能保持 keep-alive
         }
         sse_consume(&call.sse);
     }

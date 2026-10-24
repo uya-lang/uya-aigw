@@ -332,8 +332,8 @@ export @async_fn fn htc_next_event_async(call: &HtcCall, has: &bool) Future<!i32
         if p > 0 {
             continue;
         }
-        if call.head.chunked && call.chunk_eof {
-            return 0;
+        if call.head.chunked && (call.chunk_eof || htc_chunk_terminated(call)) {
+            return 0;       // 终止块已到，且 plain 已取空
         }
         const rr: i32 = try @await htc_read_more_async(call);
         if rr <= 0 {
