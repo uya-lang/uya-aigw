@@ -25,7 +25,6 @@ Phase A0 (SQLite spike) 可与 Phase T 并行 ─────┘
 | ID | 任务 | 验收 | 依赖 |
 |---|---|---|---|
 | TLS-04 | `src/net/tlsx.uya`：指纹、pin、TOFU 多证书存储、链门控判定 | 同域多证书：已知通过；新证书链校验通过才追加；`none` 需显式开关 | TLS-03 |
-| TLS-04A | `src/net/chainx.uya`：移植 `cachain`/`x509min` 完整链校验（逐跳签名/SAN/pathLen/keyCertSign） | 本地 fixture 链通过/失败；新证书门控生效 | TLS-04 |
 | TLS-05 | **spike**：`https_handshake_async` + 读写接入自建事件循环 + 链校验接入 | 1k 并发流不阻塞；取消可回收；记录结论 | TLS-04A |
 | TLS-06 | `src/net/httpc.uya`：请求构造、响应解析、chunked、1xx、限长 | Content-Length/chunked/EOF/畸形响应用例 | TLS-05 |
 | TLS-07 | `src/net/ssex.uya`：SSE 解析、`[DONE]`、跨包分帧、取消、背压 | 断连即取消；空闲超时；1 MiB 缓冲上限 | TLS-06 |

@@ -1,0 +1,122 @@
+// tests/test_chainx.uya — 完整证书链校验（fixtures 由 openssl 生成，编译期 @embed）
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+const LEAF_DER: &[const byte] = @embed("fixtures/chain/leaf.der");
+const INTER_DER: &[const byte] = @embed("fixtures/chain/inter.der");
+const ROOT_PEM: &[const byte] = @embed("fixtures/chain/root.pem");
+const LEAF_PEM: &[const byte] = @embed("fixtures/chain/leaf.pem");
+
+fn put_u24(out: &byte, off: usize, v: usize) void {
+    out[off] = ((v / (65536 as usize)) % (256 as usize)) as byte;
+    out[off + 1] = ((v / (256 as usize)) % (256 as usize)) as byte;
+    out[off + 2] = (v % (256 as usize)) as byte;
+}
+
+fn put_bytes(out: &byte, off: usize, src: &const byte, n: usize) usize {
+    var i: usize = 0;
+    while i < n {
+        out[off + i] = src[i];
+        i = i + 1;
+    }
+    return off +% n;
+}
+
+// 构造 TLS 握手消息流里的 Certificate 消息（type 11）：
+// type(1) + len(3) + list_len(3) + [cert_len(3) + DER] * n
+fn build_flight(leaf: &const byte, leaf_n: usize,
+    inter: &const byte, inter_n: usize, out: &byte) usize {
+    var list: usize = (3 as usize) +% leaf_n;
+    if inter_n > 0 {
+        list = list +% (3 as usize) +% inter_n;
+    }
+    const mlen: usize = (3 as usize) +% list;
+    out[0] = 11;
+    put_u24(out, 1, mlen);
+    put_u24(out, 4, list);
+    var off: usize = 7;
+    put_u24(out, off, leaf_n);
+    off = off +% 3;
+    off = put_bytes(out, off, leaf, leaf_n);
+    if inter_n > 0 {
+        put_u24(out, off, inter_n);
+        off = off +% 3;
+        off = put_bytes(out, off, inter, inter_n);
+    }
+    return (4 as usize) +% mlen;
+}
+
+fn verify(f: &const byte, fl: usize, host: &[byte], bundle: &const byte, bundle_n: usize) i32 {
+    return chainx_verify_flight_bundle(f, fl, host.ptr, host.len, bundle, bundle_n);
+}
+
+fn test_chain_ok() !void {
+    var flight: [byte: 8192] = [0: 8192];
+    const fl: usize = build_flight(LEAF_DER.ptr, LEAF_DER.len,
+        INTER_DER.ptr, INTER_DER.len, &flight[0]);
+    const r: i32 = verify(&flight[0], fl, &"example.test"[0: 12], ROOT_PEM.ptr, ROOT_PEM.len);
+    try assert_eq_i32(r, 1);
+}
+
+fn test_wrong_host() !void {
+    var flight: [byte: 8192] = [0: 8192];
+    const fl: usize = build_flight(LEAF_DER.ptr, LEAF_DER.len,
+        INTER_DER.ptr, INTER_DER.len, &flight[0]);
+    const r: i32 = verify(&flight[0], fl, &"evil.test"[0: 9], ROOT_PEM.ptr, ROOT_PEM.len);
+    try assert_eq_i32(r, 0);
+}
+
+fn test_missing_intermediate() !void {
+    var flight: [byte: 8192] = [0: 8192];
+    const fl: usize = build_flight(LEAF_DER.ptr, LEAF_DER.len,
+        LEAF_DER.ptr, 0, &flight[0]);
+    const r: i32 = verify(&flight[0], fl, &"example.test"[0: 12], ROOT_PEM.ptr, ROOT_PEM.len);
+    try assert_eq_i32(r, 0);
+}
+
+fn test_untrusted_bundle() !void {
+    var flight: [byte: 8192] = [0: 8192];
+    const fl: usize = build_flight(LEAF_DER.ptr, LEAF_DER.len,
+        INTER_DER.ptr, INTER_DER.len, &flight[0]);
+    // 把叶子证书当 CA 库：它不是 CA，链无法终止
+    const r: i32 = verify(&flight[0], fl, &"example.test"[0: 12], LEAF_PEM.ptr, LEAF_PEM.len);
+    try assert_eq_bool(r != 1, true);
+}
+
+fn test_tampered_leaf() !void {
+    const ll: usize = LEAF_DER.len;
+    var bad: [byte: 4096] = [0: 4096];
+    var i: usize = 0;
+    while i < ll {
+        bad[i] = LEAF_DER.ptr[i];
+        i = i + 1;
+    }
+    const last: usize = ll -% 1;
+    if last < 4096 {
+        bad[last] = bad[last] +% 1;
+    }
+
+    var flight: [byte: 8192] = [0: 8192];
+    const fl: usize = build_flight(&bad[0], ll,
+        INTER_DER.ptr, INTER_DER.len, &flight[0]);
+    const r: i32 = verify(&flight[0], fl, &"example.test"[0: 12], ROOT_PEM.ptr, ROOT_PEM.len);
+    try assert_eq_i32(r, 0);
+}
+
+fn test_empty_bundle() !void {
+    var flight: [byte: 8192] = [0: 8192];
+    const fl: usize = build_flight(LEAF_DER.ptr, LEAF_DER.len,
+        INTER_DER.ptr, INTER_DER.len, &flight[0]);
+    var empty: [byte: 1] = [0: 1];
+    const r: i32 = chainx_verify_flight_bundle(&flight[0], fl, &"example.test"[0: 12], 12,
+        &empty[0], 0);
+    try assert_eq_i32(r, -1);
+}
+
+test "chain_ok" { run_test("chain_ok", test_chain_ok); }
+test "wrong_host" { run_test("wrong_host", test_wrong_host); }
+test "missing_intermediate" { run_test("missing_intermediate", test_missing_intermediate); }
+test "untrusted_bundle" { run_test("untrusted_bundle", test_untrusted_bundle); }
+test "tampered_leaf" { run_test("tampered_leaf", test_tampered_leaf); }
+test "empty_bundle" { run_test("empty_bundle", test_empty_bundle); }

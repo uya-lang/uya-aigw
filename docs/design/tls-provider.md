@@ -123,7 +123,7 @@ const r: !usize = await f;
 |---|---|---|---|
 | `pin` | leaf 证书 DER 的 SHA-256 与本机配置的 64 位 hex 完全一致（可配多个，轮换窗口） | 生产推荐；供应商证书稳定 | 证书轮换需更新配置，否则连接失败 |
 | `tofu` | 同 host 可存**多条**指纹；已知任一 sha 直接通过；同一 host 的**新 sha 仅当链校验通过才追加**；首用记录到 `data/tls_pins.tsv` | 默认；快速接入 | 首连可能被 MITM；新证书必须有链校验 |
-| `chain` | 完整链校验（逐跳签名、SAN、有效期、basicConstraints/pathLen/keyCertSign）+ 系统/自定义 CA bundle | 有私有 CA / 多证书轮换 | 需要 TLS-04A 的 verifier；stdlib `verify_chain_rsa` 不验签，不能单独用作门禁 |
+| `chain` | 完整链校验（逐跳签名、SAN、有效期、basicConstraints/pathLen/keyCertSign）+ 系统/自定义 CA bundle | 有私有 CA / 多证书轮换 | 由 `chainx`（TLS-04A）实现；stdlib `verify_chain_rsa` 不验签，不使用 |
 | `none` | 不校验 | 仅本机 mock / 排障 | 可被任意 MITM；必须显式 `allow_insecure: true` 并打警告日志 |
 
 实现要点（对齐 uya-agent）：
@@ -136,9 +136,9 @@ const r: !usize = await f;
   - 库里有该 host 但没有该 sha ⇒ **只有链校验通过才追加并通过**，否则拒绝（`TlsVerifyFailed`）；
   - 库里没有该 host ⇒ 首用记录（无先验，风险已知；`tofu_strict=true` 时首用也要求链校验）；
 - `tofu` 存储：`data/tls_pins.tsv`（每行 `host<TAB>sha256<TAB>first_seen_ms<TAB>updated_at_ms`），文件 0600；
-- **链校验实现**：stdlib 的 `verify_chain_rsa` **不验证签名**（只查有效期/basicConstraints/锚点公钥相等），
-  不能作为门禁；新增 `TLS-04A`：移植 uya-agent 的 `cachain` + `x509min`（逐跳验签、SAN、pathLen、keyCertSign）；
-  在它完成之前 `chain_ok` 一律按 `false`（fail-closed），绝不静默放行；
+- **链校验实现**：stdlib 的 `verify_chain_rsa` **不验证签名**（只查有效期/basicConstraints/锚点公钥相等），不能作为门禁；
+  TLS-04A 已移植 `chainx`（uya-agent `cachain` + `x509min`：逐跳验签、SAN、pathLen、keyCertSign、未知 critical 扩展 fail-closed）；
+  TLS-05 把 `chainx_verify_flight_bundle/_system` 的结论作为 `chain_ok`，绝不静默放行；
 - `none`：`ssl_set_insecure_skip_verify(ctx, true)`，日志 `tls_verify=none`。
 
 ### 4.3 证书轮换
@@ -352,7 +352,7 @@ User-Agent: uya-aigw/<version>
 1. **异步 TLS 原语不兼容**：`https_handshake_async` 依赖 `async_poll_pending_readable_usize` 的
    `Waker` 注册；若与自建循环的 fd 槽冲突，退回「TLS 客户端跑在子进程，stdio 传流」，
   进程模型与插件一致，性能损失可接受。
-2. **`chain` 档的 stdlib 实现不完整**：`verify_chain_rsa` 不验签，不能当门禁 → 由 TLS-04A 移植完整 verifier；在此之前 `chain_ok=false`（fail-closed）。
+2. **`chain` 档的 stdlib 实现不完整**：`verify_chain_rsa` 不验签 → 已由 TLS-04A 的 `chainx` 替代（逐跳验签 + SAN + pathLen）；stdlib 版不再使用。
 3. **TOFU 首连风险**：生产建议 `pin`；文档给出上线流程（可信网络 probe → 写 pin）。
 4. **DNS 阻塞**：异步 + 缓存 + 超时；极端情况下用 `/etc/hosts` 兜底。
 5. **证书轮换**：多 pin 值 + probe + 观察期。
