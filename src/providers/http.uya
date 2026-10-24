@@ -306,3 +306,42 @@ export fn httpp_build_request(cfg: &const HttppConfig, method: &const byte, meth
     }
     return true;
 }
+
+const HTTPP_KIND_UPSTREAM: &const byte = "upstream_error" as &const byte;
+const HTTPP_KIND_INVALID: &const byte = "invalid_request_error" as &const byte;
+const HTTPP_KIND_AUTH: &const byte = "provider_auth_error" as &const byte;
+const HTTPP_KIND_NOTFOUND: &const byte = "model_not_found" as &const byte;
+const HTTPP_KIND_TIMEOUT: &const byte = "upstream_timeout" as &const byte;
+const HTTPP_KIND_RATE: &const byte = "rate_limit_error" as &const byte;
+
+/// 上游 HTTP 状态码 -> 我方错误 kind（用于 httpp_error_json）。
+export fn httpp_status_kind(status: i32, out: &byte, out_cap: usize, out_len: &usize) bool {
+    var k: &const byte = HTTPP_KIND_UPSTREAM;
+    var kn: usize = 14;
+    if status == 400 {
+        k = HTTPP_KIND_INVALID;
+        kn = 21;
+    } else if status == 401 || status == 403 {
+        k = HTTPP_KIND_AUTH;
+        kn = 19;
+    } else if status == 404 {
+        k = HTTPP_KIND_NOTFOUND;
+        kn = 15;
+    } else if status == 408 {
+        k = HTTPP_KIND_TIMEOUT;
+        kn = 16;
+    } else if status == 429 {
+        k = HTTPP_KIND_RATE;
+        kn = 16;
+    }
+    if kn > out_cap {
+        return false;
+    }
+    var i: usize = 0;
+    while i < kn {
+        out[i] = k[i];
+        i = i + 1;
+    }
+    out_len[0] = kn;
+    return true;
+}

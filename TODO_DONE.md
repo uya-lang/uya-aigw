@@ -20,3 +20,4 @@
 | TLS-09A | 2026-10-24 | `git log --grep=TLS-09A` | `src/providers/http.uya`：密钥解析（env/file/literal）、模型别名、鉴权头（Bearer/x-api-key/api-key/query）、OpenAI 风格错误体（最小转义）；`tests/test_provider_http.uya` 6 组用例全过；异步 chat 调用留在 TLS-09 |
 | TLS-09B | 2026-10-24 | `git log --grep=TLS-09B` | `src/net/proxyx.uya`：http 代理 URL 解析、no_proxy 匹配（`*`/精确/后缀）、CONNECT 请求构造（含 Basic 认证）；`tests/test_proxyx.uya` 3 组用例全过 |
 | TLS-09C | 2026-10-24 | `git log --grep=TLS-09C` | `src/providers/http.uya`：`httpp_set_host` + `httpp_build_request`（method + base_path + path + Host/port + 鉴权 + Content-Type/Accept + Content-Length + body）；`tests/test_provider_http.uya` 新增 build_request 用例 |
+| TLS-09D | 2026-10-24 | `git log --grep=TLS-09D` | `src/providers/http.uya`：`httpp_status_kind`（400/401/403/404/408/429/5xx → 错误 kind）；`tests/test_provider_http.uya` 新增 status_kind 用例（16 个用例全过） |
