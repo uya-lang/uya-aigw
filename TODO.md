@@ -16,7 +16,7 @@ Phase A0 (SQLite spike) 可与 Phase T 并行 ─────┘
 ```
 
 - Phase T 与 A0 可并行；A1（事件循环）先于 A2–A9；B 依赖 A；C 依赖 A（用户端可先做）。
-- TLS-05 是 Phase T 的门禁：spike 失败则改「TLS 客户端子进程」方案，并在设计文档记录。
+- TLS-05 spike 已完成（负面结论：`https_handshake_async` 非可恢复）；TLS-05A 自写可恢复握手，若仍失败则退「TLS 客户端子进程」，见 `docs/design/tls-spike-findings.md`。
 
 ---
 
@@ -25,8 +25,8 @@ Phase A0 (SQLite spike) 可与 Phase T 并行 ─────┘
 | ID | 任务 | 验收 | 依赖 |
 |---|---|---|---|
 | TLS-04 | `src/net/tlsx.uya`：指纹、pin、TOFU 多证书存储、链门控判定 | 同域多证书：已知通过；新证书链校验通过才追加；`none` 需显式开关 | TLS-03 |
-| TLS-05 | **spike**：`https_handshake_async` + 读写接入自建事件循环 + 链校验接入 | 1k 并发流不阻塞；取消可回收；记录结论 | TLS-04A |
-| TLS-06 | `src/net/httpc.uya`：请求构造、响应解析、chunked、1xx、限长 | Content-Length/chunked/EOF/畸形响应用例 | TLS-05 |
+| TLS-05A | **可恢复握手**：`ssl_handshake_step` + 异步读完整 TLS record + 第二 flight 消费 + 链校验 | 本机 s_server 握手成功；并发流不阻塞；失败退子进程 | TLS-04A |
+| TLS-06 | `src/net/httpc.uya`：请求构造、响应解析、chunked、1xx、限长 | Content-Length/chunked/EOF/畸形响应用例 | TLS-05A |
 | TLS-07 | `src/net/ssex.uya`：SSE 解析、`[DONE]`、跨包分帧、取消、背压 | 断连即取消；空闲超时；1 MiB 缓冲上限 | TLS-06 |
 | TLS-08 | 连接池 + 重试/退避 + 代理 CONNECT + SSRF 检查 | 复用命中；不重试 4xx；私网默认拒绝 | TLS-06 |
 | TLS-09 | `src/providers/http.uya`：`kind:"http"`、密钥解析、模型映射、错误映射 | 配置即用；错误体脱敏；流式/非流式 | TLS-07/08 |
@@ -80,7 +80,7 @@ Phase A0 (SQLite spike) 可与 Phase T 并行 ─────┘
 
 ## 当前建议顺序
 
-1. TLS-01 → TLS-02 → TLS-03 → TLS-04 → TLS-04A → **TLS-05 spike**（门禁）
+1. TLS-01 → TLS-02 → TLS-03 → TLS-04 → TLS-04A → **TLS-05 spike（已完成，负面）** → TLS-05A（可恢复握手）
 2. 并行：A0 spike（SQLite + money）
 3. TLS-06 → TLS-07 → TLS-08 → TLS-09 → TLS-10 → TLS-11
 4. A1 → A2 → A3 → A4 → A5 → A6 → A7 → A8 → A9

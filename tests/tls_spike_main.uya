@@ -1,0 +1,84 @@
+// tests/tls_spike_main.uya — TLS-05 spike：异步握手 + 链校验 + 读写（本机 s_server）
+use libc.stdlib;
+
+extern "libc" fn printf(fmt: *byte, ...) i32;
+
+fn zlen(p: &const byte) usize {
+    var n: usize = 0;
+    while p[n] != (0 as byte) {
+        n = n + 1;
+    }
+    return n;
+}
+
+fn parse_u16(s: &[byte]) u16 {
+    var v: u16 = 0;
+    var i: usize = 0;
+    while i < s.len {
+        const c: byte = s[i];
+        if c >= ('0' as byte) && c <= ('9' as byte) {
+            v = v *% (10 as u16) +% ((c as u16) -% (48 as u16));
+        }
+        i = i + 1;
+    }
+    return v;
+}
+
+export fn main() i32 {
+    const ps: &byte = getenv("AIGW_TLS_PORT" as &const byte);
+    if (ps as usize) == 0 {
+        return 1;
+    }
+    const port: u16 = parse_u16(ps[0: zlen(ps)]);
+    const root: &byte = getenv("AIGW_TLS_ROOT" as &const byte);
+    if (root as usize) == 0 {
+        return 1;
+    }
+    const root_len: usize = zlen(root);
+
+    var ip: [byte: 4] = [0: 4];
+    ip[0] = 127;
+    ip[3] = 1;
+    const fd: i32 = tcpx_connect_v4(&ip[0], port, 5000) catch |_| {
+        printf("TLS-SPIKE-FAIL connect\n" as *byte);
+        return 2;
+    };
+
+    var conn: TlsxConn = tlsx_conn_empty();
+    var pins: [byte: 64] = [0: 64];
+    var tofu: TlsxPins = TlsxPins{};
+    tlsx_pins_init(&tofu);
+
+    const host: &[byte] = &"localhost"[0: 9];
+    const ores: !i32 = block_on<i32>(tlsx_conn_open_async(fd, host, TLSX_MODE_CHAIN,
+        &pins[0], 0, root as &const byte, root_len, &tofu, false, 1u64, &conn));
+    _ = ores catch |_| {
+        printf("TLS-SPIKE-FAIL tls reason=%s\n" as *byte, cc_last_reason().ptr);
+        tlsx_conn_free(&conn);
+        return 3;
+    };
+
+    const req: &[byte] = &"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n"[0: 35];
+    const wres: !usize = block_on<usize>(tlsx_write_async(&conn, &req[0], req.len));
+    _ = wres catch |_| {
+        printf("TLS-SPIKE-FAIL write\n" as *byte);
+        tlsx_conn_free(&conn);
+        return 4;
+    };
+
+    var buf: [byte: 4096] = [0: 4096];
+    const rres: !usize = block_on<usize>(tlsx_read_async(&conn, &buf[0], 4096));
+    const n: usize = rres catch |_| {
+        printf("TLS-SPIKE-FAIL read\n" as *byte);
+        tlsx_conn_free(&conn);
+        return 5;
+    };
+    if n < 12 {
+        printf("TLS-SPIKE-FAIL short n=%d\n" as *byte, n as i32);
+        tlsx_conn_free(&conn);
+        return 6;
+    }
+    printf("TLS-SPIKE-OK n=%d head=%.12s\n" as *byte, n as i32, &buf[0]);
+    tlsx_conn_free(&conn);
+    return 0;
+}

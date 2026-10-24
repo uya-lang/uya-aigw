@@ -1,0 +1,194 @@
+// src/net/tlsx_conn.uya — TLS 连接：异步握手、指纹、链校验、四档信任、读写
+//
+// 依赖合并命名空间里的：
+//   - tls/https + tls/ssl/*：异步握手与 record 读写；
+//   - tlsx：指纹、pin、TOFU（多证书）；
+//   - chainx：完整链校验；
+//   - x509min：叶子解析与 SAN 主机名匹配。
+//
+// 信任判定（fail-closed）：
+//   - 所有模式（除 none）先做 SAN 主机名匹配；
+//   - chain：chainx 返回 CC_OK 才通过；
+//   - pin：指纹在配置列表里才通过；
+//   - tofu：已知指纹直接通过；同 host 新指纹只有 chainx 通过才追加；首用按 TOFU 记录；
+//   - none：显式跳过（仅测试/排障）。
+
+use libc.heap;
+use libc.syscall;
+use tls.https;
+use tls.ssl.context;
+use tls.ssl.handshake;
+use tls.ssl.record;
+
+export error TlsxHandshakeFailed;
+export error TlsxNoLeaf;
+export error TlsxBadCert;
+export error TlsxHostMismatch;
+export error TlsxChainFailed;
+export error TlsxNoMemory;
+
+export struct TlsxConn {
+    fd: i32,
+    hs: &HandshakeCtx,
+    rec: &RecordCtx,
+    ctx: &SslContext,
+    fingerprint: [byte: 64],
+    fingerprint_ok: bool,
+    verified: bool,
+}
+
+export fn tlsx_conn_empty() TlsxConn {
+    var c: TlsxConn = TlsxConn{};
+    c.fd = -1;
+    return c;
+}
+
+fn tlsx_conn_drop_ctx(c: &TlsxConn) void {
+    if (c.ctx as usize) != 0 {
+        free(c.ctx as &void);
+        c.ctx = null as &SslContext;
+    }
+    if (c.hs as usize) != 0 {
+        free(c.hs as &void);
+        c.hs = null as &HandshakeCtx;
+    }
+    if (c.rec as usize) != 0 {
+        free(c.rec as &void);
+        c.rec = null as &RecordCtx;
+    }
+}
+
+export fn tlsx_conn_free(c: &TlsxConn) void {
+    tlsx_conn_drop_ctx(c);
+    if c.fd >= 0 {
+        _ = sys_close(c.fd) catch |_| { 0; };
+        c.fd = -1;
+    }
+}
+
+/// 在已连通的 fd 上做 TLS 握手并完成信任判定。
+/// 成功返回 0（conn.verified 表示是否真的校验过）；失败返回 error 并释放上下文。
+export @async_fn fn tlsx_conn_open_async(fd: i32, host: &[byte], mode: u8,
+    pins: &const byte, pin_count: usize, bundle: &const byte, bundle_len: usize,
+    tofu: &TlsxPins, allow_tofu_learn: bool, now_ms: u64,
+    conn: &TlsxConn) Future<!i32> {
+    if fd < 0 || host.len == 0 {
+        return error.TlsxBadCert;
+    }
+    conn.fd = fd;
+    const hs: &HandshakeCtx = malloc(@size_of(HandshakeCtx)) as &HandshakeCtx;
+    if (hs as usize) == 0 {
+        return error.TlsxNoMemory;
+    }
+    hs[0] = HandshakeCtx{};
+    const rec: &RecordCtx = malloc(@size_of(RecordCtx)) as &RecordCtx;
+    if (rec as usize) == 0 {
+        free(hs as &void);
+        return error.TlsxNoMemory;
+    }
+    rec[0] = RecordCtx{};
+    const ctx: &SslContext = malloc(@size_of(SslContext)) as &SslContext;
+    if (ctx as usize) == 0 {
+        free(hs as &void);
+        free(rec as &void);
+        return error.TlsxNoMemory;
+    }
+    ctx[0] = SslContext{ role: HS_ROLE_CLIENT, hs: hs, rec: rec };
+    conn.hs = hs;
+    conn.rec = rec;
+    conn.ctx = ctx;
+    ssl_init(ctx);
+    ssl_set_insecure_skip_verify(ctx, true);
+    ssl_set_skip_hostname_verify(ctx, true);
+    ssl_set_hostname(ctx, &host[0], host.len);
+
+    const hr: !usize = @await https_handshake_async(fd, ctx, HS_ROLE_CLIENT);
+    _ = hr catch |_| {
+        tlsx_conn_drop_ctx(conn);
+        return error.TlsxHandshakeFailed;
+    };
+
+    const fl: usize = hs.server_flight_msg_len;
+    if fl == 0 {
+        tlsx_conn_drop_ctx(conn);
+        return error.TlsxNoLeaf;
+    }
+    var fp: [byte: 64] = [0: 64];
+    if !tlsx_leaf_fingerprint(&hs.server_flight_msg[0], fl, &fp[0]) {
+        tlsx_conn_drop_ctx(conn);
+        return error.TlsxNoLeaf;
+    }
+    var k: usize = 0;
+    while k < 64 {
+        conn.fingerprint[k] = fp[k];
+        k = k + 1;
+    }
+    conn.fingerprint_ok = true;
+
+    var off: usize = 0;
+    var clen: usize = 0;
+    if !cc_flight_cert(&hs.server_flight_msg[0], fl, 0, &off, &clen) {
+        tlsx_conn_drop_ctx(conn);
+        return error.TlsxNoLeaf;
+    }
+    var leaf: XmCert = xm_empty();
+    if !xm_parse(&leaf, &hs.server_flight_msg[off], clen) {
+        tlsx_conn_drop_ctx(conn);
+        return error.TlsxBadCert;
+    }
+    if mode != TLSX_MODE_NONE && !xm_host_match(&leaf, &host[0], host.len) {
+        tlsx_conn_drop_ctx(conn);
+        return error.TlsxHostMismatch;
+    }
+
+    var chain_ok: bool = false;
+    if mode == TLSX_MODE_CHAIN || mode == TLSX_MODE_TOFU {
+        var res: i32 = 0;
+        if bundle_len > 0 {
+            res = chainx_verify_flight_bundle(&hs.server_flight_msg[0], fl,
+                &host[0], host.len, bundle, bundle_len);
+        } else {
+            res = chainx_verify_flight_system(&hs.server_flight_msg[0], fl,
+                &host[0], host.len);
+        }
+        chain_ok = res == CC_OK;
+    }
+
+    if mode == TLSX_MODE_NONE {
+        conn.verified = false;
+        return 0;
+    }
+    if mode == TLSX_MODE_PIN {
+        if !tlsx_pin_match(&fp[0], pins, pin_count) {
+            tlsx_conn_drop_ctx(conn);
+            return error.TlsxPinMismatch;
+        }
+        conn.verified = true;
+        return 0;
+    }
+    if mode == TLSX_MODE_CHAIN {
+        if !chain_ok {
+            tlsx_conn_drop_ctx(conn);
+            return error.TlsxChainFailed;
+        }
+        conn.verified = true;
+        return 0;
+    }
+    const d: i32 = tlsx_tofu_decide(tofu, host, &fp[0], chain_ok, allow_tofu_learn, now_ms);
+    if d == TLSX_TOFU_MISMATCH {
+        tlsx_conn_drop_ctx(conn);
+        return error.TlsxTofuMismatch;
+    }
+    conn.verified = d == TLSX_TOFU_MATCH;
+    return 0;
+}
+
+export @async_fn fn tlsx_read_async(c: &TlsxConn, out: &byte, max: usize) Future<!usize> {
+    const r: usize = try @await https_read_some_async(c.fd, out, max);
+    return r;
+}
+
+export @async_fn fn tlsx_write_async(c: &TlsxConn, src: &const byte, n: usize) Future<!usize> {
+    const r: usize = try @await https_write_all_async(c.fd, src, n);
+    return r;
+}

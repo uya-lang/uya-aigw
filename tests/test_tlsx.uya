@@ -73,8 +73,8 @@ fn test_pin_match() !void {
         i = i + 1;
     }
 
-    try assert_eq_bool(tlsx_pin_match(&obs[0: 64], &pins[0: 64], 1), true);
-    try assert_eq_bool(tlsx_pin_match(&obs[0: 64], &pins[0: 128], 2), true);
+    try assert_eq_bool(tlsx_pin_match(&obs[0], &pins[0], 1), true);
+    try assert_eq_bool(tlsx_pin_match(&obs[0], &pins[0], 2), true);
 
     var up: [byte: 64] = [0: 64];
     i = 0;
@@ -82,7 +82,7 @@ fn test_pin_match() !void {
         up[i] = toupper_hex(obs[i]);
         i = i + 1;
     }
-    try assert_eq_bool(tlsx_pin_match(&up[0: 64], &pins[0: 64], 1), true);
+    try assert_eq_bool(tlsx_pin_match(&up[0], &pins[0], 1), true);
 
     var bad: [byte: 64] = [0: 64];
     i = 0;
@@ -91,8 +91,8 @@ fn test_pin_match() !void {
         i = i + 1;
     }
     bad[0] = 'c' as byte;
-    try assert_eq_bool(tlsx_pin_match(&bad[0: 64], &pins[0: 64], 1), false);
-    try assert_eq_bool(tlsx_pin_match(&obs[0: 64], &pins[0: 64], 0), false);
+    try assert_eq_bool(tlsx_pin_match(&bad[0], &pins[0], 1), false);
+    try assert_eq_bool(tlsx_pin_match(&obs[0], &pins[0], 0), false);
 }
 
 fn test_tofu_store() !void {

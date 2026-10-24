@@ -28,3 +28,6 @@ logs/
 .vscode/
 *.swp
 .DS_Store
+
+# Uya 构建缓存（uya build 生成）
+.uyacache/

@@ -125,17 +125,14 @@ export fn tlsx_leaf_fingerprint(flight: &const byte, flight_len: usize, out: &by
     return false;
 }
 
-/// pin 比对：observed 为 64 字符 hex；pins 为 count 个 64 字符 hex 拼接。
-export fn tlsx_pin_match(observed: &[byte], pins: &[byte], pin_count: usize) bool {
-    if observed.len != TLSX_PIN_HEX_LEN || pin_count == 0 {
+/// pin 比对：observed 为 64 字符 hex；pins 为 count 个 64 字符 hex 拼接（调用方保证长度）。
+export fn tlsx_pin_match(observed: &const byte, pins: &const byte, pin_count: usize) bool {
+    if pin_count == 0 {
         return false;
     }
     var i: usize = 0;
     while i < pin_count {
         const off: usize = i * TLSX_PIN_HEX_LEN;
-        if off +% TLSX_PIN_HEX_LEN > pins.len {
-            return false;
-        }
         var k: usize = 0;
         var eq: bool = true;
         while k < TLSX_PIN_HEX_LEN {

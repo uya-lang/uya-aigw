@@ -12,3 +12,4 @@
 | TLS-03 | 2026-10-24 | `git log --grep=TLS-03` | `src/net/tcpx.uya`：sockaddr_in 构造、非阻塞 connect（复用 `std.async.async_connect`）、超时/错误分类、NODELAY/KEEPALIVE、同步包装；`tests/test_tcpx.uya` 4 组用例全过（本机回环，不依赖外网） |
 | TLS-04 | 2026-10-24 | `git log --grep=TLS-04` | `src/net/tlsx.uya`：SHA-256 指纹、leaf 解析、pin（多值/大小写折叠）、TOFU 多证书库（同一 host 多条）、链门控判定（新证书只有链校验通过才追加，fail-closed）、TSV 存取；`tests/test_tlsx.uya` 4 组用例全过（含同域多证书场景） |
 | TLS-04A | 2026-10-24 | `git log --grep=TLS-04A` | `src/net/chainx.uya`（移植 uya-agent `cachain`）、`src/net/x509min.uya`、`src/net/rsav.uya`、`src/foundation/buf.uya`：完整链校验（逐跳签名/SAN/pathLen/keyCertSign/有效期/未知 critical 扩展 fail-closed）；openssl 三级链 fixture，6 组用例全过（有效/错主机/缺中间/不可信锚/篡改签名/空库） |
+| TLS-05 | 2026-10-24 | `git log --grep=TLS-05` | spike（**负面结论**）：`https_handshake_async` 每次 poll 重跑阻塞版握手，非阻塞 fd 上反复重发 ClientHello、永不完成；证据/复现/三条备选见 `docs/design/tls-spike-findings.md`；转为 TLS-05A（自写可恢复握手） |
