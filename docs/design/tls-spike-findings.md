@@ -188,3 +188,29 @@ PROV-ALL-OK
 ```
 
 `stall` 用例是真正的验收点：上游半开时不挂住，按空闲预算收尾。
+
+## 10. A1 服务端（进行中的笔记）
+
+`src/net/serve.uya` 的首版（串行 accept + keep-alive + `/healthz`）在本机手工验证通过：
+
+```
+$ ./build/aigw serve --port 18994 &
+listen port=18994
+$ curl -sv http://127.0.0.1:18994/healthz
+< HTTP/1.1 200 OK
+< Content-Type: application/json
+< Content-Length: 11
+< Connection: keep-alive
+```
+
+踩到的坑（都已定位）：
+
+1. **`tcpx_sockaddr_v4` 要的是 4 字节二进制 IP，不是点分十进制字符串**。直接传 `"0.0.0.0"`
+   会把它当成 `48.46.48.46`，`bind` 报 `EADDRNOTAVAIL(99)`。需要先解析（`serve_parse_ipv4`）。
+2. **`@await ... catch |_| {}` 直接写成表达式会生成非法 C**（`err_union_int32_t` 没有
+   `.value`）。必须先 `const rf: !T = @await f();`，再 `const v: T = rf catch |_| {...};`。
+3. `Future<!void>` 的 async 函数在 `_ = @await f() catch ...` 里同样会炸，改成 `Future<!i32>`。
+
+脚本化回归（`tests/serve_smoke.sh`）最后一版仍在「起服务→curl」这一步失败（手工同样二进制却正常，
+怀疑脚本里的就绪探测与 `set -e` 组合），因此本任务**未提交**，代码已回退，等下一轮补上再进
+`run_all.sh`。
