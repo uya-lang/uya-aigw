@@ -77,3 +77,22 @@ tests/tls_spike.sh
 - `TODO.md`：TLS-05（spike）以「负面结论」完成，移入 `TODO_DONE.md`；
   新增 `TLS-05A`（可恢复握手），`TLS-06` 依赖它。
 - 设计文档风险项 1 更新为本结论。
+
+## 7. TLS-05A 结果（通过）
+
+自写可恢复握手落地后，本机 s_server 验证通过：
+
+```
+TLS-SPIKE-OK n=31
+```
+
+实现（`src/net/tlsx_conn.uya`）：
+
+- `tlsx_handshake_async`：`ssl_handshake_step`（INIT → ClientHello）；
+- `tlsx_hs_read_record_async`：5 字节 record 头 + payload，按长度读满；
+- `tlsx_flight_done`：扫描未加密 flight，看到 ServerHelloDone（type 14）即结束；
+- step(flight) → ClientFinished；再消费 CCS/Finished（type 20/22），不污染应用数据；
+- 之后 `https_read_some_async` / `https_write_all_async` 读写应用数据；
+- 信任：SAN 主机名 + `chainx` 完整链校验，失败 fail-closed。
+
+已知限制：本实现按 TLS 1.2 路径验证（`s_server -tls1_2`）；TLS 1.3 路径尚未覆盖，TLS-06 前补测。

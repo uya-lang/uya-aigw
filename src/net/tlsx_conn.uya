@@ -66,6 +66,160 @@ export fn tlsx_conn_free(c: &TlsxConn) void {
     }
 }
 
+// ============================================================
+// 可恢复握手（TLS-05A）
+//
+// https_handshake_async 每次 poll 重跑阻塞版握手（见 docs/design/tls-spike-findings.md），
+// 不能用在非阻塞 fd 上。这里直接用 ssl_handshake_step 的状态机：
+//   1) INIT -> ClientHello -> 写出；
+//   2) 异步读完整 TLS record，累积到 ServerHelloDone（handshake type 14）；
+//   3) step(flight) -> ClientFinished -> 写出；
+//   4) 消费服务端 CCS + Finished（type 20/22），避免污染应用数据。
+// ============================================================
+
+const TLSX_HS_SEND_MAX: usize = 32768;
+const TLSX_FLIGHT_MAX: usize = 65536;
+
+@async_fn fn tlsx_read_exact_async(fd: i32, out: &byte, need: usize) Future<!bool> {
+    var off: usize = 0;
+    while off < need {
+        const n: usize = try @await https_read_some_async(fd, &out[off], need - off);
+        if n == 0 {
+            return false;
+        }
+        off = off +% n;
+    }
+    return true;
+}
+
+/// 读一条完整 TLS record（5 字节头 + payload）。1=成功，0=连接关闭，-1=缓冲不够。
+@async_fn fn tlsx_hs_read_record_async(fd: i32, rec: &byte, cap: usize,
+    out_len: &usize) Future<!i32> {
+    var hdr: [byte: 5] = [0: 5];
+    const okh: bool = try @await tlsx_read_exact_async(fd, &hdr[0], 5);
+    if !okh {
+        return 0;
+    }
+    const len: usize = ((hdr[3] as usize) * 256) + (hdr[4] as usize);
+    if (5 as usize) +% len > cap {
+        return -1;
+    }
+    var i: usize = 0;
+    while i < 5 {
+        rec[i] = hdr[i];
+        i = i + 1;
+    }
+    if len > 0 {
+        const okp: bool = try @await tlsx_read_exact_async(fd, &rec[5], len);
+        if !okp {
+            return 0;
+        }
+    }
+    out_len[0] = (5 as usize) +% len;
+    return 1;
+}
+
+/// 扫描未加密的握手 flight，看到 ServerHelloDone（type 14）就说明第一条 flight 完整。
+fn tlsx_flight_done(flight: &const byte, len: usize) bool {
+    var p: usize = 0;
+    while p +% 5 <= len {
+        const rtype: byte = flight[p];
+        const rlen: usize = ((flight[p + 3] as usize) * 256) + (flight[p + 4] as usize);
+        if p +% 5 +% rlen > len {
+            return false;
+        }
+        if rtype == (22 as byte) {
+            var q: usize = p +% 5;
+            const qend: usize = p +% 5 +% rlen;
+            while q +% 4 <= qend {
+                const mtype: byte = flight[q];
+                const mlen: usize = ((flight[q + 1] as usize) * 65536)
+                    + ((flight[q + 2] as usize) * 256) + (flight[q + 3] as usize);
+                if q +% 4 +% mlen > qend {
+                    break;
+                }
+                if mtype == (14 as byte) {
+                    return true;
+                }
+                q = q +% 4 +% mlen;
+            }
+        }
+        p = p +% 5 +% rlen;
+    }
+    return false;
+}
+
+@async_fn fn tlsx_handshake_async(fd: i32, ctx: &SslContext) Future<!i32> {
+    var send: [byte: TLSX_HS_SEND_MAX] = [0: TLSX_HS_SEND_MAX];
+    var empty: [byte: 1] = [0: 1];
+    var slen: usize = 0;
+    var st: i32 = ssl_handshake_step(ctx, &empty[0], 0, &send[0], TLSX_HS_SEND_MAX, &slen);
+    if st == HS_STATUS_ERROR {
+        return error.TlsxHandshakeFailed;
+    }
+    if slen > 0 {
+        const w: usize = try @await https_write_all_async(fd, &send[0], slen);
+        if w != slen {
+            return error.TlsxHandshakeFailed;
+        }
+    }
+
+    var flight: [byte: TLSX_FLIGHT_MAX] = [0: TLSX_FLIGHT_MAX];
+    var flen: usize = 0;
+    var got: bool = false;
+    while flen < TLSX_FLIGHT_MAX {
+        var rlen: usize = 0;
+        const r: i32 = try @await tlsx_hs_read_record_async(fd, &flight[flen],
+            TLSX_FLIGHT_MAX - flen, &rlen);
+        if r != 1 {
+            return error.TlsxHandshakeFailed;
+        }
+        flen = flen +% rlen;
+        if tlsx_flight_done(&flight[0], flen) {
+            got = true;
+            break;
+        }
+    }
+    if !got {
+        return error.TlsxHandshakeFailed;
+    }
+
+    slen = 0;
+    st = ssl_handshake_step(ctx, &flight[0], flen, &send[0], TLSX_HS_SEND_MAX, &slen);
+    if st == HS_STATUS_ERROR {
+        return error.TlsxHandshakeFailed;
+    }
+    if slen > 0 {
+        const w2: usize = try @await https_write_all_async(fd, &send[0], slen);
+        if w2 != slen {
+            return error.TlsxHandshakeFailed;
+        }
+    }
+
+    // 消费服务端第二 flight（CCS + Finished），不解析内容，只保证不留在 socket 里。
+    var saw_ccs: bool = false;
+    var saw_fin: bool = false;
+    var guard: usize = 0;
+    var rec2: [byte: TLSX_HS_SEND_MAX] = [0: TLSX_HS_SEND_MAX];
+    while guard < 8 && !(saw_ccs && saw_fin) {
+        var rl2: usize = 0;
+        const r2: i32 = try @await tlsx_hs_read_record_async(fd, &rec2[0],
+            TLSX_HS_SEND_MAX, &rl2);
+        if r2 != 1 {
+            break;
+        }
+        const rt: byte = rec2[0];
+        if rt == (20 as byte) {
+            saw_ccs = true;
+        }
+        if rt == (22 as byte) {
+            saw_fin = true;
+        }
+        guard = guard + 1;
+    }
+    return 0;
+}
+
 /// 在已连通的 fd 上做 TLS 握手并完成信任判定。
 /// 成功返回 0（conn.verified 表示是否真的校验过）；失败返回 error 并释放上下文。
 export @async_fn fn tlsx_conn_open_async(fd: i32, host: &[byte], mode: u8,
@@ -102,7 +256,7 @@ export @async_fn fn tlsx_conn_open_async(fd: i32, host: &[byte], mode: u8,
     ssl_set_skip_hostname_verify(ctx, true);
     ssl_set_hostname(ctx, &host[0], host.len);
 
-    const hr: !usize = @await https_handshake_async(fd, ctx, HS_ROLE_CLIENT);
+    const hr: !i32 = @await tlsx_handshake_async(fd, ctx);
     _ = hr catch |_| {
         tlsx_conn_drop_ctx(conn);
         return error.TlsxHandshakeFailed;

@@ -1,5 +1,6 @@
 // tests/tls_spike_main.uya — TLS-05 spike：异步握手 + 链校验 + 读写（本机 s_server）
 use libc.stdlib;
+use std.io.file;
 
 extern "libc" fn printf(fmt: *byte, ...) i32;
 
@@ -34,7 +35,24 @@ export fn main() i32 {
     if (root as usize) == 0 {
         return 1;
     }
-    const root_len: usize = zlen(root);
+    var root_buf: [byte: 16384] = [0: 16384];
+    var root_n: usize = 0;
+    const rf: File = file_open(root as &const byte, 0, 0) catch |_| {
+        printf("TLS-SPIKE-FAIL open-root\n" as *byte);
+        return 7;
+    };
+    while root_n < 16384 {
+        const rn: isize = file_read(&rf, &root_buf[root_n], 16384 - root_n);
+        if rn <= 0 {
+            break;
+        }
+        root_n = root_n +% (rn as usize);
+    }
+    file_close(&rf) catch |_| { };
+    if root_n == 0 {
+        printf("TLS-SPIKE-FAIL empty-root\n" as *byte);
+        return 7;
+    }
 
     var ip: [byte: 4] = [0: 4];
     ip[0] = 127;
@@ -51,7 +69,7 @@ export fn main() i32 {
 
     const host: &[byte] = &"localhost"[0: 9];
     const ores: !i32 = block_on<i32>(tlsx_conn_open_async(fd, host, TLSX_MODE_CHAIN,
-        &pins[0], 0, root as &const byte, root_len, &tofu, false, 1u64, &conn));
+        &pins[0], 0, &root_buf[0], root_n, &tofu, false, 1u64, &conn));
     _ = ores catch |_| {
         printf("TLS-SPIKE-FAIL tls reason=%s\n" as *byte, cc_last_reason().ptr);
         tlsx_conn_free(&conn);

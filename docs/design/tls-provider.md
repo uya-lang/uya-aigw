@@ -349,9 +349,9 @@ User-Agent: uya-aigw/<version>
 
 ## 14. 风险与备选方案
 
-1. **异步握手不可恢复**：`https_handshake_async` 每次 poll 重跑阻塞版 `https_client_handshake`，
-   非阻塞 fd 上反复重发 ClientHello（TLS-05 spike 实证，见 `tls-spike-findings.md`）；
-   改由 TLS-05A 用 `ssl_handshake_step` + 异步 record 读实现；仍不稳则退「TLS 客户端子进程」。
+1. **异步握手不可恢复（已解决）**：`https_handshake_async` 每次 poll 重跑阻塞版 `https_client_handshake`，
+   非阻塞 fd 上反复重发 ClientHello（TLS-05 实证）；TLS-05A 已用 `ssl_handshake_step` + 异步 record 读
+   实现并通过本机 s_server 验证（见 `tls-spike-findings.md`）。
 2. **`chain` 档的 stdlib 实现不完整**：`verify_chain_rsa` 不验签 → 已由 TLS-04A 的 `chainx` 替代（逐跳验签 + SAN + pathLen）；stdlib 版不再使用。
 3. **TOFU 首连风险**：生产建议 `pin`；文档给出上线流程（可信网络 probe → 写 pin）。
 4. **DNS 阻塞**：异步 + 缓存 + 超时；极端情况下用 `/etc/hosts` 兜底。
