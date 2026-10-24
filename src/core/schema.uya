@@ -1,0 +1,142 @@
+// src/core/schema.uya — A2 数据模型与迁移
+//
+// 一次迁移 = 一个 `pragma user_version` 台阶：
+//   v0 → v1：身份与凭据（users / api_keys / otp_codes / sessions）
+// 后面 A2 的价目、分时、journal，以及 A4 的请求明细，各自是下一个台阶。
+//
+// 约定：
+//   * 迁移**幂等**：重复执行到同一版本不产生副作用（`create table if not exists`）。
+//   * 每个台阶在 `begin immediate` / `commit` 里，失败整体回滚，版本号不前进。
+//   * 时间一律 unix 秒（integer）；金额一律 nano-USD（integer），见 money.uya。
+//   * 文本列不放二进制密钥：api_keys 只存 sha256 十六进制。
+//
+// 打开流程（`schema_open`）：open → pragmas → migrate。热路径不该调它。
+
+export const SCHEMA_VERSION: i32 = 1;
+
+export error SchemaFailed;
+
+/// 打开库的推荐 PRAGMA。`:memory:` 上 WAL 建不起来，忽略即可。
+export fn schema_pragmas(d: &Db) !void {
+    _ = dbx_exec_cstr(d, "pragma journal_mode=wal" as &const byte) catch {};
+    try dbx_exec_cstr(d, "pragma synchronous=normal" as &const byte);
+    try dbx_exec_cstr(d, "pragma busy_timeout=5000" as &const byte);
+    try dbx_exec_cstr(d, "pragma foreign_keys=on" as &const byte);
+}
+
+/// 当前 schema 版本；读不到返回 -1。
+export fn schema_current(d: &Db) i32 {
+    var v: i64 = 0;
+    if dbx_scalar_i64(d, &"pragma user_version"[0: 19], &v) != 0 {
+        return 0 - 1;
+    }
+    return v as i32;
+}
+
+/// 打开 + pragmas + 迁移，一步到位。
+export fn schema_open(d: &Db, path: &[byte]) !i32 {
+    try dbx_open(d, path);
+    schema_pragmas(d) catch |_| {};
+    return schema_migrate(d);
+}
+
+// ---------------------------------------------------------------
+// v1：身份与凭据
+// ---------------------------------------------------------------
+//
+// users.status      0=active 1=suspended
+// api_keys.prefix   `aigw_sk_` 之后的 8 位，用来在 O(1) 里定位一条 key
+// api_keys.hash     sha256(整把 key) 的十六进制，逐字节比较
+// otp_codes.used_at 非 0 表示已消费；attempts 超过上限即作废
+// sessions.token_hash 同 api_keys.hash 的处理方式
+
+fn schema_v1(d: &Db) !void {
+    try dbx_exec_cstr(d, "create table if not exists users (id integer primary key, email text not null unique, slug text not null unique, status integer not null default 0, created_at integer not null, password_salt text not null default '', password_hash text not null default '')" as &const byte);
+    try dbx_exec_cstr(d, "create table if not exists api_keys (id integer primary key, user_id integer not null references users(id) on delete cascade, name text not null default '', prefix text not null, hash text not null, created_at integer not null, revoked_at integer not null default 0, rpm integer not null default 0, tpm integer not null default 0)" as &const byte);
+    try dbx_exec_cstr(d, "create unique index if not exists idx_api_keys_prefix on api_keys(prefix)" as &const byte);
+    try dbx_exec_cstr(d, "create index if not exists idx_api_keys_user on api_keys(user_id)" as &const byte);
+    try dbx_exec_cstr(d, "create table if not exists otp_codes (id integer primary key, email text not null, code_hash text not null, created_at integer not null, expires_at integer not null, attempts integer not null default 0, used_at integer not null default 0)" as &const byte);
+    try dbx_exec_cstr(d, "create index if not exists idx_otp_email on otp_codes(email, expires_at)" as &const byte);
+    try dbx_exec_cstr(d, "create table if not exists sessions (id integer primary key, user_id integer not null references users(id) on delete cascade, token_hash text not null unique, created_at integer not null, expires_at integer not null, ip text not null default '', ua text not null default '')" as &const byte);
+    try dbx_exec_cstr(d, "create index if not exists idx_sessions_user on sessions(user_id)" as &const byte);
+}
+
+// ---------------------------------------------------------------
+// 版本号写回
+// ---------------------------------------------------------------
+
+fn schema_put_digits(out: &byte, cap: usize, off: &usize, v: i32) bool {
+    var tmp: [byte: 16] = [0: 16];
+    var n: usize = 0;
+    var x: i32 = v;
+    if x == 0 {
+        tmp[0] = '0' as byte;
+        n = 1;
+    }
+    while x > 0 && n < 16 {
+        const d: i32 = x % 10;
+        tmp[n] = (48 as i32 + d) as byte;
+        x = x / 10;
+        n = n + 1;
+    }
+    var i: usize = n;
+    while i > 0 {
+        if off[0] >= cap {
+            return false;
+        }
+        out[off[0]] = tmp[i - 1];
+        off[0] = off[0] + 1;
+        i = i - 1;
+    }
+    return true;
+}
+
+fn schema_set_version(d: &Db, v: i32) !void {
+    var buf: [byte: 64] = [0: 64];
+    var off: usize = 0;
+    const head: &[byte] = &"pragma user_version = "[0: 22];
+    var i: usize = 0;
+    while i < head.len && off < 63 {
+        buf[off] = head[i];
+        off = off + 1;
+        i = i + 1;
+    }
+    if !schema_put_digits(&buf[0], 63, &off, v) {
+        return error.SchemaFailed;
+    }
+    buf[off] = 0 as byte;
+    try dbx_exec_cstr(d, &buf[0] as &const byte);
+}
+
+/// 幂等迁移：升级到 `SCHEMA_VERSION`，返回最终版本号。
+export fn schema_migrate(d: &Db) !i32 {
+    var cur: i32 = schema_current(d);
+    if cur < 0 {
+        return error.SchemaFailed;
+    }
+    while cur < SCHEMA_VERSION {
+        try dbx_exec_cstr(d, "begin immediate" as &const byte);
+        var applied: bool = false;
+        var failed: bool = false;
+        if cur == 0 {
+            schema_v1(d) catch |_| {
+                failed = true;
+            };
+            applied = true;
+        }
+        if !applied || failed {
+            _ = dbx_exec_cstr(d, "rollback" as &const byte) catch {};
+            return error.SchemaFailed;
+        }
+        schema_set_version(d, cur + 1) catch |_| {
+            _ = dbx_exec_cstr(d, "rollback" as &const byte) catch {};
+            return error.SchemaFailed;
+        };
+        dbx_exec_cstr(d, "commit" as &const byte) catch |_| {
+            _ = dbx_exec_cstr(d, "rollback" as &const byte) catch {};
+            return error.SchemaFailed;
+        };
+        cur = cur + 1;
+    }
+    return cur;
+}

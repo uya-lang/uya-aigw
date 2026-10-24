@@ -23,6 +23,7 @@ run src/foundation/buf.uya src/providers/http.uya tests/test_provider_http.uya
 run src/foundation/buf.uya src/net/proxyx.uya tests/test_proxyx.uya
 run src/core/money.uya tests/test_money.uya
 run src/core/dbx.uya tests/test_dbx.uya
+run src/core/dbx.uya src/core/schema.uya tests/test_schema.uya
 run src/foundation/buf.uya src/net/httpsrv.uya tests/test_httpsrv.uya
 run src/foundation/buf.uya src/core/money.uya src/core/reqlog.uya tests/test_reqlog.uya
 

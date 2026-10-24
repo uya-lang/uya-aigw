@@ -104,3 +104,93 @@ export fn dbx_strlen(p: &byte) usize {
     }
     return i;
 }
+
+// ---------------------------------------------------------------
+// 预编译语句（A2 起读多列文本 / 写参数化 SQL 都靠它）
+// ---------------------------------------------------------------
+
+extern fn aigw_db_prepare(h: &byte, sql: *const byte) &byte;
+extern fn aigw_db_step(st: &byte) i32;
+extern fn aigw_db_col_i64(st: &byte, col: i32) i64;
+extern fn aigw_db_col_text(st: &byte, col: i32, out: &byte, cap: i32) i32;
+extern fn aigw_db_bind_i64(st: &byte, idx: i32, v: i64) i32;
+extern fn aigw_db_bind_text(st: &byte, idx: i32, s: *const byte, n: i32) i32;
+extern fn aigw_db_bind_null(st: &byte, idx: i32) i32;
+extern fn aigw_db_reset(st: &byte) void;
+extern fn aigw_db_finalize(st: &byte) void;
+
+export error DbPrepareFailed;
+export error DbBindFailed;
+
+/// 一条预编译语句。用完必须 `dbx_finalize`（否则 sqlite 会一直持有它）。
+export struct DbStmt {
+    st: &byte,
+}
+
+/// 执行一条以 NUL 结尾的 SQL。给 DDL/常量 SQL 用：不用手数字面量长度。
+export fn dbx_exec_cstr(d: &Db, sql: &const byte) !void {
+    if aigw_db_exec(d.h, sql as *const byte) != 0 {
+        return error.DbExecFailed;
+    }
+    return;
+}
+
+/// 预编译一条以 NUL 结尾的 SQL。失败时 `dbx_last_error()` 里有原因。
+export fn dbx_prepare(d: &Db, sql: &const byte) !DbStmt {
+    const st: &byte = aigw_db_prepare(d.h, sql as *const byte);
+    if st == null {
+        return error.DbPrepareFailed;
+    }
+    return DbStmt{ st: st };
+}
+
+export fn dbx_bind_i64(st: &DbStmt, idx: i32, v: i64) !void {
+    if aigw_db_bind_i64(st.st, idx, v) == 0 {
+        return error.DbBindFailed;
+    }
+    return;
+}
+
+export fn dbx_bind_text(st: &DbStmt, idx: i32, s: &[byte]) !void {
+    if aigw_db_bind_text(st.st, idx, s.ptr as *const byte, s.len as i32) == 0 {
+        return error.DbBindFailed;
+    }
+    return;
+}
+
+export fn dbx_bind_null(st: &DbStmt, idx: i32) !void {
+    if aigw_db_bind_null(st.st, idx) == 0 {
+        return error.DbBindFailed;
+    }
+    return;
+}
+
+/// 步进：1 = 取到一行，0 = 结束，-1 = 出错。
+export fn dbx_step(st: &DbStmt) i32 {
+    return aigw_db_step(st.st);
+}
+
+export fn dbx_col_i64(st: &DbStmt, col: i32) i64 {
+    return aigw_db_col_i64(st.st, col);
+}
+
+/// 读文本列，返回写入 `out` 的字节数（超长截断，NULL 列返回 0）。
+export fn dbx_col_text(st: &DbStmt, col: i32, out: &byte, cap: usize) usize {
+    const n: i32 = aigw_db_col_text(st.st, col, out, cap as i32);
+    if n <= 0 {
+        return 0;
+    }
+    return n as usize;
+}
+
+/// 复用语句：重置游标并清绑定值。
+export fn dbx_reset(st: &DbStmt) void {
+    aigw_db_reset(st.st);
+}
+
+export fn dbx_finalize(st: &DbStmt) void {
+    if st.st != null {
+        aigw_db_finalize(st.st);
+        st.st = null;
+    }
+}

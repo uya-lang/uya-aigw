@@ -1,0 +1,115 @@
+// tests/test_schema.uya — A2 数据模型：迁移幂等 + 表结构 + 参数化读写
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+/// 表存在吗（sqlite_master 里按名字数）。
+fn table_exists(d: &Db, name: &[byte]) bool {
+    var n: i64 = 0;
+    var st: DbStmt = dbx_prepare(d,
+        "select count(*) from sqlite_master where type='table' and name=?" as &const byte) catch {
+        return false;
+    };
+    defer { dbx_finalize(&st); }
+    _ = dbx_bind_text(&st, 1, name) catch {
+        return false;
+    };
+    if dbx_step(&st) != 1 {
+        return false;
+    }
+    n = dbx_col_i64(&st, 0);
+    return n == 1;
+}
+
+fn test_migrate_memory() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    const v: i32 = try schema_open(&d, &":memory:"[0: 8]);
+    try assert_eq_i32(v, SCHEMA_VERSION);
+    try assert_eq_bool(table_exists(&d, &"users"[0: 5]), true);
+    try assert_eq_bool(table_exists(&d, &"api_keys"[0: 8]), true);
+    try assert_eq_bool(table_exists(&d, &"otp_codes"[0: 9]), true);
+    try assert_eq_bool(table_exists(&d, &"sessions"[0: 8]), true);
+}
+
+fn test_migrate_idempotent() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    _ = try schema_open(&d, &":memory:"[0: 8]);
+    const again: i32 = try schema_migrate(&d);
+    try assert_eq_i32(again, SCHEMA_VERSION);
+    try assert_eq_i32(schema_current(&d), SCHEMA_VERSION);
+}
+
+fn test_users_unique_email() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    _ = try schema_open(&d, &":memory:"[0: 8]);
+    try dbx_exec_cstr(&d, "insert into users(email, slug, created_at) values('a@example.com', 'u0000000001', 1700000000)" as &const byte);
+    var dup: bool = false;
+    _ = dbx_exec_cstr(&d, "insert into users(email, slug, created_at) values('a@example.com', 'u0000000002', 1700000001)" as &const byte) catch |_| {
+        dup = true;
+    };
+    try assert_eq_bool(dup, true);
+}
+
+fn test_api_key_roundtrip() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    _ = try schema_open(&d, &":memory:"[0: 8]);
+    try dbx_exec_cstr(&d, "insert into users(email, slug, created_at) values('k@example.com', 'u0000000003', 1700000000)" as &const byte);
+    var st: DbStmt = try dbx_prepare(&d, "insert into api_keys(user_id, name, prefix, hash, created_at) values(?, ?, ?, ?, ?)" as &const byte);
+    defer { dbx_finalize(&st); }
+    try dbx_bind_i64(&st, 1, 1);
+    try dbx_bind_text(&st, 2, &"main"[0: 4]);
+    try dbx_bind_text(&st, 3, &"abcdef12"[0: 8]);
+    try dbx_bind_text(&st, 4, &"00112233445566778899aabbccddeeff"[0: 32]);
+    try dbx_bind_i64(&st, 5, 1700000000);
+    try assert_eq_i32(dbx_step(&st), 0);
+
+    var q: DbStmt = try dbx_prepare(&d, "select user_id, name, hash from api_keys where prefix = ? and revoked_at = 0" as &const byte);
+    defer { dbx_finalize(&q); }
+    try dbx_bind_text(&q, 1, &"abcdef12"[0: 8]);
+    try assert_eq_i32(dbx_step(&q), 1);
+    try assert_eq_i32(dbx_col_i64(&q, 0) as i32, 1);
+    var name: [byte: 16] = [0: 16];
+    const nn: usize = dbx_col_text(&q, 1, &name[0], 16);
+    try assert_eq_i32(nn as i32, 4);
+    try assert_eq_i32(name[0] as i32, 'm' as i32);
+    var hash: [byte: 64] = [0: 64];
+    const hn: usize = dbx_col_text(&q, 2, &hash[0], 64);
+    try assert_eq_i32(hn as i32, 32);
+    try assert_eq_i32(dbx_step(&q), 0);
+}
+
+fn test_prefix_unique() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    _ = try schema_open(&d, &":memory:"[0: 8]);
+    try dbx_exec_cstr(&d, "insert into users(email, slug, created_at) values('p@example.com', 'u0000000004', 1700000000)" as &const byte);
+    try dbx_exec_cstr(&d, "insert into api_keys(user_id, prefix, hash, created_at) values(1, 'deadbeef', 'x', 1)" as &const byte);
+    var dup: bool = false;
+    _ = dbx_exec_cstr(&d, "insert into api_keys(user_id, prefix, hash, created_at) values(1, 'deadbeef', 'y', 2)" as &const byte) catch |_| {
+        dup = true;
+    };
+    try assert_eq_bool(dup, true);
+}
+
+fn test_user_delete_cascades() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    _ = try schema_open(&d, &":memory:"[0: 8]);
+    try dbx_exec_cstr(&d, "insert into users(email, slug, created_at) values('c@example.com', 'u0000000005', 1700000000)" as &const byte);
+    try dbx_exec_cstr(&d, "insert into api_keys(user_id, prefix, hash, created_at) values(1, 'cafe0001', 'x', 1)" as &const byte);
+    try dbx_exec_cstr(&d, "delete from users where id = 1" as &const byte);
+    var n: i64 = 0;
+    try assert_eq_i32(dbx_scalar_i64(&d, &"select count(*) from api_keys"[0: 29], &n), 0);
+    try assert_eq_i32(n as i32, 0);
+}
+
+test "migrate_memory" { run_test("migrate_memory", test_migrate_memory); }
+test "migrate_idempotent" { run_test("migrate_idempotent", test_migrate_idempotent); }
+test "users_unique_email" { run_test("users_unique_email", test_users_unique_email); }
+test "api_key_roundtrip" { run_test("api_key_roundtrip", test_api_key_roundtrip); }
+test "prefix_unique" { run_test("prefix_unique", test_prefix_unique); }
+test "user_delete_cascades" { run_test("user_delete_cascades", test_user_delete_cascades); }
