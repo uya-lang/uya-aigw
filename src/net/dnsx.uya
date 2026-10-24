@@ -1,0 +1,448 @@
+// src/net/dnsx.uya — DNS 缓存、/etc/hosts 与 /etc/resolv.conf 解析
+//
+// 目标：请求路径上尽快拿到地址，且不阻塞事件循环。
+//  - 字面量 / localhost：直接命中，不发查询；
+//  - 缓存：host -> 地址 + 过期时间，正/负缓存，LRU 淘汰；
+//  - hosts：纯函数解析（调用方在启动时读文件，喂文本进来）；
+//  - resolv.conf：纯函数扫描第一台 IPv4 nameserver；
+//  - 网络查询：@async_fn 包装 std.net.dns 的异步 A/AAAA 查询。
+//
+// 不做：IPv6 nameserver、search domain、CNAME 链缓存、DNSSEC。
+// 依赖：std.net.dns（异步查询）、std.time（调用方传入 now_ms）。
+
+use std.net.dns;
+
+export error DnsxNoResolver;
+
+export const DNSX_MAX_ADDRS: usize = 8;
+export const DNSX_HOST_MAX: usize = 253;
+export const DNSX_CACHE_SLOTS: usize = 128;
+
+export const DNSX_STATE_EMPTY: u8 = 0;
+export const DNSX_STATE_POS: u8 = 1;
+export const DNSX_STATE_NEG: u8 = 2;
+
+/// 一次解析结果：最多 8 个 IPv4 + 8 个 IPv6。
+export struct DnsxAddrs {
+    v4: [byte: DNSX_MAX_ADDRS * 4],
+    v4_n: usize,
+    v6: [byte: DNSX_MAX_ADDRS * 16],
+    v6_n: usize,
+}
+
+/// 缓存条目（字段摊平，避免嵌套结构体拷贝）。
+export struct DnsxEntry {
+    host: [byte: DNSX_HOST_MAX],
+    host_len: usize,
+    v4: [byte: DNSX_MAX_ADDRS * 4],
+    v4_n: usize,
+    v6: [byte: DNSX_MAX_ADDRS * 16],
+    v6_n: usize,
+    expire_ms: u64,
+    last_used: u64,
+    state: u8,
+}
+
+export struct DnsxCache {
+    slots: [DnsxEntry: DNSX_CACHE_SLOTS],
+}
+
+export fn dnsx_addrs_clear(a: &DnsxAddrs) void {
+    a.v4_n = 0;
+    a.v6_n = 0;
+}
+
+export fn dnsx_addrs_add_v4(a: &DnsxAddrs, ip: &const byte) void {
+    if a.v4_n >= DNSX_MAX_ADDRS {
+        return;
+    }
+    const off: usize = a.v4_n * 4;
+    a.v4[off] = ip[0];
+    a.v4[off + 1] = ip[1];
+    a.v4[off + 2] = ip[2];
+    a.v4[off + 3] = ip[3];
+    a.v4_n = a.v4_n + 1;
+}
+
+fn dnsx_addrs_add_v4_raw(a: &DnsxAddrs, raw: &const byte, raw_len: usize) void {
+    var i: usize = 0;
+    while i +% 4 <= raw_len && a.v4_n < DNSX_MAX_ADDRS {
+        const off: usize = a.v4_n * 4;
+        a.v4[off] = raw[i];
+        a.v4[off + 1] = raw[i + 1];
+        a.v4[off + 2] = raw[i + 2];
+        a.v4[off + 3] = raw[i + 3];
+        a.v4_n = a.v4_n + 1;
+        i = i + 4;
+    }
+}
+
+fn dnsx_addrs_add_v6_raw(a: &DnsxAddrs, raw: &const byte, raw_len: usize) void {
+    var i: usize = 0;
+    while i +% 16 <= raw_len && a.v6_n < DNSX_MAX_ADDRS {
+        const off: usize = a.v6_n * 16;
+        var k: usize = 0;
+        while k < 16 {
+            a.v6[off + k] = raw[i + k];
+            k = k + 1;
+        }
+        a.v6_n = a.v6_n + 1;
+        i = i + 16;
+    }
+}
+
+/// 解析 IPv4 点分十进制（严格 4 段、每段 0..255、无前导符号）。
+export fn dnsx_parse_ipv4(s: &[byte], out: &byte) bool {
+    var octets: [byte: 4] = [0: 4];
+    var oi: usize = 0;
+    var val: i32 = 0;
+    var digits: i32 = 0;
+    var i: usize = 0;
+    while i < s.len {
+        const c: byte = s[i];
+        if c == ('.' as byte) {
+            if digits == 0 || oi >= 3 {
+                return false;
+            }
+            octets[oi] = val as byte;
+            oi = oi + 1;
+            val = 0;
+            digits = 0;
+        } else if c >= ('0' as byte) && c <= ('9' as byte) {
+            val = val *% 10 +% ((c as i32) - 48);
+            if val > 255 {
+                return false;
+            }
+            digits = digits + 1;
+            if digits > 3 {
+                return false;
+            }
+        } else {
+            return false;
+        }
+        i = i + 1;
+    }
+    if oi != 3 || digits == 0 {
+        return false;
+    }
+    octets[3] = val as byte;
+    out[0] = octets[0];
+    out[1] = octets[1];
+    out[2] = octets[2];
+    out[3] = octets[3];
+    return true;
+}
+
+fn dnsx_lower(b: byte) byte {
+    if b >= ('A' as byte) && b <= ('Z' as byte) {
+        return (b +% 32) as byte;
+    }
+    return b;
+}
+
+fn dnsx_eq_nocase(a: &[byte], b: &[byte]) bool {
+    if a.len != b.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < a.len {
+        if dnsx_lower(a[i]) != dnsx_lower(b[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn dnsx_eq_exact(a: &[byte], b: &[byte]) bool {
+    if a.len != b.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < a.len {
+        if a[i] != b[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn dnsx_is_space(b: byte) bool {
+    return b == (' ' as byte) || b == ('\t' as byte) || b == ('\r' as byte);
+}
+
+/// 在 /etc/hosts 文本里查 host，命中写 out 并返回 1，否则 0。
+/// 支持注释、别名、大小写不敏感；只解析 IPv4 行（IPv6 行跳过）。
+export fn dnsx_hosts_parse(text: &[byte], host: &[byte], out: &DnsxAddrs) i32 {
+    var pos: usize = 0;
+    while pos < text.len {
+        var end: usize = pos;
+        while end < text.len && text[end] != ('\n' as byte) {
+            end = end + 1;
+        }
+        var cend: usize = end;
+        var ci: usize = pos;
+        while ci < end {
+            if text[ci] == ('#' as byte) {
+                cend = ci;
+                break;
+            }
+            ci = ci + 1;
+        }
+        var i: usize = pos;
+        while i < cend && dnsx_is_space(text[i]) {
+            i = i + 1;
+        }
+        var ie: usize = i;
+        while ie < cend && !dnsx_is_space(text[ie]) {
+            ie = ie + 1;
+        }
+        if ie > i {
+            var ip: [byte: 4] = [0: 4];
+            if dnsx_parse_ipv4(text[i: ie - i], &ip[0]) {
+                var t: usize = ie;
+                while t < cend {
+                    while t < cend && dnsx_is_space(text[t]) {
+                        t = t + 1;
+                    }
+                    var te: usize = t;
+                    while te < cend && !dnsx_is_space(text[te]) {
+                        te = te + 1;
+                    }
+                    if te > t && dnsx_eq_nocase(text[t: te - t], host) {
+                        dnsx_addrs_add_v4(out, &ip[0]);
+                        return 1;
+                    }
+                    t = te;
+                }
+            }
+        }
+        pos = end +% 1;
+    }
+    return 0;
+}
+
+/// 扫描 resolv.conf 文本，取第一台 IPv4 nameserver（可带 :port），写入 out。
+/// 成功返回 true；out_len 为写入字节数（不含 NUL）。
+export fn dnsx_resolv_scan(text: &[byte], out: &byte, out_max: usize, out_len: &usize) bool {
+    out_len[0] = 0;
+    var pos: usize = 0;
+    while pos < text.len {
+        var end: usize = pos;
+        while end < text.len && text[end] != ('\n' as byte) {
+            end = end + 1;
+        }
+        var cend: usize = end;
+        var ci: usize = pos;
+        while ci < end {
+            if text[ci] == ('#' as byte) {
+                cend = ci;
+                break;
+            }
+            ci = ci + 1;
+        }
+        var i: usize = pos;
+        while i < cend && dnsx_is_space(text[i]) {
+            i = i + 1;
+        }
+        if i +% 10 <= cend && dnsx_eq_exact(text[i: 10], &"nameserver"[0: 10]) {
+            const after: usize = i + 10;
+            if after >= cend || dnsx_is_space(text[after]) {
+                var t: usize = after;
+                while t < cend && dnsx_is_space(text[t]) {
+                    t = t + 1;
+                }
+                var te: usize = t;
+                while te < cend && !dnsx_is_space(text[te]) {
+                    te = te + 1;
+                }
+                const len: usize = te - t;
+                if len > 0 && len <= out_max {
+                    var k: usize = 0;
+                    while k < len {
+                        out[k] = text[t + k];
+                        k = k + 1;
+                    }
+                    out_len[0] = len;
+                    return true;
+                }
+            }
+        }
+        pos = end +% 1;
+    }
+    return false;
+}
+
+export fn dnsx_cache_init(c: &DnsxCache) void {
+    var i: usize = 0;
+    while i < DNSX_CACHE_SLOTS {
+        c.slots[i].host_len = 0;
+        c.slots[i].v4_n = 0;
+        c.slots[i].v6_n = 0;
+        c.slots[i].expire_ms = 0;
+        c.slots[i].last_used = 0;
+        c.slots[i].state = DNSX_STATE_EMPTY;
+        i = i + 1;
+    }
+}
+
+fn dnsx_entry_matches(e: &const DnsxEntry, host: &[byte]) bool {
+    if e.state == DNSX_STATE_EMPTY || e.host_len != host.len {
+        return false;
+    }
+    return dnsx_eq_nocase(e.host[0: e.host_len], host);
+}
+
+fn dnsx_entry_fill(e: &DnsxEntry, host: &[byte], a: &const DnsxAddrs, ttl_s: u32, now_ms: u64, state: u8) void {
+    var i: usize = 0;
+    while i < host.len && i < DNSX_HOST_MAX {
+        e.host[i] = dnsx_lower(host[i]);
+        i = i + 1;
+    }
+    e.host_len = i;
+    e.v4_n = a.v4_n;
+    e.v6_n = a.v6_n;
+    var k: usize = 0;
+    while k < a.v4_n * 4 {
+        e.v4[k] = a.v4[k];
+        k = k + 1;
+    }
+    k = 0;
+    while k < a.v6_n * 16 {
+        e.v6[k] = a.v6[k];
+        k = k + 1;
+    }
+    e.expire_ms = now_ms +% ((ttl_s as u64) *% 1000u64);
+    e.last_used = now_ms;
+    e.state = state;
+}
+
+/// 查缓存：1=正命中，-1=负命中，0=未命中/已过期。
+export fn dnsx_cache_get(c: &DnsxCache, host: &[byte], now_ms: u64, out: &DnsxAddrs) i32 {
+    var i: usize = 0;
+    while i < DNSX_CACHE_SLOTS {
+        if dnsx_entry_matches(&c.slots[i], host) {
+            const e: &DnsxEntry = &c.slots[i];
+            if now_ms >= e.expire_ms {
+                e.state = DNSX_STATE_EMPTY;
+                return 0;
+            }
+            e.last_used = now_ms;
+            if e.state == DNSX_STATE_NEG {
+                return -1;
+            }
+            out.v4_n = e.v4_n;
+            out.v6_n = e.v6_n;
+            var k: usize = 0;
+            while k < e.v4_n * 4 {
+                out.v4[k] = e.v4[k];
+                k = k + 1;
+            }
+            k = 0;
+            while k < e.v6_n * 16 {
+                out.v6[k] = e.v6[k];
+                k = k + 1;
+            }
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn dnsx_cache_slot_for(c: &DnsxCache, host: &[byte], now_ms: u64) usize {
+    var i: usize = 0;
+    while i < DNSX_CACHE_SLOTS {
+        if dnsx_entry_matches(&c.slots[i], host) {
+            return i;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < DNSX_CACHE_SLOTS {
+        if c.slots[i].state == DNSX_STATE_EMPTY {
+            return i;
+        }
+        i = i + 1;
+    }
+    var victim: usize = 0;
+    var oldest: u64 = c.slots[0].last_used;
+    i = 1;
+    while i < DNSX_CACHE_SLOTS {
+        if c.slots[i].last_used < oldest {
+            oldest = c.slots[i].last_used;
+            victim = i;
+        }
+        i = i + 1;
+    }
+    _ = now_ms;
+    return victim;
+}
+
+export fn dnsx_cache_put(c: &DnsxCache, host: &[byte], a: &const DnsxAddrs, ttl_s: u32, now_ms: u64) void {
+    const idx: usize = dnsx_cache_slot_for(c, host, now_ms);
+    if idx >= DNSX_CACHE_SLOTS {
+        return;
+    }
+    dnsx_entry_fill(&c.slots[idx], host, a, ttl_s, now_ms, DNSX_STATE_POS);
+}
+
+export fn dnsx_cache_put_negative(c: &DnsxCache, host: &[byte], now_ms: u64) void {
+    var empty: DnsxAddrs = DnsxAddrs{};
+    const idx: usize = dnsx_cache_slot_for(c, host, now_ms);
+    if idx >= DNSX_CACHE_SLOTS {
+        return;
+    }
+    dnsx_entry_fill(&c.slots[idx], host, &empty, 5, now_ms, DNSX_STATE_NEG);
+}
+
+/// 异步解析：字面量/localhost/缓存优先，未命中走 std.net.dns 的 A/AAAA 异步查询。
+/// 返回 1=有地址，0=NXDOMAIN（已负缓存）；网络错误走 error。
+@async_fn fn dnsx_resolve_async(host: &[byte], c: &DnsxCache, resolv: &[byte],
+    now_ms: u64, out: &DnsxAddrs) Future<!i32> {
+    dnsx_addrs_clear(out);
+    if host.len == 0 {
+        return 0;
+    }
+    var ip: [byte: 4] = [0: 4];
+    if dnsx_parse_ipv4(host, &ip[0]) {
+        dnsx_addrs_add_v4(out, &ip[0]);
+        return 1;
+    }
+    if dnsx_eq_nocase(host, &"localhost"[0: 9]) {
+        const lo: [byte: 4] = [127, 0, 0, 1];
+        dnsx_addrs_add_v4(out, &lo[0]);
+        return 1;
+    }
+    const hit: i32 = dnsx_cache_get(c, host, now_ms, out);
+    if hit != 0 {
+        return hit;
+    }
+    if resolv.len < 7 {
+        return error.DnsxNoResolver;
+    }
+    var cli: DnsClient = DnsClient{};
+    dns_client_init(&cli, resolv);
+    var raw4: [byte: 64] = [0: 64];
+    var n4: usize = 0;
+    const got4: usize = try @await dns_client_query_a_async(&cli, &host[0], host.len,
+        &raw4[0], 64, &n4);
+    if got4 > 0 {
+        dnsx_addrs_add_v4_raw(out, &raw4[0], got4);
+    }
+    var raw6: [byte: 128] = [0: 128];
+    var n6: usize = 0;
+    const r6: !usize = @await dns_client_query_aaaa_async(&cli, &host[0], host.len,
+        &raw6[0], 128, &n6);
+    const got6: usize = r6 catch |_| { 0 as usize; };
+    if got6 > 0 {
+        dnsx_addrs_add_v6_raw(out, &raw6[0], got6);
+    }
+    if out.v4_n == 0 && out.v6_n == 0 {
+        dnsx_cache_put_negative(c, host, now_ms);
+        return 0;
+    }
+    dnsx_cache_put(c, host, out, 60, now_ms);
+    return 1;
+}

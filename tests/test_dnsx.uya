@@ -1,0 +1,104 @@
+// tests/test_dnsx.uya — dnsx 单元测试（纯函数 + 缓存；不发网络）
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+fn test_ipv4_parse() !void {
+    var ip: [byte: 4] = [0: 4];
+    try assert_eq_bool(dnsx_parse_ipv4(&"1.2.3.4"[0: 7], &ip[0]), true);
+    try assert_eq_i32(ip[0] as i32, 1);
+    try assert_eq_i32(ip[1] as i32, 2);
+    try assert_eq_i32(ip[2] as i32, 3);
+    try assert_eq_i32(ip[3] as i32, 4);
+
+    try assert_eq_bool(dnsx_parse_ipv4(&"255.255.255.255"[0: 15], &ip[0]), true);
+    try assert_eq_i32(ip[0] as i32, 255);
+
+    try assert_eq_bool(dnsx_parse_ipv4(&"256.0.0.1"[0: 9], &ip[0]), false);
+    try assert_eq_bool(dnsx_parse_ipv4(&"1.2.3"[0: 5], &ip[0]), false);
+    try assert_eq_bool(dnsx_parse_ipv4(&"1.2.3.4.5"[0: 9], &ip[0]), false);
+    try assert_eq_bool(dnsx_parse_ipv4(&"a.b.c.d"[0: 7], &ip[0]), false);
+    try assert_eq_bool(dnsx_parse_ipv4(&"1..2.3"[0: 6], &ip[0]), false);
+    try assert_eq_bool(dnsx_parse_ipv4(&""[0: 0], &ip[0]), false);
+}
+
+fn test_hosts_parse() !void {
+    const text: &[byte] = &"127.0.0.1 localhost myhost\n# comment\n10.0.0.1 api.internal api\n"[0: 63];
+    var out: DnsxAddrs = DnsxAddrs{};
+
+    dnsx_addrs_clear(&out);
+    try assert_eq_i32(dnsx_hosts_parse(text, &"myhost"[0: 6], &out), 1);
+    try assert_eq_i32(out.v4_n as i32, 1);
+    try assert_eq_i32(out.v4[0] as i32, 127);
+    try assert_eq_i32(out.v4[3] as i32, 1);
+
+    dnsx_addrs_clear(&out);
+    try assert_eq_i32(dnsx_hosts_parse(text, &"API"[0: 3], &out), 1);
+    try assert_eq_i32(out.v4[0] as i32, 10);
+
+    dnsx_addrs_clear(&out);
+    try assert_eq_i32(dnsx_hosts_parse(text, &"localhost"[0: 9], &out), 1);
+
+    dnsx_addrs_clear(&out);
+    try assert_eq_i32(dnsx_hosts_parse(text, &"nope"[0: 4], &out), 0);
+    try assert_eq_i32(out.v4_n as i32, 0);
+}
+
+fn test_resolv_scan() !void {
+    const text: &[byte] = &"# comment\nnameserver 8.8.8.8\nnameserver 1.1.1.1\n"[0: 48];
+    var buf: [byte: 32] = [0: 32];
+    var n: usize = 0;
+    try assert_eq_bool(dnsx_resolv_scan(text, &buf[0], 32, &n), true);
+    try assert_eq_i32(n as i32, 7);
+    try assert_eq_i32(buf[0] as i32, '8' as i32);
+    try assert_eq_i32(buf[6] as i32, '8' as i32);
+
+    const no_ns: &[byte] = &"domain example.com\n"[0: 19];
+    var n2: usize = 0;
+    try assert_eq_bool(dnsx_resolv_scan(no_ns, &buf[0], 32, &n2), false);
+    try assert_eq_i32(n2 as i32, 0);
+}
+
+fn test_cache_hit_expire_negative() !void {
+    var c: DnsxCache = DnsxCache{};
+    dnsx_cache_init(&c);
+
+    var a: DnsxAddrs = DnsxAddrs{};
+    var ip: [byte: 4] = [0: 4];
+    _ = dnsx_parse_ipv4(&"1.2.3.4"[0: 7], &ip[0]);
+    dnsx_addrs_add_v4(&a, &ip[0]);
+    dnsx_cache_put(&c, &"example.com"[0: 11], &a, 60, 1000);
+
+    var out: DnsxAddrs = DnsxAddrs{};
+    try assert_eq_i32(dnsx_cache_get(&c, &"EXAMPLE.com"[0: 11], 2000, &out), 1);
+    try assert_eq_i32(out.v4_n as i32, 1);
+    try assert_eq_i32(out.v4[0] as i32, 1);
+
+    try assert_eq_i32(dnsx_cache_get(&c, &"example.com"[0: 11], 61000, &out), 0);
+
+    dnsx_cache_put_negative(&c, &"bad.example"[0: 11], 2000);
+    try assert_eq_i32(dnsx_cache_get(&c, &"bad.example"[0: 11], 3000, &out), -1);
+    try assert_eq_i32(dnsx_cache_get(&c, &"bad.example"[0: 11], 7000, &out), 0);
+
+    try assert_eq_i32(dnsx_cache_get(&c, &"missing.example"[0: 15], 1000, &out), 0);
+}
+
+fn test_addrs() !void {
+    var a: DnsxAddrs = DnsxAddrs{};
+    var ip: [byte: 4] = [0: 4];
+    ip[0] = 10;
+    ip[3] = 7;
+    dnsx_addrs_add_v4(&a, &ip[0]);
+    try assert_eq_i32(a.v4_n as i32, 1);
+    try assert_eq_i32(a.v4[0] as i32, 10);
+    try assert_eq_i32(a.v4[3] as i32, 7);
+    dnsx_addrs_clear(&a);
+    try assert_eq_i32(a.v4_n as i32, 0);
+    try assert_eq_i32(a.v6_n as i32, 0);
+}
+
+test "ipv4_parse" { run_test("ipv4_parse", test_ipv4_parse); }
+test "hosts_parse" { run_test("hosts_parse", test_hosts_parse); }
+test "resolv_scan" { run_test("resolv_scan", test_resolv_scan); }
+test "cache_hit_expire_negative" { run_test("cache_hit_expire_negative", test_cache_hit_expire_negative); }
+test "addrs" { run_test("addrs", test_addrs); }
