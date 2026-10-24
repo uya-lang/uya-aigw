@@ -1,0 +1,545 @@
+// src/core/store.uya — A2 身份与凭据（用户 / API Key / OTP / 会话）
+//
+// 设计约定：
+//   * 时间一律由调用方传入 `now`（unix 秒），本模块不读时钟 —— 单测才能确定化。
+//     需要现成的秒数用 `store_now()`。
+//   * 明文凭据只出现在**返回值**里（创建时给用户看一次），库里只有 sha256 十六进制。
+//   * 所有 SQL 都是预编译 + 绑定，用户输入永远不当 SQL 语法。
+//   * 查 Key 先按 8 位前缀定位（唯一索引），再比对整串哈希；前缀写库、明文不写库。
+//
+// 表结构见 `schema.uya` v1。
+
+use tls.crypto.sha256;
+use libc.syscall;
+
+/// API Key 前缀标记；整把 key = 标记 + 32 位十六进制。
+const STORE_KEY_TAG: &[byte] = &"aigw_sk_"[0: 8];
+/// 整把 key 的长度（8 + 32）。
+export const STORE_KEY_TOKEN_LEN: usize = 40;
+/// 库里存的前缀长度（标记之后的 8 位十六进制）。
+export const STORE_KEY_PREFIX_LEN: usize = 8;
+/// OTP 位数。
+export const STORE_OTP_LEN: usize = 6;
+/// 同一封邮件最多试几次 OTP。
+export const STORE_OTP_MAX_ATTEMPTS: i32 = 5;
+/// slug = 'u' + 10 位 base32。
+export const STORE_SLUG_LEN: usize = 11;
+
+export error StoreFailed;
+export error UserExists;
+export error UserNotFound;
+export error KeyInvalid;
+export error OtpInvalid;
+export error SessionInvalid;
+
+/// 用户的最小读模型。
+export struct StoreUser {
+    id: i64,
+    status: i32,
+    found: bool,
+}
+
+/// 校验通过后的 Key 读模型（鉴权只需要这些）。
+export struct StoreKey {
+    key_id: i64,
+    user_id: i64,
+    rpm: i32,
+    tpm: i32,
+}
+
+/// 当前 unix 秒。
+export fn store_now() i64 {
+    var ts: TimeSpec = TimeSpec{};
+    const r: !i32 = sys_clock_gettime(0, &ts);
+    _ = r catch {
+        return 0;
+    };
+    return ts.tv_sec;
+}
+
+// ---------------------------------------------------------------
+// 随机与编码
+// ---------------------------------------------------------------
+
+/// 从 /dev/urandom 读 `n` 字节。
+fn store_random(buf: &byte, n: usize, cap: usize) !void {
+    if n > cap || n == 0 {
+        return error.StoreFailed;
+    }
+    const fd: i32 = sys_open("/dev/urandom" as *const byte, 0 as i32, 0) catch |_| {
+        return error.StoreFailed;
+    };
+    defer { _ = sys_close(fd) catch {}; }
+    var got: usize = 0;
+    while got < n {
+        const r: !isize = sys_read(fd, &buf[got], n - got);
+        const k: isize = r catch {
+            return error.StoreFailed;
+        };
+        if k <= 0 {
+            return error.StoreFailed;
+        }
+        got = got +% (k as usize);
+    }
+    return;
+}
+
+fn store_hex_digit(v: byte) byte {
+    const d: byte = v & (15 as byte);
+    if d < 10 {
+        return (48 as byte) + d;
+    }
+    return (87 as byte) + d;
+}
+
+/// 写成 2n 位小写十六进制，返回写入长度。
+fn store_hex_out(data: &byte, n: usize, out: &byte, cap: usize) usize {
+    var i: usize = 0;
+    while i < n && (i * 2) + 1 < cap {
+        const v: byte = data[i];
+        out[i * 2] = store_hex_digit(v >> 4);
+        out[i * 2 + 1] = store_hex_digit(v);
+        i = i + 1;
+    }
+    return i * 2;
+}
+
+/// sha256(明文) 的十六进制，返回写入长度（正常 64）。
+fn store_sha256_hex(data: &const byte, len: usize, out: &byte, cap: usize) usize {
+    var digest: [byte: 32] = [0: 32];
+    sha256(data, len, &digest[0]);
+    return store_hex_out(&digest[0], 32, out, cap);
+}
+
+fn store_b32_char(v: byte) byte {
+    const x: byte = v % (32 as byte);
+    if x < 26 {
+        return (97 as byte) + x;
+    }
+    return (50 as byte) + (x - 26);
+}
+
+/// 生成 `u` + 10 位 base32 的接入 slug。
+export fn store_new_slug(out: &byte, cap: usize) !usize {
+    if cap < STORE_SLUG_LEN {
+        return error.StoreFailed;
+    }
+    var rb: [byte: 16] = [0: 16];
+    try store_random(&rb[0], 16, 16);
+    out[0] = 'u' as byte;
+    var i: usize = 0;
+    while i < STORE_SLUG_LEN - 1 {
+        out[i + 1] = store_b32_char(rb[i]);
+        i = i + 1;
+    }
+    return STORE_SLUG_LEN;
+}
+
+// ---------------------------------------------------------------
+// 用户
+// ---------------------------------------------------------------
+
+/// 唯一约束冲突的判定：sqlite 的错误信息里带 "UNIQUE"。
+fn store_last_error_is_unique() bool {
+    const e: &byte = dbx_last_error();
+    var i: usize = 0;
+    while i + 6 < 200 {
+        if e[i] == (0 as byte) {
+            return false;
+        }
+        if e[i] == ('U' as byte) && e[i + 1] == ('N' as byte) && e[i + 2] == ('I' as byte)
+            && e[i + 3] == ('Q' as byte) && e[i + 4] == ('U' as byte) && e[i + 5] == ('E' as byte) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// 建用户（email 唯一）。slug 不传就现生成一个。
+export fn store_create_user(d: &Db, email: &[byte], slug: &[byte], now: i64,
+    out: &StoreUser) !void {
+    var st: DbStmt = dbx_prepare(d,
+        "insert into users(email, slug, created_at) values(?, ?, ?)" as &const byte) catch {
+        return error.StoreFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, email) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_text(&st, 2, slug) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_i64(&st, 3, now) catch {
+        return error.StoreFailed;
+    };
+    const rc: i32 = dbx_step(&st);
+    if rc != 0 {
+        if store_last_error_is_unique() {
+            return error.UserExists;
+        }
+        return error.StoreFailed;
+    }
+    out.id = dbx_last_insert_rowid(d);
+    out.status = 0;
+    out.found = true;
+    return;
+}
+
+/// 按 email 找用户。
+export fn store_find_user(d: &Db, email: &[byte], out: &StoreUser) !void {
+    var st: DbStmt = dbx_prepare(d,
+        "select id, status from users where email = ?" as &const byte) catch {
+        return error.StoreFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, email) catch {
+        return error.StoreFailed;
+    };
+    if dbx_step(&st) != 1 {
+        return error.UserNotFound;
+    }
+    out.id = dbx_col_i64(&st, 0);
+    out.status = dbx_col_i64(&st, 1) as i32;
+    out.found = true;
+    return;
+}
+
+/// 改用户状态（0=active 1=suspended）。
+export fn store_set_user_status(d: &Db, user_id: i64, status: i32) !void {
+    var st: DbStmt = dbx_prepare(d, "update users set status = ? where id = ?" as &const byte) catch {
+        return error.StoreFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_i64(&st, 1, status as i64) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_i64(&st, 2, user_id) catch {
+        return error.StoreFailed;
+    };
+    if dbx_step(&st) != 0 {
+        return error.StoreFailed;
+    }
+    return;
+}
+
+// ---------------------------------------------------------------
+// API Key
+// ---------------------------------------------------------------
+
+/// 建一把 Key，把明文写进 `token_out`（只此一次），返回长度。
+export fn store_create_key(d: &Db, user_id: i64, name: &[byte], now: i64,
+    token_out: &byte, cap: usize) !usize {
+    if cap < STORE_KEY_TOKEN_LEN {
+        return error.StoreFailed;
+    }
+    var secret: [byte: 16] = [0: 16];
+    try store_random(&secret[0], 16, 16);
+    var i: usize = 0;
+    while i < STORE_KEY_TAG.len {
+        token_out[i] = STORE_KEY_TAG[i];
+        i = i + 1;
+    }
+    _ = store_hex_out(&secret[0], 16, &token_out[STORE_KEY_TAG.len], cap - STORE_KEY_TAG.len);
+    // 前缀 = 标记之后的 8 位
+    var prefix: [byte: 16] = [0: 16];
+    var p: usize = 0;
+    while p < STORE_KEY_PREFIX_LEN {
+        prefix[p] = token_out[STORE_KEY_TAG.len + p];
+        p = p + 1;
+    }
+    var hash: [byte: 80] = [0: 80];
+    const hn: usize = store_sha256_hex(&token_out[0] as &const byte, STORE_KEY_TOKEN_LEN, &hash[0], 80);
+    var st: DbStmt = dbx_prepare(d,
+        "insert into api_keys(user_id, name, prefix, hash, created_at) values(?, ?, ?, ?, ?)" as &const byte) catch {
+        return error.StoreFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_i64(&st, 1, user_id) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_text(&st, 2, name) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_text(&st, 3, prefix[0: STORE_KEY_PREFIX_LEN]) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_text(&st, 4, hash[0: hn]) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_i64(&st, 5, now) catch {
+        return error.StoreFailed;
+    };
+    if dbx_step(&st) != 0 {
+        return error.StoreFailed;
+    }
+    return STORE_KEY_TOKEN_LEN;
+}
+
+/// 校验一把 Key。未撤销、前缀命中且哈希一致才算通过。
+export fn store_verify_key(d: &Db, token: &[byte], out: &StoreKey) !void {
+    if token.len < STORE_KEY_TOKEN_LEN {
+        return error.KeyInvalid;
+    }
+    var i: usize = 0;
+    while i < STORE_KEY_TAG.len {
+        if token[i] != STORE_KEY_TAG[i] {
+            return error.KeyInvalid;
+        }
+        i = i + 1;
+    }
+    var prefix: [byte: 16] = [0: 16];
+    var p: usize = 0;
+    while p < STORE_KEY_PREFIX_LEN {
+        prefix[p] = token[STORE_KEY_TAG.len + p];
+        p = p + 1;
+    }
+    var hash: [byte: 80] = [0: 80];
+    const hn: usize = store_sha256_hex(token.ptr, STORE_KEY_TOKEN_LEN, &hash[0], 80);
+    var st: DbStmt = dbx_prepare(d,
+        "select id, user_id, hash, rpm, tpm from api_keys where prefix = ? and revoked_at = 0" as &const byte) catch {
+        return error.StoreFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, prefix[0: STORE_KEY_PREFIX_LEN]) catch {
+        return error.StoreFailed;
+    };
+    if dbx_step(&st) != 1 {
+        return error.KeyInvalid;
+    }
+    var stored: [byte: 80] = [0: 80];
+    const sn: usize = dbx_col_text(&st, 2, &stored[0], 80);
+    if sn != hn {
+        return error.KeyInvalid;
+    }
+    var k: usize = 0;
+    while k < hn {
+        if stored[k] != hash[k] {
+            return error.KeyInvalid;
+        }
+        k = k + 1;
+    }
+    out.key_id = dbx_col_i64(&st, 0);
+    out.user_id = dbx_col_i64(&st, 1);
+    out.rpm = dbx_col_i64(&st, 3) as i32;
+    out.tpm = dbx_col_i64(&st, 4) as i32;
+    return;
+}
+
+/// 撤销一把 Key（保留行，审计要看）。
+export fn store_revoke_key(d: &Db, key_id: i64, now: i64) !void {
+    var st: DbStmt = dbx_prepare(d, "update api_keys set revoked_at = ? where id = ?" as &const byte) catch {
+        return error.StoreFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_i64(&st, 1, now) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_i64(&st, 2, key_id) catch {
+        return error.StoreFailed;
+    };
+    if dbx_step(&st) != 0 {
+        return error.StoreFailed;
+    }
+    return;
+}
+
+// ---------------------------------------------------------------
+// OTP（邮箱验证码）
+// ---------------------------------------------------------------
+
+/// 发一个验证码：库里只存哈希，明文写进 `code_out` 返回长度。
+export fn store_request_otp(d: &Db, email: &[byte], now: i64, ttl: i64,
+    code_out: &byte, cap: usize) !usize {
+    if cap < STORE_OTP_LEN {
+        return error.StoreFailed;
+    }
+    var rb: [byte: 4] = [0: 4];
+    try store_random(&rb[0], 4, 4);
+    const v: u32 = ((rb[0] as u32) << 24) | ((rb[1] as u32) << 16) | ((rb[2] as u32) << 8) | (rb[3] as u32);
+    const code: u32 = v % (1000000 as u32);
+    code_out[0] = (48 as byte) + ((code / (100000 as u32)) % (10 as u32)) as byte;
+    code_out[1] = (48 as byte) + ((code / (10000 as u32)) % (10 as u32)) as byte;
+    code_out[2] = (48 as byte) + ((code / (1000 as u32)) % (10 as u32)) as byte;
+    code_out[3] = (48 as byte) + ((code / (100 as u32)) % (10 as u32)) as byte;
+    code_out[4] = (48 as byte) + ((code / (10 as u32)) % (10 as u32)) as byte;
+    code_out[5] = (48 as byte) + (code % (10 as u32)) as byte;
+    var hash: [byte: 80] = [0: 80];
+    const hn: usize = store_sha256_hex(&code_out[0] as &const byte, STORE_OTP_LEN, &hash[0], 80);
+    var st: DbStmt = dbx_prepare(d,
+        "insert into otp_codes(email, code_hash, created_at, expires_at) values(?, ?, ?, ?)" as &const byte) catch {
+        return error.StoreFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, email) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_text(&st, 2, hash[0: hn]) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_i64(&st, 3, now) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_i64(&st, 4, now +% ttl) catch {
+        return error.StoreFailed;
+    };
+    if dbx_step(&st) != 0 {
+        return error.StoreFailed;
+    }
+    return STORE_OTP_LEN;
+}
+
+/// 校验验证码：取该邮箱最新一条，未过期、未消费、未超试错上限，哈希一致才通过。
+export fn store_verify_otp(d: &Db, email: &[byte], code: &[byte], now: i64) !void {
+    if code.len != STORE_OTP_LEN {
+        return error.OtpInvalid;
+    }
+    var st: DbStmt = dbx_prepare(d,
+        "select id, code_hash, expires_at, attempts, used_at from otp_codes where email = ? order by id desc limit 1" as &const byte) catch {
+        return error.StoreFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, email) catch {
+        return error.StoreFailed;
+    };
+    if dbx_step(&st) != 1 {
+        return error.OtpInvalid;
+    }
+    const id: i64 = dbx_col_i64(&st, 0);
+    var stored: [byte: 80] = [0: 80];
+    const sn: usize = dbx_col_text(&st, 1, &stored[0], 80);
+    const expires_at: i64 = dbx_col_i64(&st, 2);
+    const attempts: i32 = dbx_col_i64(&st, 3) as i32;
+    const used_at: i64 = dbx_col_i64(&st, 4);
+    if used_at != 0 || now > expires_at || attempts >= STORE_OTP_MAX_ATTEMPTS {
+        return error.OtpInvalid;
+    }
+    var hash: [byte: 80] = [0: 80];
+    const hn: usize = store_sha256_hex(code.ptr, STORE_OTP_LEN, &hash[0], 80);
+    var same: bool = sn == hn;
+    var i: usize = 0;
+    while same && i < hn {
+        if stored[i] != hash[i] {
+            same = false;
+        }
+        i = i + 1;
+    }
+    if !same {
+        store_otp_bump_attempts(d, id) catch {};
+        return error.OtpInvalid;
+    }
+    var up: DbStmt = dbx_prepare(d, "update otp_codes set used_at = ? where id = ?" as &const byte) catch {
+        return error.StoreFailed;
+    };
+    defer { dbx_finalize(&up); }
+    dbx_bind_i64(&up, 1, now) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_i64(&up, 2, id) catch {
+        return error.StoreFailed;
+    };
+    if dbx_step(&up) != 0 {
+        return error.StoreFailed;
+    }
+    return;
+}
+
+fn store_otp_bump_attempts(d: &Db, id: i64) !void {
+    var st: DbStmt = dbx_prepare(d, "update otp_codes set attempts = attempts + 1 where id = ?" as &const byte) catch {
+        return error.StoreFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_i64(&st, 1, id) catch {
+        return error.StoreFailed;
+    };
+    if dbx_step(&st) != 0 {
+        return error.StoreFailed;
+    }
+    return;
+}
+
+// ---------------------------------------------------------------
+// 会话
+// ---------------------------------------------------------------
+
+/// 建会话：返回 32 位十六进制明文 token（库里存哈希）。
+export fn store_create_session(d: &Db, user_id: i64, now: i64, ttl: i64,
+    token_out: &byte, cap: usize) !usize {
+    if cap < 32 {
+        return error.StoreFailed;
+    }
+    var secret: [byte: 16] = [0: 16];
+    try store_random(&secret[0], 16, 16);
+    _ = store_hex_out(&secret[0], 16, token_out, cap);
+    var hash: [byte: 80] = [0: 80];
+    const hn: usize = store_sha256_hex(&token_out[0] as &const byte, 32, &hash[0], 80);
+    var st: DbStmt = dbx_prepare(d,
+        "insert into sessions(user_id, token_hash, created_at, expires_at) values(?, ?, ?, ?)" as &const byte) catch {
+        return error.StoreFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_i64(&st, 1, user_id) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_text(&st, 2, hash[0: hn]) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_i64(&st, 3, now) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_i64(&st, 4, now +% ttl) catch {
+        return error.StoreFailed;
+    };
+    if dbx_step(&st) != 0 {
+        return error.StoreFailed;
+    }
+    return 32 as usize;
+}
+
+/// 校验会话 token，通过则写回 user_id。
+export fn store_verify_session(d: &Db, token: &[byte], now: i64, user_id_out: &i64) !void {
+    if token.len != 32 {
+        return error.SessionInvalid;
+    }
+    var hash: [byte: 80] = [0: 80];
+    const hn: usize = store_sha256_hex(token.ptr, 32, &hash[0], 80);
+    var st: DbStmt = dbx_prepare(d,
+        "select user_id, expires_at from sessions where token_hash = ?" as &const byte) catch {
+        return error.StoreFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, hash[0: hn]) catch {
+        return error.StoreFailed;
+    };
+    if dbx_step(&st) != 1 {
+        return error.SessionInvalid;
+    }
+    const uid: i64 = dbx_col_i64(&st, 0);
+    const exp: i64 = dbx_col_i64(&st, 1);
+    if now > exp {
+        store_drop_session(d, token) catch {};
+        return error.SessionInvalid;
+    }
+    user_id_out[0] = uid;
+    return;
+}
+
+/// 注销会话。
+export fn store_drop_session(d: &Db, token: &[byte]) !void {
+    if token.len != 32 {
+        return error.SessionInvalid;
+    }
+    var hash: [byte: 80] = [0: 80];
+    const hn: usize = store_sha256_hex(token.ptr, 32, &hash[0], 80);
+    var st: DbStmt = dbx_prepare(d, "delete from sessions where token_hash = ?" as &const byte) catch {
+        return error.StoreFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, hash[0: hn]) catch {
+        return error.StoreFailed;
+    };
+    if dbx_step(&st) != 0 {
+        return error.StoreFailed;
+    }
+    return;
+}

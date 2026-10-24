@@ -1,0 +1,257 @@
+// tests/test_store.uya — A2 身份与凭据：用户 / Key / OTP / 会话
+//
+// 全部用固定 `now` 驱动，不依赖真实时间；随机性只验证「格式 + 能自洽校验」。
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+const T0: i64 = 1700000000;
+
+fn open_db(d: &Db) !void {
+    _ = try schema_open(d, &":memory:"[0: 8]);
+}
+
+fn test_user_create_and_find() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    var u: StoreUser = StoreUser{ id: 0, status: 0, found: false };
+    var slug: [byte: 16] = [0: 16];
+    const sn: usize = try store_new_slug(&slug[0], 16);
+    try assert_eq_i32(sn as i32, 11);
+    try assert_eq_i32(slug[0] as i32, 'u' as i32);
+    try store_create_user(&d, &"alice@example.com"[0: 17], slug[0: sn], T0, &u);
+    try assert_eq_i32(u.id as i32, 1);
+    try assert_eq_bool(u.found, true);
+
+    var f: StoreUser = StoreUser{ id: 0, status: 0, found: false };
+    try store_find_user(&d, &"alice@example.com"[0: 17], &f);
+    try assert_eq_i32(f.id as i32, 1);
+    try assert_eq_i32(f.status, 0);
+
+    var missing: bool = false;
+    _ = store_find_user(&d, &"nobody@example.com"[0: 18], &f) catch |_| {
+        missing = true;
+    };
+    try assert_eq_bool(missing, true);
+}
+
+fn test_user_duplicate() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    var u: StoreUser = StoreUser{ id: 0, status: 0, found: false };
+    try store_create_user(&d, &"dup@example.com"[0: 15], &"u0000000001"[0: 11], T0, &u);
+    var dup: bool = false;
+    _ = store_create_user(&d, &"dup@example.com"[0: 15], &"u0000000002"[0: 11], T0, &u) catch |_| {
+        dup = true;
+    };
+    try assert_eq_bool(dup, true);
+}
+
+fn test_key_lifecycle() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    var u: StoreUser = StoreUser{ id: 0, status: 0, found: false };
+    try store_create_user(&d, &"key@example.com"[0: 15], &"u0000000003"[0: 11], T0, &u);
+
+    var tok: [byte: 64] = [0: 64];
+    const n: usize = try store_create_key(&d, u.id, &"ci"[0: 2], T0, &tok[0], 64);
+    try assert_eq_i32(n as i32, 40);
+    // aigw_sk_ 前缀 + 32 位十六进制
+    try assert_eq_i32(tok[0] as i32, 'a' as i32);
+    try assert_eq_i32(tok[7] as i32, 95);
+
+    var k: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
+    try store_verify_key(&d, tok[0: n], &k);
+    try assert_eq_i32(k.user_id as i32, u.id as i32);
+
+    // 改一位就应当失效
+    tok[20] = if tok[20] == ('0' as byte) { '1' as byte } else { '0' as byte };
+    var bad: bool = false;
+    _ = store_verify_key(&d, tok[0: n], &k) catch |_| {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+}
+
+fn test_key_revoke() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    var u: StoreUser = StoreUser{ id: 0, status: 0, found: false };
+    try store_create_user(&d, &"rv@example.com"[0: 14], &"u0000000004"[0: 11], T0, &u);
+    var tok: [byte: 64] = [0: 64];
+    const n: usize = try store_create_key(&d, u.id, &"ci"[0: 2], T0, &tok[0], 64);
+    var k: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
+    try store_verify_key(&d, tok[0: n], &k);
+    try store_revoke_key(&d, k.key_id, T0 + 10);
+    var bad: bool = false;
+    _ = store_verify_key(&d, tok[0: n], &k) catch |_| {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+}
+
+fn test_key_garbage() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    var k: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
+    var bad: bool = false;
+    _ = store_verify_key(&d, &"nope"[0: 4], &k) catch |_| {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+    bad = false;
+    _ = store_verify_key(&d, &"bearer_sk_0000000000000000000000000000000000"[0: 40], &k) catch |_| {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+}
+
+fn test_otp_flow() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    var code: [byte: 16] = [0: 16];
+    const n: usize = try store_request_otp(&d, &"otp@example.com"[0: 15], T0, 600, &code[0], 16);
+    try assert_eq_i32(n as i32, 6);
+
+    // 错码：失败并计入 attempts
+    var wrong: [byte: 6] = [0: 6];
+    wrong[0] = if code[0] == ('0' as byte) { '1' as byte } else { '0' as byte };
+    wrong[1] = code[1];
+    wrong[2] = code[2];
+    wrong[3] = code[3];
+    wrong[4] = code[4];
+    wrong[5] = code[5];
+    var bad: bool = false;
+    _ = store_verify_otp(&d, &"otp@example.com"[0: 15], wrong[0: 6], T0 + 1) catch |_| {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+
+    // 正确码：通过
+    try store_verify_otp(&d, &"otp@example.com"[0: 15], code[0: n], T0 + 2);
+
+    // 用过就不能再用
+    bad = false;
+    _ = store_verify_otp(&d, &"otp@example.com"[0: 15], code[0: n], T0 + 3) catch |_| {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+}
+
+fn test_otp_expiry_and_attempts() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    var code: [byte: 16] = [0: 16];
+    const n: usize = try store_request_otp(&d, &"exp@example.com"[0: 15], T0, 60, &code[0], 16);
+    var bad: bool = false;
+    _ = store_verify_otp(&d, &"exp@example.com"[0: 15], code[0: n], T0 + 61) catch |_| {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+
+    // 连续输错 5 次后，正确码也不再受理
+    var code2: [byte: 16] = [0: 16];
+    const n2: usize = try store_request_otp(&d, &"brute@example.com"[0: 17], T0, 600, &code2[0], 16);
+    var wrong: [byte: 6] = [0: 6];
+    wrong[0] = if code2[0] == ('0' as byte) { '1' as byte } else { '0' as byte };
+    wrong[1] = code2[1];
+    wrong[2] = code2[2];
+    wrong[3] = code2[3];
+    wrong[4] = code2[4];
+    wrong[5] = code2[5];
+    var i: i32 = 0;
+    while i < 5 {
+        _ = store_verify_otp(&d, &"brute@example.com"[0: 17], wrong[0: 6], T0 + 1) catch {};
+        i = i + 1;
+    }
+    bad = false;
+    _ = store_verify_otp(&d, &"brute@example.com"[0: 17], code2[0: n2], T0 + 2) catch |_| {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+}
+
+fn test_session_flow() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    var u: StoreUser = StoreUser{ id: 0, status: 0, found: false };
+    try store_create_user(&d, &"sess@example.com"[0: 16], &"u0000000005"[0: 11], T0, &u);
+    var tok: [byte: 64] = [0: 64];
+    const n: usize = try store_create_session(&d, u.id, T0, 3600, &tok[0], 64);
+    try assert_eq_i32(n as i32, 32);
+
+    var uid: i64 = 0;
+    try store_verify_session(&d, tok[0: n], T0 + 10, &uid);
+    try assert_eq_i32(uid as i32, u.id as i32);
+
+    // 过期即失效，并且顺手删掉
+    var bad: bool = false;
+    _ = store_verify_session(&d, tok[0: n], T0 + 3601, &uid) catch |_| {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+    bad = false;
+    _ = store_verify_session(&d, tok[0: n], T0 + 11, &uid) catch |_| {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+}
+
+fn test_session_drop() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    var u: StoreUser = StoreUser{ id: 0, status: 0, found: false };
+    try store_create_user(&d, &"drop@example.com"[0: 16], &"u0000000006"[0: 11], T0, &u);
+    var tok: [byte: 64] = [0: 64];
+    const n: usize = try store_create_session(&d, u.id, T0, 3600, &tok[0], 64);
+    try store_drop_session(&d, tok[0: n]);
+    var uid: i64 = 0;
+    var bad: bool = false;
+    _ = store_verify_session(&d, tok[0: n], T0 + 1, &uid) catch |_| {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+}
+
+/// 端到端：注册 → 建 key → 用 key 鉴权拿到用户（A2 验收的「登录→建 key→调用」）。
+fn test_login_key_use() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    // 1) OTP 登录
+    var code: [byte: 16] = [0: 16];
+    const cn: usize = try store_request_otp(&d, &"e2e@example.com"[0: 15], T0, 600, &code[0], 16);
+    try store_verify_otp(&d, &"e2e@example.com"[0: 15], code[0: cn], T0 + 1);
+    // 2) 建用户
+    var u: StoreUser = StoreUser{ id: 0, status: 0, found: false };
+    var slug: [byte: 16] = [0: 16];
+    const sn: usize = try store_new_slug(&slug[0], 16);
+    try store_create_user(&d, &"e2e@example.com"[0: 15], slug[0: sn], T0 + 2, &u);
+    // 3) 建 key
+    var tok: [byte: 64] = [0: 64];
+    const kn: usize = try store_create_key(&d, u.id, &"default"[0: 7], T0 + 3, &tok[0], 64);
+    // 4) 用 key 鉴权
+    var k: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
+    try store_verify_key(&d, tok[0: kn], &k);
+    try assert_eq_i32(k.user_id as i32, u.id as i32);
+}
+
+test "user_create_and_find" { run_test("user_create_and_find", test_user_create_and_find); }
+test "user_duplicate" { run_test("user_duplicate", test_user_duplicate); }
+test "key_lifecycle" { run_test("key_lifecycle", test_key_lifecycle); }
+test "key_revoke" { run_test("key_revoke", test_key_revoke); }
+test "key_garbage" { run_test("key_garbage", test_key_garbage); }
+test "otp_flow" { run_test("otp_flow", test_otp_flow); }
+test "otp_expiry_and_attempts" { run_test("otp_expiry_and_attempts", test_otp_expiry_and_attempts); }
+test "session_flow" { run_test("session_flow", test_session_flow); }
+test "session_drop" { run_test("session_drop", test_session_drop); }
+test "login_key_use" { run_test("login_key_use", test_login_key_use); }
