@@ -134,7 +134,8 @@ fn step_stream(ctx: &HtcCtx, cfg: &const HttppConfig, now: u64) i32 {
     var saw_done: bool = false;
     while events < 16 {
         var has: bool = false;
-        const r: !i32 = block_on<i32>(htc_next_event_async(&call, &has));
+        const r: !i32 = block_on<i32>(htc_next_event_async(&call, &has,
+            (now_ms() catch |_| { 0 as u64; }) +% (30000 as u64)));
         const rr: i32 = r catch |_| {
             printf("PROV-FAIL stream parse\n" as *byte);
             return 8;

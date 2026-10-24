@@ -13,11 +13,12 @@
 
 ## 进行中
 
-- TLS-09：异步 chat 调用（DNS→TCP→握手→写请求→读头→SSE 转发 / 非流式聚合）。
+- TLS-09E：流式**读超时**（两种写法实测失败，候选修法与证据见
+  `docs/design/tls-spike-findings.md` §9；当前靠 `[DONE]` 收尾 + 断开取消兜底）。
 
 ## 下一步
 
-1. TLS-09 异步调用 → TLS-10 mock 上游 e2e → TLS-11 `aigw tls probe/pin`
+1. ~~TLS-09 → TLS-10 → TLS-11~~（已完成，剩 TLS-09E 超时）
 2. Phase A：A0 SQLite+money spike、A1 事件循环、A2 schema/认证/备份 … A9 文档/e2e
 3. Phase B：controller/node/edge、lease/epoch、ingest/journal
 4. Phase C：用户端/管理端后台

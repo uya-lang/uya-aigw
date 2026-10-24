@@ -1,0 +1,147 @@
+// src/cli/tls_cmd.uya — `aigw tls probe|pin`：运维自检与指纹入库
+//
+// probe：连一次目标，打印 leaf SHA-256、链结论、是否通过信任判定。
+// pin  ：把指纹追加进 data/tls_pins.tsv（同一 host 可多条，轮换窗口）。
+
+use std.io.file;
+
+export struct TlsProbeOut {
+    fp: [byte: 64],
+    fp_ok: bool,
+    verified: bool,
+    chain: i32,
+    reason: [byte: 256],
+    reason_len: usize,
+}
+
+fn tls_probe_load_bundle(ctx: &HtcCtx, path: &[byte]) bool {
+    if path.len == 0 {
+        return true;
+    }
+    var z: [byte: 512] = [0: 512];
+    if path.len + 1 > 512 {
+        return false;
+    }
+    var i: usize = 0;
+    while i < path.len {
+        z[i] = path[i];
+        i = i + 1;
+    }
+    z[path.len] = 0;
+    const f: File = file_open(&z[0] as &const byte, 0, 0) catch |_| {
+        return false;
+    };
+    var total: usize = 0;
+    while total < HTC_BUNDLE_MAX {
+        const n: isize = file_read(&f, &ctx.bundle[total], HTC_BUNDLE_MAX - total);
+        if n <= 0 {
+            break;
+        }
+        total = total +% (n as usize);
+    }
+    file_close(&f) catch |_| { };
+    ctx.bundle_len = total;
+    return total > 0;
+}
+
+@async_fn fn tls_probe_async(host: &[byte], port: u16, now: u64, ctx: &HtcCtx,
+    out: &TlsProbeOut) Future<!i32> {
+    var addrs: DnsxAddrs = DnsxAddrs{};
+    const r: i32 = try @await dnsx_resolve_async(host, &ctx.cache,
+        &ctx.resolv[0: ctx.resolv_len], now, &addrs);
+    if r != 1 || addrs.v4_n == 0 {
+        return error.HtcNoAddress;
+    }
+    const fd: i32 = try @await tcpx_connect_v4_async(&addrs.v4[0], port, now +% (5000 as u64));
+    var conn: TlsxConn = tlsx_conn_empty();
+    const hr: !i32 = @await tlsx_conn_open_async(fd, host, ctx.mode, &ctx.pins[0],
+        ctx.pin_count, &ctx.bundle[0], ctx.bundle_len, &ctx.tofu, false, now, &conn);
+    const hv: i32 = hr catch |_| {
+        tlsx_conn_free(&conn);
+        return error.TlsxHandshakeFailed;
+    };
+    _ = hv;
+    out.fp_ok = conn.fingerprint_ok;
+    out.verified = conn.verified;
+    var k: usize = 0;
+    while k < 64 {
+        out.fp[k] = conn.fingerprint[k];
+        k = k + 1;
+    }
+    const fl: usize = conn.hs.server_flight_msg_len;
+    if ctx.bundle_len > 0 {
+        out.chain = chainx_verify_flight_bundle(&conn.hs.server_flight_msg[0], fl,
+            &host[0], host.len, &ctx.bundle[0], ctx.bundle_len);
+    } else {
+        out.chain = chainx_verify_flight_system(&conn.hs.server_flight_msg[0], fl,
+            &host[0], host.len);
+    }
+    const why: &[byte] = cc_last_reason();
+    out.reason_len = why.len;
+    var m: usize = 0;
+    while m < why.len && m < 256 {
+        out.reason[m] = why.ptr[m];
+        m = m + 1;
+    }
+    tlsx_conn_free(&conn);
+    return 0;
+}
+
+export fn tls_cmd_probe(host: &[byte], port: u16, bundle_path: &[byte]) i32 {
+    var ctx: HtcCtx = HtcCtx{};
+    htc_ctx_init(&ctx, TLSX_MODE_CHAIN);
+    ctx.allow_private = true;
+    if !tls_probe_load_bundle(&ctx, bundle_path) {
+        printf("error=ca_bundle_unreadable\n" as *byte);
+        return 3;
+    }
+    var out: TlsProbeOut = TlsProbeOut{};
+    const now: u64 = now_ms() catch |_| { 0 as u64; };
+    const r: !i32 = block_on<i32>(tls_probe_async(host, port, now, &ctx, &out));
+    _ = r catch |_| {
+        printf("host=%.*s status=handshake_failed\n" as *byte, host.len as i32, &host[0]);
+        return 2;
+    };
+    printf("host=%.*s status=ok verified=%d\n" as *byte, host.len as i32, &host[0],
+        out.verified as i32);
+    printf("fingerprint=sha256:%.*s\n" as *byte, 64, &out.fp[0]);
+    if out.chain == CC_OK {
+        printf("chain=ok\n" as *byte);
+    } else {
+        printf("chain=fail reason=%.*s\n" as *byte, out.reason_len as i32, &out.reason[0]);
+    }
+    return 0;
+}
+
+/// 把指纹写进 TOFU/pin 库（追加语义：同一 host 允许多条）。
+export fn tls_cmd_pin(path: &[byte], host: &[byte], fp: &[byte]) i32 {
+    if fp.len != 64 {
+        printf("error=bad_fingerprint\n" as *byte);
+        return 2;
+    }
+    var z: [byte: 512] = [0: 512];
+    if path.len + 1 > 512 {
+        return 2;
+    }
+    var i: usize = 0;
+    while i < path.len {
+        z[i] = path[i];
+        i = i + 1;
+    }
+    z[path.len] = 0;
+    var pins: TlsxPins = TlsxPins{};
+    tlsx_pins_load(&z[0] as &const byte, &pins) catch |_| { };
+    const now: u64 = now_ms() catch |_| { 0 as u64; };
+    const r: i32 = tlsx_tofu_upsert(&pins, host, &fp[0], now);
+    if r == 0 {
+        printf("error=pin_store_full\n" as *byte);
+        return 2;
+    }
+    tlsx_pins_save(&z[0] as &const byte, &pins) catch |_| {
+        printf("error=pin_write_failed\n" as *byte);
+        return 3;
+    };
+    printf("pinned=%.*s fingerprint=sha256:%.*s\n" as *byte, host.len as i32, &host[0],
+        64, &fp[0]);
+    return 0;
+}

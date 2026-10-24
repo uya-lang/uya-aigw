@@ -25,9 +25,7 @@ Phase A0 (SQLite spike) 可与 Phase T 并行 ─────┘
 | ID | 任务 | 验收 | 依赖 |
 |---|---|---|---|
 | TLS-04 | `src/net/tlsx.uya`：指纹、pin、TOFU 多证书存储、链门控判定 | 同域多证书：已知通过；新证书链校验通过才追加；`none` 需显式开关 | TLS-03 |
-| TLS-09E | **流式读超时**：`htc_next_event_async` 缺少空闲/总超时（`[DONE]` 之后靠调用方停止） | 上游半开时能返回而不是挂住 | TLS-09 |
-| TLS-10 | 本地 TLS mock 上游 + e2e（真实 provider 环境变量门控） | 流式/非流式/断流用例通过 | TLS-09 |
-| TLS-11 | `aigw tls probe/pin`、provider 健康、配置文档 | 运维可自检；文档更新 | TLS-09 |
+| TLS-09E | **流式读超时**：`htc_next_event_async` 缺少空闲超时；两种 `deadline` 写法实测均失败（见 findings §9） | 上游半开时能返回而不是挂住；两条候选修法见文档 | TLS-09 |
 
 ---
 

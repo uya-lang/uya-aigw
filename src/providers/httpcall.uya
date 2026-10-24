@@ -81,7 +81,7 @@ export fn htc_call_free(call: &HtcCall) void {
     buf_free(&call.plain);
 }
 
-@async_fn fn htc_read_more_async(call: &HtcCall) Future<!i32> {
+@async_fn fn htc_read_more_async(call: &HtcCall, deadline: u64) Future<!i32> {
     if !buf_reserve(&call.body, 4096) {
         return -1;
     }
@@ -89,7 +89,13 @@ export fn htc_call_free(call: &HtcCall) void {
     if room == 0 {
         return -1;
     }
-    const n: usize = try @await tlsx_read_async(&call.conn, &call.body.ptr[call.body.len], room);
+    // TLS-09E（未完成）：流式读超时依赖一个「可取消的等待」原语。实测把
+    // async_wait_readable 嵌到 record 读之前会立刻返回 0（嵌套等待抢同一组 Waker 槽），
+    // 见 TODO.md TLS-09E 与 docs/design/tls-spike-findings.md §9。在拿到调度器时间轮
+    // 之前保持无超时读；上层用「[DONE] 收尾 + 客户端断开即取消」兜底。
+    _ = deadline;
+    const n: usize = try @await tlsx_read_async(&call.conn,
+        &call.body.ptr[call.body.len], room);
     if n == 0 {
         return 0;
     }
@@ -201,7 +207,7 @@ export @async_fn fn htc_body_async(call: &HtcCall, out: &byte, cap: usize,
     }
     if call.head.chunked {
         while !htc_chunk_terminated(call) {
-            const r: i32 = try @await htc_read_more_async(call);
+            const r: i32 = try @await htc_read_more_async(call, 0);
             if r <= 0 {
                 break;
             }
@@ -229,7 +235,7 @@ export @async_fn fn htc_body_async(call: &HtcCall, out: &byte, cap: usize,
     if call.head.content_length >= 0 {
         const need: usize = hl +% (call.head.content_length as usize);
         while call.body.len < need {
-            const r: i32 = try @await htc_read_more_async(call);
+            const r: i32 = try @await htc_read_more_async(call, 0);
             if r <= 0 {
                 break;
             }
@@ -252,7 +258,7 @@ export @async_fn fn htc_body_async(call: &HtcCall, out: &byte, cap: usize,
     }
     // 无长度：读到连接关闭
     while call.body.len - hl < cap {
-        const r: i32 = try @await htc_read_more_async(call);
+        const r: i32 = try @await htc_read_more_async(call, 0);
         if r <= 0 {
             break;
         }
@@ -310,7 +316,8 @@ fn htc_pump_plain(call: &HtcCall) i32 {
 
 /// 流式：返回 1=有事件（call.sse.ev），0=结束，-1=解析错误。
 /// chunked 响应会先解帧再喂给 SSE 解析器（SSE 数据在 chunk 负载里）。
-export @async_fn fn htc_next_event_async(call: &HtcCall, has: &bool) Future<!i32> {
+export @async_fn fn htc_next_event_async(call: &HtcCall, has: &bool,
+    deadline: u64) Future<!i32> {
     has[0] = false;
     while true {
         if call.plain_off < call.plain.len {
@@ -335,7 +342,7 @@ export @async_fn fn htc_next_event_async(call: &HtcCall, has: &bool) Future<!i32
         if call.head.chunked && (call.chunk_eof || htc_chunk_terminated(call)) {
             return 0;       // 终止块已到，且 plain 已取空
         }
-        const rr: i32 = try @await htc_read_more_async(call);
+        const rr: i32 = try @await htc_read_more_async(call, deadline);
         if rr <= 0 {
             return 0;
         }

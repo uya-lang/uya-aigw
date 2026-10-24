@@ -19,6 +19,7 @@ use tls.https;
 use tls.ssl.context;
 use tls.ssl.handshake;
 use tls.ssl.record;
+use std.async;
 
 export error TlsxHandshakeFailed;
 export error TlsxNoLeaf;
@@ -386,6 +387,12 @@ export @async_fn fn tlsx_read_async(c: &TlsxConn, out: &byte, max: usize) Future
         }
     }
 }
+
+// TLS-09E：带 deadline 的应用数据读**尚未落地**。
+// 曾经写成 `async_wait_readable(fd, deadline)` + 普通 record 读，在本机上游上首帧就返回 0
+// （嵌套在 `tlsx_read_async` 的等待之外的 readiness 等待会与内层 Waker 注册抢同一组槽，
+// WAKER_IO_SLOT_MAX = 4）。结论与两条候选修法见 docs/design/tls-spike-findings.md §9。
+// 在那之前：流式靠 `[DONE]` 收尾 + 客户端断开传播取消，非流式靠连接级超时。
 
 /// 应用数据写：record_encrypt → 写出密文（按 8 KiB 分片）。
 export @async_fn fn tlsx_write_async(c: &TlsxConn, src: &const byte, n: usize) Future<!usize> {

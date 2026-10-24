@@ -24,4 +24,6 @@ run src/foundation/buf.uya src/net/proxyx.uya tests/test_proxyx.uya
 
 echo "== provider e2e (TLS + chain + CL/chunked/SSE)"
 ./tests/provider_spike.sh 2>&1 | grep -a "PROV-ALL-OK"
+echo "== cli probe/pin"
+./tests/tls_cli_spike.sh 2>&1 | grep -a "CLI-ALL-OK"
 echo "ALL GREEN"

@@ -107,3 +107,23 @@ TLS-SPIKE-OK n=31
 - **非应用记录要丢弃**：NewSessionTicket 等解密后按记录类型跳过，alert 视为关闭。
 - `tests/tls_spike.sh`（s_server）已被 `tests/provider_spike.sh`（本机 Python TLS 上游，
   覆盖 非流式/ chunked / SSE）取代，后者进入 `tests/run_all.sh`。
+
+## 9. TLS-09E：流式读超时（未落地）
+
+目标：上游半开（连接在但不发数据）时，`htc_next_event_async` 应返回而不是永久挂住。
+
+实测两种写法都失败：
+
+| 写法 | 结果 |
+|---|---|
+| `async_fd_read_deadline_future` 直接读 record 头/载荷 | 首帧即返回 0（本机 Python 上游上一个 record 被切成多段时语义不符） |
+| `async_wait_readable(fd, deadline)` + 普通 record 读 | 流式路径 `events=0`（嵌套的 readiness 等待与内层 `tlsx_read_async` 的 Waker 注册抢同一组槽，`WAKER_IO_SLOT_MAX = 4`） |
+
+两条候选修法（后续任务）：
+
+1. **单层等待**：把 deadline 下沉到 `tlsx_hs_read_record_async` 内部，一处等待同时负责
+   「可读」与「超时」，不再嵌套第二层；`https_read_some_async` 需要支持 deadline 变体。
+2. **调度器时间轮**：在事件循环里给每个流式连接挂一个 idle 定时器，到点由循环取消该
+   协程（`Future` 取消语义已存在），读路径完全不动。
+
+当前兜底：`[DONE]` 收尾 + 客户端断开传播取消 + 连接级超时；`events=4 done=1` 的流式 e2e 通过。
