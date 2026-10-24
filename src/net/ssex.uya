@@ -1,0 +1,154 @@
+// src/net/ssex.uya — SSE（text/event-stream）增量解析
+//
+// 用法：把每次读到的字节喂给 sse_feed；返回 1 表示 p.ev 里有一个完整事件
+// （调用方读完后调 sse_consume 清空），0 表示还需要更多数据，-1 行太长，
+// -2 事件数据/字段超限。
+//
+// 支持：data 多行、event、id、注释行（:）、CRLF/LF、[DONE]（sse_is_done）。
+// 不解析 retry（网关不重连上游）。
+
+export const SSE_MAX_LINE: usize = 8192;
+export const SSE_MAX_DATA: usize = 16384;
+export const SSE_MAX_EVENT: usize = 128;
+export const SSE_MAX_ID: usize = 256;
+
+export struct SseEvent {
+    event: [byte: SSE_MAX_EVENT],
+    event_len: usize,
+    data: [byte: SSE_MAX_DATA],
+    data_len: usize,
+    id: [byte: SSE_MAX_ID],
+    id_len: usize,
+    has_event: bool,
+    has_data: bool,
+}
+
+export struct SseParser {
+    line: [byte: SSE_MAX_LINE],
+    line_len: usize,
+    ev: SseEvent,
+}
+
+export fn sse_init(p: &SseParser) void {
+    p.line_len = 0;
+    p.ev.event_len = 0;
+    p.ev.data_len = 0;
+    p.ev.id_len = 0;
+    p.ev.has_event = false;
+    p.ev.has_data = false;
+}
+
+export fn sse_consume(p: &SseParser) void {
+    p.ev.event_len = 0;
+    p.ev.data_len = 0;
+    p.ev.id_len = 0;
+    p.ev.has_event = false;
+    p.ev.has_data = false;
+}
+
+fn sse_eq(a: &const byte, an: usize, b: &const byte, bn: usize) bool {
+    if an != bn {
+        return false;
+    }
+    var i: usize = 0;
+    while i < an {
+        if a[i] != b[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn sse_copy(dst: &byte, cap: usize, src: &const byte, n: usize) bool {
+    if n > cap {
+        return false;
+    }
+    var i: usize = 0;
+    while i < n {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+    return true;
+}
+
+/// 处理一段字节；返回 1=有事件，0=需要更多，-1=行超长，-2=字段/数据超限。
+export fn sse_feed(p: &SseParser, b: &const byte, n: usize) i32 {
+    var i: usize = 0;
+    while i < n {
+        const c: byte = b[i];
+        if c == (10 as byte) {
+            var ll: usize = p.line_len;
+            if ll > 0 && p.line[ll - 1] == (13 as byte) {
+                ll = ll - 1;
+            }
+            if ll == 0 {
+                if p.ev.has_event || p.ev.has_data {
+                    p.line_len = 0;
+                    return 1;
+                }
+            } else if p.line[0] == (58 as byte) {
+                // 注释行
+            } else {
+                var colon: usize = 0;
+                while colon < ll && p.line[colon] != (58 as byte) {
+                    colon = colon + 1;
+                }
+                if colon < ll {
+                    const field: &const byte = &p.line[0];
+                    const flen: usize = colon;
+                    var vs: usize = colon + 1;
+                    if vs < ll && p.line[vs] == (32 as byte) {
+                        vs = vs + 1;
+                    }
+                    const vlen: usize = ll - vs;
+                    const val: &const byte = &p.line[vs];
+                    if sse_eq(field, flen, &"data"[0: 4], 4) {
+                        if p.ev.data_len +% vlen +% 1 > SSE_MAX_DATA {
+                            return -2;
+                        }
+                        if !sse_copy(&p.ev.data[p.ev.data_len], SSE_MAX_DATA - p.ev.data_len,
+                            val, vlen) {
+                            return -2;
+                        }
+                        p.ev.data_len = p.ev.data_len +% vlen;
+                        p.ev.data[p.ev.data_len] = 10;
+                        p.ev.data_len = p.ev.data_len +% 1;
+                        p.ev.has_data = true;
+                    } else if sse_eq(field, flen, &"event"[0: 5], 5) {
+                        if !sse_copy(&p.ev.event[0], SSE_MAX_EVENT, val, vlen) {
+                            return -2;
+                        }
+                        p.ev.event_len = vlen;
+                        p.ev.has_event = true;
+                    } else if sse_eq(field, flen, &"id"[0: 2], 2) {
+                        if !sse_copy(&p.ev.id[0], SSE_MAX_ID, val, vlen) {
+                            return -2;
+                        }
+                        p.ev.id_len = vlen;
+                    }
+                }
+            }
+            p.line_len = 0;
+        } else {
+            if p.line_len >= SSE_MAX_LINE {
+                return -1;
+            }
+            p.line[p.line_len] = c;
+            p.line_len = p.line_len + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+/// 当前事件的 data 是否是 "[DONE]"（允许末尾的换行）。
+export fn sse_is_done(p: &const SseParser) bool {
+    if p.ev.data_len == 7 {
+        return sse_eq(&p.ev.data[0], 7, &"[DONE]\n"[0: 7], 7);
+    }
+    if p.ev.data_len == 6 {
+        return sse_eq(&p.ev.data[0], 6, &"[DONE]"[0: 6], 6);
+    }
+    return false;
+}

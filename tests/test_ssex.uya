@@ -1,0 +1,108 @@
+// tests/test_ssex.uya — SSE 增量解析单测
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+fn eq_n(a: &const byte, b: &const byte, n: usize) !void {
+    var i: usize = 0;
+    while i < n {
+        try assert_eq_i32(a[i] as i32, b[i] as i32);
+        i = i + 1;
+    }
+}
+
+fn test_single_event() !void {
+    var b: Buf = buf_new(256);
+    defer { buf_free(&b); }
+    _ = buf_append_cstr(&b, "event: message\n" as &const byte);
+    _ = buf_append_cstr(&b, "data: hello\n" as &const byte);
+    _ = buf_append_cstr(&b, "data: world\n" as &const byte);
+    _ = buf_append_cstr(&b, "\n" as &const byte);
+
+    var p: SseParser = SseParser{};
+    sse_init(&p);
+    try assert_eq_i32(sse_feed(&p, b.ptr as &const byte, b.len), 1);
+    try assert_eq_i32(p.ev.event_len as i32, 7);
+    try eq_n(&p.ev.event[0], &"message"[0: 7], 7);
+    try assert_eq_i32(p.ev.data_len as i32, 12);
+    try eq_n(&p.ev.data[0], &"hello\nworld\n"[0: 12], 12);
+    try assert_eq_bool(p.ev.has_data, true);
+    sse_consume(&p);
+    try assert_eq_i32(p.ev.data_len as i32, 0);
+}
+
+fn test_done() !void {
+    var b: Buf = buf_new(64);
+    defer { buf_free(&b); }
+    _ = buf_append_cstr(&b, "data: [DONE]\n\n" as &const byte);
+    var p: SseParser = SseParser{};
+    sse_init(&p);
+    try assert_eq_i32(sse_feed(&p, b.ptr as &const byte, b.len), 1);
+    try assert_eq_bool(sse_is_done(&p), true);
+}
+
+fn test_split_packets() !void {
+    var b: Buf = buf_new(256);
+    defer { buf_free(&b); }
+    _ = buf_append_cstr(&b, "event: delta\n" as &const byte);
+    _ = buf_append_cstr(&b, "data: a\n" as &const byte);
+    _ = buf_append_cstr(&b, "data: b\n\n" as &const byte);
+
+    var p: SseParser = SseParser{};
+    sse_init(&p);
+    var got: i32 = 0;
+    var i: usize = 0;
+    while i < b.len {
+        const r: i32 = sse_feed(&p, &b.ptr[i], 1);
+        if r == 1 {
+            got = got + 1;
+            try assert_eq_i32(p.ev.data_len as i32, 4);
+            try eq_n(&p.ev.data[0], &"a\nb\n"[0: 4], 4);
+            sse_consume(&p);
+        }
+        i = i + 1;
+    }
+    try assert_eq_i32(got, 1);
+}
+
+fn test_comment_crlf() !void {
+    var b: Buf = buf_new(64);
+    defer { buf_free(&b); }
+    _ = buf_append_cstr(&b, ": ping\r\ndata: x\r\n\r\n" as &const byte);
+    var p: SseParser = SseParser{};
+    sse_init(&p);
+    try assert_eq_i32(sse_feed(&p, b.ptr as &const byte, b.len), 1);
+    try assert_eq_i32(p.ev.data_len as i32, 2);
+    try eq_n(&p.ev.data[0], &"x\n"[0: 2], 2);
+}
+
+fn test_empty_data() !void {
+    var b: Buf = buf_new(32);
+    defer { buf_free(&b); }
+    _ = buf_append_cstr(&b, "data:\n\n" as &const byte);
+    var p: SseParser = SseParser{};
+    sse_init(&p);
+    try assert_eq_i32(sse_feed(&p, b.ptr as &const byte, b.len), 1);
+    try assert_eq_bool(p.ev.has_data, true);
+    try assert_eq_i32(p.ev.data_len as i32, 1);
+    try assert_eq_i32(p.ev.data[0] as i32, 10);
+}
+
+fn test_line_too_long() !void {
+    var big: [byte: 9000] = [0: 9000];
+    var i: usize = 0;
+    while i < 9000 {
+        big[i] = 'a' as byte;
+        i = i + 1;
+    }
+    var p: SseParser = SseParser{};
+    sse_init(&p);
+    try assert_eq_i32(sse_feed(&p, &big[0], 9000), -1);
+}
+
+test "single_event" { run_test("single_event", test_single_event); }
+test "done" { run_test("done", test_done); }
+test "split_packets" { run_test("split_packets", test_split_packets); }
+test "comment_crlf" { run_test("comment_crlf", test_comment_crlf); }
+test "empty_data" { run_test("empty_data", test_empty_data); }
+test "line_too_long" { run_test("line_too_long", test_line_too_long); }

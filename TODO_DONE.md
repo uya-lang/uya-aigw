@@ -15,3 +15,4 @@
 | TLS-05 | 2026-10-24 | `git log --grep=TLS-05` | spike（**负面结论**）：`https_handshake_async` 每次 poll 重跑阻塞版握手，非阻塞 fd 上反复重发 ClientHello、永不完成；证据/复现/三条备选见 `docs/design/tls-spike-findings.md`；转为 TLS-05A（自写可恢复握手） |
 | TLS-05A | 2026-10-24 | `git log --grep=TLS-05A` | `src/net/tlsx_conn.uya` 可恢复握手：`ssl_handshake_step` + 异步读完整 TLS record + ServerHelloDone 聚合 + 消费 CCS/Finished；本机 openssl s_server 端到端 `TLS-SPIKE-OK`；配合 chainx 完成 SAN + 完整链校验 |
 | TLS-06 | 2026-10-24 | `git log --grep=TLS-06` | `src/net/httpc.uya`：请求构造（Host/Content-Length/keep-alive）、响应头解析（状态码/头/Content-Length/chunked/Connection）、1xx 跳过、分块解码（完整/部分/0 块/trailer/畸形）、异步写请求/读头/按 CL 读体；`tests/test_httpc.uya` 5 组用例全过 |
+| TLS-07 | 2026-10-24 | `git log --grep=TLS-07` | `src/net/ssex.uya`：增量 SSE 解析（多行 data/event/id/注释/CRLF）、`[DONE]` 判定、跨包分帧、行/数据上限；`tests/test_ssex.uya` 6 组用例全过 |
