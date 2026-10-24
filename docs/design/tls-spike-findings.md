@@ -128,3 +128,12 @@ TLS-SPIKE-OK n=31
    协程（`Future` 取消语义已存在），读路径完全不动。
 
 当前兜底：`[DONE]` 收尾 + 客户端断开传播取消 + 连接级超时；`events=4 done=1` 的流式 e2e 通过。
+### 补充：poll 切片版（照 uya-agent `httpstream` 的泵点写法）同样返 0
+
+`tlsx_wait_readable_idle_async` 用同步 `sys_poll(fd, POLLIN, ≤50ms)` 累计计时，
+再配合同步 `https_read_some` 读完整 record（`tlsx_fill_deadline_async`），
+在本机 Python TLS 上游上流式仍 `events=0`（非流式路径用同一份 `tlsx_read_async` 正常）。
+
+说明问题不在「等待原语」的选择，而在 deadline 读这条路径与 `htc_open_async` 留下的
+socket 状态/已缓冲数据之间。下一步应打印 `sys_poll` 的返回值与 `https_read_some` 的错误码
+定位（一次 instrumentation 即可），而不是再换第五种等待方式。

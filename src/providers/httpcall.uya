@@ -89,9 +89,9 @@ export fn htc_call_free(call: &HtcCall) void {
     if room == 0 {
         return -1;
     }
-    // TLS-09E（未接入）：`tlsx_read_deadline_async` 已实现单层等待版，但在本机上游上
-    // 流式首帧仍返回 0（三种写法都撞同一处调度器行为，见 findings §9）。在拿到时间轮或
-    // 把 deadline 下沉进 https_read_some 之前，流式保持无超时读：`[DONE]` 收尾 +
+    // TLS-09E 未接入：`tlsx_read_deadline_async`（poll 切片版，照 uya-agent httpstream 的
+    // 泵点做法）在本机上游上流式仍首帧返 0；四种等待写法都撞同一现象（findings §9）。
+    // 在定位到 sys_poll 在本 fd 上的真实返回前，流式保持无超时读：`[DONE]` 收尾 +
     // 客户端断开传播取消兜底。
     _ = deadline;
     const n: usize = try @await tlsx_read_async(&call.conn,
