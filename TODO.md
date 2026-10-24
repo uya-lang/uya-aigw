@@ -25,7 +25,7 @@ Phase A0 (SQLite spike) 可与 Phase T 并行 ─────┘
 | ID | 任务 | 验收 | 依赖 |
 |---|---|---|---|
 | TLS-04 | `src/net/tlsx.uya`：指纹、pin、TOFU 多证书存储、链门控判定 | 同域多证书：已知通过；新证书链校验通过才追加；`none` 需显式开关 | TLS-03 |
-| TLS-09 | `src/providers/http.uya`：`kind:"http"`、密钥解析、模型映射、错误映射、代理 CONNECT | 配置即用；错误体脱敏；流式/非流式 | TLS-07/08 |
+| TLS-09 | `src/providers/http.uya`：异步 chat 调用（请求构造、SSE 转发、非流式聚合）、代理 CONNECT | 配置即用；流式/非流式 | TLS-07/08 |
 | TLS-10 | 本地 TLS mock 上游 + e2e（真实 provider 环境变量门控） | 流式/非流式/断流用例通过 | TLS-09 |
 | TLS-11 | `aigw tls probe/pin`、provider 健康、配置文档 | 运维可自检；文档更新 | TLS-09 |
 

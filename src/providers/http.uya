@@ -1,0 +1,259 @@
+// src/providers/http.uya — 内置 HTTP 供应商的配置/密钥/模型映射/鉴权/错误体
+//
+// 纯逻辑（可离线单测）：
+//   - 密钥解析：env:NAME / file:/path / literal:...
+//   - 模型别名：网关模型名 -> 上游模型名（未命中原样透传）
+//   - 鉴权头：Bearer / x-api-key / api-key / query
+//   - 错误体：OpenAI 风格 {"error":{...}}，消息做最小转义
+// 网络调用（chat/responses 流式转发）在 TLS-09 的 provider 层接线，本文件只提供配置与报文原语。
+
+use libc.stdlib;
+use std.io.file;
+
+export const HTTPP_AUTH_BEARER: u8 = 1;
+export const HTTPP_AUTH_X_API_KEY: u8 = 2;
+export const HTTPP_AUTH_API_KEY: u8 = 3;
+export const HTTPP_AUTH_QUERY: u8 = 4;
+
+export const HTTPP_MAX_MODELS: usize = 32;
+export const HTTPP_NAME_MAX: usize = 128;
+export const HTTPP_SECRET_MAX: usize = 512;
+export const HTTPP_HOST_MAX: usize = 253;
+
+export struct HttppAlias {
+    alias: [byte: HTTPP_NAME_MAX],
+    alias_len: usize,
+    upstream: [byte: HTTPP_NAME_MAX],
+    upstream_len: usize,
+    used: bool,
+}
+
+export struct HttppConfig {
+    host: [byte: HTTPP_HOST_MAX],
+    host_len: usize,
+    port: u16,
+    base_path: [byte: 256],
+    base_path_len: usize,
+    auth_type: u8,
+    secret: [byte: HTTPP_SECRET_MAX],
+    secret_len: usize,
+    tls_mode: u8,
+    allow_plaintext: bool,
+    allow_private: bool,
+    aliases: [HttppAlias: HTTPP_MAX_MODELS],
+    alias_count: usize,
+}
+
+export fn httpp_empty() HttppConfig {
+    return HttppConfig{};
+}
+
+fn httpp_eq(a: &const byte, an: usize, b: &const byte, bn: usize) bool {
+    if an != bn {
+        return false;
+    }
+    var i: usize = 0;
+    while i < an {
+        if a[i] != b[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn httpp_copy(dst: &byte, cap: usize, src: &const byte, n: usize) bool {
+    if n > cap {
+        return false;
+    }
+    var i: usize = 0;
+    while i < n {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+    return true;
+}
+
+fn httpp_copy_z(dst: &byte, cap: usize, src: &const byte, n: usize) bool {
+    if n +% 1 > cap {
+        return false;
+    }
+    var i: usize = 0;
+    while i < n {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+    dst[n] = 0;
+    return true;
+}
+
+fn httpp_trim_len(s: &const byte, n: usize) usize {
+    var e: usize = n;
+    while e > 0 {
+        const c: byte = s[e - 1];
+        if c == (10 as byte) || c == (13 as byte) || c == (32 as byte) || c == (9 as byte) {
+            e = e - 1;
+        } else {
+            break;
+        }
+    }
+    return e;
+}
+
+/// 解析密钥：env:NAME / file:/path / literal:...；成功写入 cfg.secret。
+export fn httpp_set_secret(cfg: &HttppConfig, spec: &const byte, spec_len: usize) bool {
+    cfg.secret_len = 0;
+    if spec_len > 4 && httpp_eq(spec, 4, &"env:"[0: 4], 4) {
+        var name: [byte: 256] = [0: 256];
+        if !httpp_copy_z(&name[0], 256, &spec[4], spec_len - 4) {
+            return false;
+        }
+        const v: &byte = getenv(&name[0] as &const byte);
+        if (v as usize) == 0 {
+            return false;
+        }
+        var n: usize = 0;
+        while v[n] != (0 as byte) && n < HTTPP_SECRET_MAX {
+            n = n + 1;
+        }
+        if n == 0 || !httpp_copy(&cfg.secret[0], HTTPP_SECRET_MAX, v, n) {
+            return false;
+        }
+        cfg.secret_len = n;
+        return true;
+    }
+    if spec_len > 5 && httpp_eq(spec, 5, &"file:"[0: 5], 5) {
+        var path: [byte: 512] = [0: 512];
+        if !httpp_copy_z(&path[0], 512, &spec[5], spec_len - 5) {
+            return false;
+        }
+        const f: File = file_open(&path[0] as &const byte, 0, 0) catch |_| {
+            return false;
+        };
+        var buf: [byte: HTTPP_SECRET_MAX] = [0: HTTPP_SECRET_MAX];
+        var total: usize = 0;
+        while total < HTTPP_SECRET_MAX {
+            const n: isize = file_read(&f, &buf[total], HTTPP_SECRET_MAX - total);
+            if n <= 0 {
+                break;
+            }
+            total = total +% (n as usize);
+        }
+        file_close(&f) catch |_| { };
+        const use_len: usize = httpp_trim_len(&buf[0], total);
+        if use_len == 0 || !httpp_copy(&cfg.secret[0], HTTPP_SECRET_MAX, &buf[0], use_len) {
+            return false;
+        }
+        cfg.secret_len = use_len;
+        return true;
+    }
+    if spec_len > 8 && httpp_eq(spec, 8, &"literal:"[0: 8], 8) {
+        const n: usize = spec_len - 8;
+        if n == 0 || !httpp_copy(&cfg.secret[0], HTTPP_SECRET_MAX, &spec[8], n) {
+            return false;
+        }
+        cfg.secret_len = n;
+        return true;
+    }
+    return false;
+}
+
+export fn httpp_add_alias(cfg: &HttppConfig, alias: &const byte, alias_len: usize,
+    upstream: &const byte, upstream_len: usize) bool {
+    if cfg.alias_count >= HTTPP_MAX_MODELS || alias_len == 0 || alias_len > HTTPP_NAME_MAX
+        || upstream_len == 0 || upstream_len > HTTPP_NAME_MAX {
+        return false;
+    }
+    const a: &HttppAlias = &cfg.aliases[cfg.alias_count];
+    a.alias_len = alias_len;
+    a.upstream_len = upstream_len;
+    if !httpp_copy(&a.alias[0], HTTPP_NAME_MAX, alias, alias_len) {
+        return false;
+    }
+    if !httpp_copy(&a.upstream[0], HTTPP_NAME_MAX, upstream, upstream_len) {
+        return false;
+    }
+    a.used = true;
+    cfg.alias_count = cfg.alias_count + 1;
+    return true;
+}
+
+/// 网关模型名 -> 上游模型名；未命中则原样复制。
+export fn httpp_map_model(cfg: &const HttppConfig, model: &const byte, model_len: usize,
+    out: &byte, out_cap: usize, out_len: &usize) bool {
+    var i: usize = 0;
+    while i < cfg.alias_count && i < HTTPP_MAX_MODELS {
+        const a: &const HttppAlias = &cfg.aliases[i];
+        if a.used && httpp_eq(&a.alias[0], a.alias_len, model, model_len) {
+            if !httpp_copy(out, out_cap, &a.upstream[0], a.upstream_len) {
+                return false;
+            }
+            out_len[0] = a.upstream_len;
+            return true;
+        }
+        i = i + 1;
+    }
+    if !httpp_copy(out, out_cap, model, model_len) {
+        return false;
+    }
+    out_len[0] = model_len;
+    return true;
+}
+
+/// 追加一行鉴权头（query 类型不追加头，由调用方拼 query）。
+export fn httpp_auth_line(cfg: &const HttppConfig, out: &Buf) bool {
+    if cfg.secret_len == 0 {
+        return false;
+    }
+    if cfg.auth_type == HTTPP_AUTH_BEARER {
+        if !buf_append_cstr(out, "Authorization: Bearer " as &const byte) { return false; }
+    } else if cfg.auth_type == HTTPP_AUTH_X_API_KEY {
+        if !buf_append_cstr(out, "x-api-key: " as &const byte) { return false; }
+    } else if cfg.auth_type == HTTPP_AUTH_API_KEY {
+        if !buf_append_cstr(out, "api-key: " as &const byte) { return false; }
+    } else {
+        return true;
+    }
+    if !buf_append(out, &cfg.secret[0], cfg.secret_len) { return false; }
+    if !buf_append_cstr(out, "\r\n" as &const byte) { return false; }
+    return true;
+}
+
+/// query 鉴权后缀（"key=<secret>"）；其他类型返回空。
+export fn httpp_auth_query(cfg: &const HttppConfig, out: &Buf) bool {
+    if cfg.auth_type != HTTPP_AUTH_QUERY || cfg.secret_len == 0 {
+        return true;
+    }
+    if !buf_append_cstr(out, "key=" as &const byte) { return false; }
+    if !buf_append(out, &cfg.secret[0], cfg.secret_len) { return false; }
+    return true;
+}
+
+fn httpp_escape(out: &Buf, s: &const byte, n: usize) bool {
+    var i: usize = 0;
+    while i < n {
+        const c: byte = s[i];
+        if c == (34 as byte) || c == (92 as byte) {
+            if !buf_append_byte(out, 92) { return false; }
+            if !buf_append_byte(out, c) { return false; }
+        } else if c < (32 as byte) {
+            if !buf_append_byte(out, 32) { return false; }
+        } else {
+            if !buf_append_byte(out, c) { return false; }
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// OpenAI 风格错误体：{"error":{"message":"...","type":"<type>"}}
+export fn httpp_error_json(status: i32, kind: &const byte, kind_len: usize,
+    msg: &const byte, msg_len: usize, out: &Buf) bool {
+    _ = status;
+    if !buf_append_cstr(out, "{\"error\":{\"message\":\"" as &const byte) { return false; }
+    if !httpp_escape(out, msg, msg_len) { return false; }
+    if !buf_append_cstr(out, "\",\"type\":\"" as &const byte) { return false; }
+    if !httpp_escape(out, kind, kind_len) { return false; }
+    if !buf_append_cstr(out, "\"}}" as &const byte) { return false; }
+    return true;
+}

@@ -1,0 +1,80 @@
+// tests/test_provider_http.uya — 内置 HTTP 供应商配置原语单测
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+use std.io.file;
+
+fn test_secret_literal() !void {
+    var cfg: HttppConfig = httpp_empty();
+    try assert_eq_bool(httpp_set_secret(&cfg, &"literal:sk-x"[0: 12], 12), true);
+    try assert_eq_i32(cfg.secret_len as i32, 4);
+    try assert_eq_i32(cfg.secret[0] as i32, 's' as i32);
+}
+
+fn test_secret_env() !void {
+    var cfg: HttppConfig = httpp_empty();
+    try assert_eq_bool(httpp_set_secret(&cfg, &"env:HOME"[0: 8], 8), true);
+    try assert_eq_bool(cfg.secret_len > (0 as usize), true);
+}
+
+fn test_secret_file() !void {
+    const path: &[byte] = &"/tmp/aigw_http_secret"[0: 21];
+    const f: File = try file_open(&path[0] as &const byte, 1 | 64 | 512, 384);
+    _ = try file_write(&f, &"sk-file\n"[0: 8], 8);
+    file_close(&f) catch |_| { };
+
+    var spec: Buf = buf_new(64);
+    defer { buf_free(&spec); }
+    _ = buf_append_cstr(&spec, "file:/tmp/aigw_http_secret" as &const byte);
+    var cfg: HttppConfig = httpp_empty();
+    try assert_eq_bool(httpp_set_secret(&cfg, spec.ptr as &const byte, spec.len), true);
+    try assert_eq_i32(cfg.secret_len as i32, 7);
+    try assert_eq_i32(cfg.secret[0] as i32, 's' as i32);
+}
+
+fn test_alias() !void {
+    var cfg: HttppConfig = httpp_empty();
+    try assert_eq_bool(httpp_add_alias(&cfg, &"gw-model"[0: 8], 8,
+        &"up-model"[0: 8], 8), true);
+    var out: [byte: 64] = [0: 64];
+    var n: usize = 0;
+    try assert_eq_bool(httpp_map_model(&cfg, &"gw-model"[0: 8], 8, &out[0], 64, &n), true);
+    try assert_eq_i32(n as i32, 8);
+    try assert_eq_i32(out[0] as i32, 'u' as i32);
+    n = 0;
+    try assert_eq_bool(httpp_map_model(&cfg, &"other"[0: 5], 5, &out[0], 64, &n), true);
+    try assert_eq_i32(n as i32, 5);
+    try assert_eq_i32(out[0] as i32, 'o' as i32);
+}
+
+fn test_auth() !void {
+    var cfg: HttppConfig = httpp_empty();
+    cfg.auth_type = HTTPP_AUTH_BEARER;
+    _ = httpp_set_secret(&cfg, &"literal:sk-1"[0: 12], 12);
+    var b: Buf = buf_new(128);
+    defer { buf_free(&b); }
+    try assert_eq_bool(httpp_auth_line(&cfg, &b), true);
+    try assert_eq_bool(find_sub(b.ptr[0: b.len], &"Bearer sk-1"[0: 11], 0) >= 0, true);
+
+    var q: Buf = buf_new(64);
+    defer { buf_free(&q); }
+    cfg.auth_type = HTTPP_AUTH_QUERY;
+    try assert_eq_bool(httpp_auth_query(&cfg, &q), true);
+    try assert_eq_bool(find_sub(q.ptr[0: q.len], &"key=sk-1"[0: 8], 0) >= 0, true);
+}
+
+fn test_error_json() !void {
+    var b: Buf = buf_new(256);
+    defer { buf_free(&b); }
+    try assert_eq_bool(httpp_error_json(502, &"upstream_error"[0: 14], 14,
+        &"upstream failed"[0: 15], 15, &b), true);
+    try assert_eq_bool(find_sub(b.ptr[0: b.len], &"upstream failed"[0: 15], 0) >= 0, true);
+    try assert_eq_bool(find_sub(b.ptr[0: b.len], &"upstream_error"[0: 14], 0) >= 0, true);
+}
+
+test "secret_literal" { run_test("secret_literal", test_secret_literal); }
+test "secret_env" { run_test("secret_env", test_secret_env); }
+test "secret_file" { run_test("secret_file", test_secret_file); }
+test "alias" { run_test("alias", test_alias); }
+test "auth" { run_test("auth", test_auth); }
+test "error_json" { run_test("error_json", test_error_json); }
