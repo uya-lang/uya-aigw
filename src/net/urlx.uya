@@ -1,0 +1,296 @@
+// src/net/urlx.uya — URL 解析与归一（供内置 HTTP/TLS 供应商使用）
+//
+// 只接受 http:// 与 https://；解析 scheme / host / port / path(+query)。
+// 输出写入调用方提供的 UrlX 自带缓冲区（固定 2048 字节），不做堆分配。
+//
+// 归一规则：
+//   - scheme 小写（仅 http/https）；
+//   - host 小写；IPv6 字面量支持 `[::1]` 形式，host 中不含方括号；
+//   - 端口 1..65535，缺省 443（https）/ 80（http）；
+//   - path 为空时写 "/"；fragment（#...）丢弃；query 保留；
+//   - 拒绝 userinfo（`user:pass@host`）、控制字符、空格。
+//
+// 不做：IDN/punycode、百分号解码、相对 URL、DNS 解析。
+
+export error UrlxBadUrl;
+export error UrlxTooLong;
+export error UrlxBadScheme;
+export error UrlxUserInfo;
+export error UrlxBadPort;
+export error UrlxBadHost;
+
+export const URLX_SCHEME_HTTPS: u8 = 1;
+export const URLX_SCHEME_HTTP: u8 = 2;
+
+export const URLX_BUF_MAX: usize = 2048;
+export const URLX_HOST_MAX: usize = 253;
+export const URLX_PATH_MAX: usize = 1536;
+
+export struct UrlX {
+    buf: [byte: URLX_BUF_MAX],
+    host_off: usize,
+    host_len: usize,
+    path_off: usize,
+    path_len: usize,
+    port: u16,
+    scheme: u8,
+    ipv6: bool,
+}
+
+/// 零初始化的 UrlX（host/path 为空、端口 0）。
+export fn urlx_empty() UrlX {
+    return UrlX{};
+}
+
+/// host 的只读切片（长度见 host_len）。
+/// 注意 Uya 切片语法是 `[start:len]`，第二项是长度而非结束下标。
+export fn urlx_host_slice(u: &UrlX) &[byte] {
+    return u.buf[u.host_off: u.host_len];
+}
+
+/// path(+query) 的只读切片；至少含一个 '/'。
+export fn urlx_path_slice(u: &UrlX) &[byte] {
+    return u.buf[u.path_off: u.path_len];
+}
+
+fn urlx_lower(b: byte) byte {
+    if b >= ('A' as byte) && b <= ('Z' as byte) {
+        return (b +% 32) as byte;
+    }
+    return b;
+}
+
+fn urlx_is_digit(b: byte) bool {
+    return b >= ('0' as byte) && b <= ('9' as byte);
+}
+
+fn urlx_is_alpha(b: byte) bool {
+    return (b >= ('a' as byte) && b <= ('z' as byte))
+        || (b >= ('A' as byte) && b <= ('Z' as byte));
+}
+
+fn urlx_is_hex(b: byte) bool {
+    return urlx_is_digit(b)
+        || (b >= ('a' as byte) && b <= ('f' as byte))
+        || (b >= ('A' as byte) && b <= ('F' as byte));
+}
+
+fn urlx_is_host_char(b: byte) bool {
+    return urlx_is_alpha(b) || urlx_is_digit(b)
+        || b == ('.' as byte) || b == ('-' as byte) || b == ('_' as byte);
+}
+
+fn urlx_is_ipv6_char(b: byte) bool {
+    return urlx_is_hex(b) || b == (':' as byte) || b == ('.' as byte);
+}
+
+fn urlx_is_path_byte_ok(b: byte) bool {
+    if b < (32 as byte) { return false; }
+    if b == (127 as byte) { return false; }
+    if b == (' ' as byte) { return false; }
+    return true;
+}
+
+fn urlx_prefix_eq_ignore_case(s: &[byte], lit: &[byte]) bool {
+    if s.len < lit.len { return false; }
+    var i: usize = 0;
+    while i < lit.len {
+        if urlx_lower(s[i]) != urlx_lower(lit[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// 解析 URL。成功时 out 的 host/path 指向 out.buf 内部，生命周期与 out 相同。
+export fn urlx_parse(url: &[byte], out: &UrlX) !void {
+    out.host_off = 0;
+    out.host_len = 0;
+    out.path_off = 0;
+    out.path_len = 0;
+    out.port = 0;
+    out.scheme = 0;
+    out.ipv6 = false;
+
+    const n: usize = url.len;
+    if n == 0 {
+        return error.UrlxBadUrl;
+    }
+    if n > URLX_BUF_MAX {
+        return error.UrlxTooLong;
+    }
+
+    var host_start: usize = 0;
+    if urlx_prefix_eq_ignore_case(url, &"https://"[0: 8]) {
+        out.scheme = URLX_SCHEME_HTTPS;
+        host_start = 8;
+    } else if urlx_prefix_eq_ignore_case(url, &"http://"[0: 7]) {
+        out.scheme = URLX_SCHEME_HTTP;
+        host_start = 7;
+    } else {
+        return error.UrlxBadScheme;
+    }
+    if host_start >= n {
+        return error.UrlxBadUrl;
+    }
+
+    var p: usize = host_start;
+    var host_end: usize = host_start;
+    if url[p] == ('[' as byte) {
+        out.ipv6 = true;
+        p = p + 1;
+        host_start = p;
+        while p < n && url[p] != (']' as byte) {
+            p = p + 1;
+        }
+        if p >= n {
+            return error.UrlxBadUrl;
+        }
+        host_end = p;
+        p = p + 1; // 跳过 ']'
+    } else {
+        while p < n && url[p] != (':' as byte) && url[p] != ('/' as byte)
+            && url[p] != ('?' as byte) && url[p] != ('#' as byte) {
+            p = p + 1;
+        }
+        host_end = p;
+    }
+
+    const hlen: usize = host_end - host_start;
+    if hlen == 0 {
+        return error.UrlxBadHost;
+    }
+    if hlen > URLX_HOST_MAX {
+        return error.UrlxBadHost;
+    }
+
+    var hi: usize = 0;
+    while hi < hlen {
+        const c: byte = url[host_start + hi];
+        if out.ipv6 {
+            if !urlx_is_ipv6_char(c) {
+                return error.UrlxBadHost;
+            }
+        } else {
+            if c == ('@' as byte) {
+                return error.UrlxUserInfo;
+            }
+            if !urlx_is_host_char(c) {
+                return error.UrlxBadHost;
+            }
+            if c == ('_' as byte) && hi == 0 {
+                return error.UrlxBadHost;
+            }
+        }
+        out.buf[hi] = urlx_lower(c);
+        hi = hi + 1;
+    }
+    out.host_off = 0;
+    out.host_len = hlen;
+
+    // 端口
+    var port: u16 = 0;
+    if p < n && url[p] == (':' as byte) {
+        p = p + 1;
+        var val: i32 = 0;
+        var digits: usize = 0;
+        while p < n && urlx_is_digit(url[p]) {
+            val = val *% 10 +% ((url[p] as i32) -% 48);
+            digits = digits + 1;
+            p = p + 1;
+        }
+        if digits == 0 {
+            return error.UrlxBadPort;
+        }
+        if val <= 0 || val > 65535 {
+            return error.UrlxBadPort;
+        }
+        port = val as u16;
+    }
+    if port == 0 {
+        if out.scheme == URLX_SCHEME_HTTPS {
+            port = 443;
+        } else {
+            port = 80;
+        }
+    }
+    out.port = port;
+
+    // 端口之后只允许 '/'、'?'、'#' 或结束
+    if p < n {
+        if url[p] != ('/' as byte) && url[p] != ('?' as byte) && url[p] != ('#' as byte) {
+            return error.UrlxBadUrl;
+        }
+    }
+
+    // 默认 path / 只有 fragment
+    if p >= n || url[p] == ('#' as byte) {
+        if hlen +% 1 > URLX_BUF_MAX {
+            return error.UrlxTooLong;
+        }
+        out.buf[hlen] = '/' as byte;
+        out.path_off = hlen;
+        out.path_len = 1;
+        return;
+    }
+
+    // 去 fragment
+    var path_end: usize = n;
+    var q: usize = p;
+    while q < n {
+        if url[q] == ('#' as byte) {
+            path_end = q;
+            break;
+        }
+        q = q + 1;
+    }
+    if path_end == p {
+        if hlen +% 1 > URLX_BUF_MAX {
+            return error.UrlxTooLong;
+        }
+        out.buf[hlen] = '/' as byte;
+        out.path_off = hlen;
+        out.path_len = 1;
+        return;
+    }
+
+    const has_query_prefix: bool = url[p] == ('?' as byte);
+    const body_len: usize = path_end - p;
+    var plen: usize = body_len;
+    if has_query_prefix {
+        plen = plen +% 1;
+    }
+    if plen > URLX_PATH_MAX {
+        return error.UrlxTooLong;
+    }
+    if hlen +% plen > URLX_BUF_MAX {
+        return error.UrlxTooLong;
+    }
+
+    if has_query_prefix {
+        out.buf[hlen] = '/' as byte;
+        var k: usize = 0;
+        while k < body_len {
+            const c: byte = url[p + k];
+            if !urlx_is_path_byte_ok(c) {
+                return error.UrlxBadUrl;
+            }
+            out.buf[hlen +% 1 +% k] = c;
+            k = k + 1;
+        }
+    } else {
+        var k: usize = 0;
+        while k < body_len {
+            const c: byte = url[p + k];
+            if !urlx_is_path_byte_ok(c) {
+                return error.UrlxBadUrl;
+            }
+            out.buf[hlen +% k] = c;
+            k = k + 1;
+        }
+    }
+    out.path_off = hlen;
+    out.path_len = plen;
+    return;
+}

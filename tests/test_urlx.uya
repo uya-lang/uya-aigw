@@ -1,0 +1,136 @@
+// tests/test_urlx.uya — urlx 单元测试
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+fn eq_bytes(a: &[byte], b: &[byte]) !void {
+    try assert_eq_i32(@len(a), @len(b));
+    var i: usize = 0;
+    while i < a.len {
+        try assert_eq_i32(a[i] as i32, b[i] as i32);
+        i = i + 1;
+    }
+}
+
+fn parse_ok(url: &[byte], scheme: i32, host: &[byte], port: i32, path: &[byte]) !void {
+    var u: UrlX = urlx_empty();
+    try urlx_parse(url, &u);
+    try assert_eq_i32(u.scheme as i32, scheme);
+    try eq_bytes(urlx_host_slice(&u), host);
+    try assert_eq_i32(u.port as i32, port);
+    try eq_bytes(urlx_path_slice(&u), path);
+}
+
+fn is_bad(url: &[byte]) bool {
+    var u: UrlX = urlx_empty();
+    urlx_parse(url, &u) catch |_| { return true; };
+    return false;
+}
+
+fn test_https_default() !void {
+    try parse_ok(&"https://api.deepseek.com"[0: 24], 1,
+        &"api.deepseek.com"[0: 16], 443, &"/"[0: 1]);
+}
+
+fn test_https_path_query() !void {
+    try parse_ok(&"https://api.deepseek.com/v1/chat?x=1"[0: 36], 1,
+        &"api.deepseek.com"[0: 16], 443, &"/v1/chat?x=1"[0: 12]);
+}
+
+fn test_http_custom_port() !void {
+    try parse_ok(&"http://127.0.0.1:8080/x"[0: 23], 2,
+        &"127.0.0.1"[0: 9], 8080, &"/x"[0: 2]);
+}
+
+fn test_ipv6_literal() !void {
+    try parse_ok(&"https://[::1]:8443/p"[0: 20], 1,
+        &"::1"[0: 3], 8443, &"/p"[0: 2]);
+}
+
+fn test_host_lowercase_path_case() !void {
+    try parse_ok(&"https://HOST.COM/A/B"[0: 20], 1,
+        &"host.com"[0: 8], 443, &"/A/B"[0: 4]);
+}
+
+fn test_fragment_stripped() !void {
+    try parse_ok(&"https://host#frag"[0: 17], 1,
+        &"host"[0: 4], 443, &"/"[0: 1]);
+    try parse_ok(&"https://host/path#frag"[0: 22], 1,
+        &"host"[0: 4], 443, &"/path"[0: 5]);
+}
+
+fn test_query_without_path() !void {
+    try parse_ok(&"https://host?a=1"[0: 16], 1,
+        &"host"[0: 4], 443, &"/?a=1"[0: 5]);
+}
+
+fn test_bad_scheme() !void {
+    try assert_eq_bool(is_bad(&"ftp://x"[0: 7]), true);
+}
+
+fn test_userinfo_rejected() !void {
+    try assert_eq_bool(is_bad(&"https://User@Host/x"[0: 19]), true);
+}
+
+fn test_bad_ports() !void {
+    try assert_eq_bool(is_bad(&"https://host:0/"[0: 15]), true);
+    try assert_eq_bool(is_bad(&"https://host:99999/"[0: 19]), true);
+    try assert_eq_bool(is_bad(&"https://host:abc/"[0: 17]), true);
+    try assert_eq_bool(is_bad(&"https://host:8080x/"[0: 18]), true);
+}
+
+fn test_missing_host() !void {
+    try assert_eq_bool(is_bad(&"https://"[0: 8]), true);
+    try assert_eq_bool(is_bad(&"https:///x"[0: 10]), true);
+    var e: [byte: 1] = [0: 1];
+    try assert_eq_bool(is_bad(&e[0: 0]), true);
+}
+
+fn test_space_in_path() !void {
+    try assert_eq_bool(is_bad(&"https://host/a b"[0: 16]), true);
+}
+
+fn test_leading_underscore_host() !void {
+    try assert_eq_bool(is_bad(&"https://_host/" [0: 14]), true);
+}
+
+fn test_too_long_url() !void {
+    var big: [byte: 3000] = [0: 3000];
+    var i: usize = 0;
+    while i < 3000 {
+        big[i] = 'a' as byte;
+        i = i + 1;
+    }
+    try assert_eq_bool(is_bad(&big[0: 3000]), true);
+}
+
+fn test_too_long_path() !void {
+    const prefix: &[byte] = &"https://host/"[0: 13];
+    var big: [byte: 1700] = [0: 1700];
+    var i: usize = 0;
+    while i < 13 {
+        big[i] = prefix[i];
+        i = i + 1;
+    }
+    while i < 1700 {
+        big[i] = 'a' as byte;
+        i = i + 1;
+    }
+    try assert_eq_bool(is_bad(&big[0: 1700]), true);
+}
+
+test "https_default" { run_test("https_default", test_https_default); }
+test "https_path_query" { run_test("https_path_query", test_https_path_query); }
+test "http_custom_port" { run_test("http_custom_port", test_http_custom_port); }
+test "ipv6_literal" { run_test("ipv6_literal", test_ipv6_literal); }
+test "host_lowercase_path_case" { run_test("host_lowercase_path_case", test_host_lowercase_path_case); }
+test "fragment_stripped" { run_test("fragment_stripped", test_fragment_stripped); }
+test "query_without_path" { run_test("query_without_path", test_query_without_path); }
+test "bad_scheme" { run_test("bad_scheme", test_bad_scheme); }
+test "userinfo_rejected" { run_test("userinfo_rejected", test_userinfo_rejected); }
+test "bad_ports" { run_test("bad_ports", test_bad_ports); }
+test "missing_host" { run_test("missing_host", test_missing_host); }
+test "space_in_path" { run_test("space_in_path", test_space_in_path); }
+test "leading_underscore_host" { run_test("leading_underscore_host", test_leading_underscore_host); }
+test "too_long_url" { run_test("too_long_url", test_too_long_url); }
+test "too_long_path" { run_test("too_long_path", test_too_long_path); }
