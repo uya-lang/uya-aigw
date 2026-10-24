@@ -1,0 +1,112 @@
+// tests/test_httpsrv.uya — 服务端 HTTP 解析/写出单测（A1 地基）
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+fn test_simple_get() !void {
+    var r: HsrvReq = HsrvReq{};
+    const raw: &[byte] = &"GET /v1/models HTTP/1.1\r\nHost: aigw\r\n\r\n"[0: 39];
+    try assert_eq_i32(hsrv_parse_head(raw.ptr, raw.len, HSRV_HEAD_MAX, &r), 1);
+    try assert_eq_i32(r.method_len as i32, 3);
+    try assert_eq_i32(r.method[0] as i32, 'G' as i32);
+    try assert_eq_i32(r.path_len as i32, 10);
+    try assert_eq_i32(r.path[0] as i32, '/' as i32);
+    try assert_eq_i32(r.minor, 1);
+    try assert_eq_bool(r.keep_alive, true);
+    try assert_eq_bool(r.chunked, false);
+    try assert_eq_i32(r.content_length as i32, -1);
+    try assert_eq_i32(r.head_len as i32, 39);
+}
+
+fn test_incomplete_then_complete() !void {
+    var r: HsrvReq = HsrvReq{};
+    const part: &[byte] = &"GET /x HTTP/1.1\r\nHost: a"[0: 24];
+    try assert_eq_i32(hsrv_parse_head(part.ptr, part.len, HSRV_HEAD_MAX, &r), 0);
+}
+
+fn test_post_content_length() !void {
+    var r: HsrvReq = HsrvReq{};
+    const raw: &[byte] = &"POST /v1/chat/completions HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 1234\r\n\r\n"[0: 92];
+    try assert_eq_i32(hsrv_parse_head(raw.ptr, raw.len, HSRV_HEAD_MAX, &r), 1);
+    try assert_eq_i32(r.content_length as i32, 1234);
+    try assert_eq_bool(r.keep_alive, true);
+}
+
+fn test_chunked_and_expect() !void {
+    var r: HsrvReq = HsrvReq{};
+    const raw: &[byte] = &"POST /u HTTP/1.1\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n"[0: 70];
+    try assert_eq_i32(hsrv_parse_head(raw.ptr, raw.len, HSRV_HEAD_MAX, &r), 1);
+    try assert_eq_bool(r.chunked, true);
+    try assert_eq_bool(r.expect_continue, true);
+    try assert_eq_i32(r.content_length as i32, -1);
+}
+
+fn test_keep_alive_rules() !void {
+    var r: HsrvReq = HsrvReq{};
+    const c1: &[byte] = &"GET / HTTP/1.1\r\nConnection: close\r\n\r\n"[0: 37];
+    try assert_eq_i32(hsrv_parse_head(c1.ptr, c1.len, HSRV_HEAD_MAX, &r), 1);
+    try assert_eq_bool(r.keep_alive, false);
+    const c2: &[byte] = &"GET / HTTP/1.0\r\n\r\n"[0: 18];
+    try assert_eq_i32(hsrv_parse_head(c2.ptr, c2.len, HSRV_HEAD_MAX, &r), 1);
+    try assert_eq_i32(r.minor, 0);
+    try assert_eq_bool(r.keep_alive, false);
+    const c3: &[byte] = &"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n"[0: 42];
+    try assert_eq_i32(hsrv_parse_head(c3.ptr, c3.len, HSRV_HEAD_MAX, &r), 1);
+    try assert_eq_bool(r.keep_alive, true);
+}
+
+fn test_bad_requests() !void {
+    var r: HsrvReq = HsrvReq{};
+    // 两个不同的 Content-Length → 请求走私风险，必须拒
+    const b1: &[byte] = &"POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n"[0: 57];
+    try assert_eq_i32(hsrv_parse_head(b1.ptr, b1.len, HSRV_HEAD_MAX, &r), -1);
+    // 非法版本
+    const b2: &[byte] = &"GET / HTTP/2.0\r\n\r\n"[0: 18];
+    try assert_eq_i32(hsrv_parse_head(b2.ptr, b2.len, HSRV_HEAD_MAX, &r), -1);
+    // 头部超限
+    const b3: &[byte] = &"GET / HTTP/1.1\r\nX: yyyyyyyyyyyyyyyy"[0: 35];
+    try assert_eq_i32(hsrv_parse_head(b3.ptr, b3.len, 8, &r), -1);
+    // 不支持的 transfer-encoding
+    const b4: &[byte] = &"POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n"[0: 44];
+    try assert_eq_i32(hsrv_parse_head(b4.ptr, b4.len, HSRV_HEAD_MAX, &r), -1);
+}
+
+fn test_resp_head() !void {
+    var b: [byte: 512] = [0: 512];
+    const n: usize = hsrv_resp_head(&b[0], 512, 200, &"application/json"[0: 16], 16,
+        42 as i64, false, true);
+    const v: &[byte] = b[0: n];
+    try assert_eq_bool(find_sub(v, &"HTTP/1.1 200 OK"[0: 15], 0) == 0, true);
+    try assert_eq_bool(find_sub(v, &"Content-Length: 42"[0: 18], 0) > 0, true);
+    try assert_eq_bool(find_sub(v, &"Connection: keep-alive"[0: 22], 0) > 0, true);
+    const c: usize = hsrv_resp_head(&b[0], 512, 204, &"x"[0: 0], 0, -1 as i64, true, false);
+    const w: &[byte] = b[0: c];
+    try assert_eq_bool(find_sub(w, &"Transfer-Encoding: chunked"[0: 26], 0) > 0, true);
+    try assert_eq_bool(find_sub(w, &"Connection: close"[0: 17], 0) > 0, true);
+    try assert_eq_bool(find_sub(w, &"Content-Length"[0: 14], 0) < 0, true);
+}
+
+fn test_chunks() !void {
+    var b: [byte: 256] = [0: 256];
+    const n: usize = hsrv_chunk(&b[0], 256, &"hello"[0: 5], 5);
+    const v: &[byte] = b[0: n];
+    try assert_eq_i32(v[0] as i32, '5' as i32);
+    try assert_eq_i32(v[1] as i32, '\r' as i32);
+    try assert_eq_i32(v[2] as i32, '\n' as i32);
+    try assert_eq_i32(n as i32, 10);       // 5\r\nhello\r\n
+    const m: usize = hsrv_chunk_last(&b[0], 256);
+    try assert_eq_i32(m as i32, 5);
+    try assert_eq_i32(b[0] as i32, '0' as i32);
+    try assert_eq_bool(hsrv_body_ok(64 * 1024 * 1024, 64 * 1024 * 1024), true);
+    try assert_eq_bool(hsrv_body_ok(65 * 1024 * 1024, 64 * 1024 * 1024), false);
+    try assert_eq_bool(hsrv_body_ok(999999, 0), true);
+}
+
+test "simple_get" { run_test("simple_get", test_simple_get); }
+test "incomplete" { run_test("incomplete", test_incomplete_then_complete); }
+test "post_cl" { run_test("post_cl", test_post_content_length); }
+test "chunked_expect" { run_test("chunked_expect", test_chunked_and_expect); }
+test "keep_alive" { run_test("keep_alive", test_keep_alive_rules); }
+test "bad" { run_test("bad", test_bad_requests); }
+test "resp_head" { run_test("resp_head", test_resp_head); }
+test "chunks" { run_test("chunks", test_chunks); }

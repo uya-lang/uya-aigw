@@ -1,0 +1,421 @@
+// src/net/httpsrv.uya — 服务端 HTTP/1.1 头部解析与响应写出（A1 的地基）
+//
+// 只做「字节 ↔ 结构」这一层，不碰 socket：这样 64 MiB body、chunked、keep-alive、
+// 100-continue 这些最容易出错的规则可以脱网单测，事件循环只负责搬运。
+//
+// 解析严格但宽容：行结束允许 `\r\n`；头部名大小写不敏感；重复的 Content-Length 只要
+// 值一致就接受（RFC 7230 §3.3.2 允许），不一致直接判坏请求。
+
+export const HSRV_METHOD_MAX: usize = 16;
+export const HSRV_PATH_MAX: usize = 1024;
+export const HSRV_HEAD_MAX: usize = 65536;
+
+export struct HsrvReq {
+    method: [byte: HSRV_METHOD_MAX],
+    method_len: usize,
+    path: [byte: HSRV_PATH_MAX],
+    path_len: usize,
+    minor: i32,             // 0 = HTTP/1.0，1 = HTTP/1.1
+    content_length: i64,    // -1 = 没有该头
+    chunked: bool,
+    keep_alive: bool,
+    expect_continue: bool,
+    head_len: usize,        // 头部总字节数（含结尾空行）
+}
+
+fn hsl_lower(c: byte) byte {
+    if c >= ('A' as byte) && c <= ('Z' as byte) {
+        return c +% 32;
+    }
+    return c;
+}
+
+fn hsl_eq_ci(a: &const byte, n: usize, lit: &const byte, ln: usize) bool {
+    if n != ln {
+        return false;
+    }
+    var i: usize = 0;
+    while i < n {
+        if hsl_lower(a[i]) != hsl_lower(lit[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn hsl_trim(s: &const byte, from: usize, to: usize, out_off: &usize, out_end: &usize) void {
+    var a: usize = from;
+    var b: usize = to;
+    while a < b && (s[a] == (32 as byte) || s[a] == (9 as byte)) {
+        a = a + 1;
+    }
+    while b > a && (s[b - 1] == (32 as byte) || s[b - 1] == (9 as byte)) {
+        b = b - 1;
+    }
+    out_off[0] = a;
+    out_end[0] = b;
+}
+
+/// 解析请求头。1=完整可处理，0=还没收到完整头，-1=坏请求。
+export fn hsrv_parse_head(buf: &const byte, n: usize, max_head: usize,
+    out: &HsrvReq) i32 {
+    out.content_length = -1;
+    out.chunked = false;
+    out.keep_alive = false;
+    out.expect_continue = false;
+    out.head_len = 0;
+    out.minor = 1;
+    out.method_len = 0;
+    out.path_len = 0;
+    if n == 0 {
+        return 0;
+    }
+    // 找空行
+    var end: usize = 0;
+    var i: usize = 0;
+    while i + 3 < n {
+        if buf[i] == (13 as byte) && buf[i + 1] == (10 as byte) && buf[i + 2] == (13 as byte)
+            && buf[i + 3] == (10 as byte) {
+            end = i;
+            break;
+        }
+        i = i + 1;
+    }
+    if end == 0 {
+        if n > max_head {
+            return -1;
+        }
+        return 0;
+    }
+    out.head_len = end + 4;
+    if end > max_head {
+        return -1;
+    }
+
+    // 请求行：METHOD SP PATH SP HTTP/1.x
+    var le: usize = 0;
+    while le < end && !(buf[le] == (13 as byte) && buf[le + 1] == (10 as byte)) {
+        le = le + 1;
+    }
+    var sp1: usize = 0;
+    while sp1 < le && buf[sp1] != (32 as byte) {
+        sp1 = sp1 + 1;
+    }
+    if sp1 == 0 || sp1 >= le || sp1 >= HSRV_METHOD_MAX {
+        return -1;
+    }
+    var m: usize = 0;
+    while m < sp1 {
+        out.method[m] = buf[m];
+        m = m + 1;
+    }
+    out.method_len = sp1;
+    var sp2: usize = sp1 + 1;
+    while sp2 < le && buf[sp2] != (32 as byte) {
+        sp2 = sp2 + 1;
+    }
+    if sp2 >= le {
+        return -1;
+    }
+    const path_len: usize = sp2 - sp1 - 1;
+    if path_len == 0 || path_len >= HSRV_PATH_MAX {
+        return -1;
+    }
+    var p: usize = 0;
+    while p < path_len {
+        out.path[p] = buf[sp1 + 1 + p];
+        p = p + 1;
+    }
+    out.path_len = path_len;
+    // 版本
+    var v: usize = sp2 + 1;
+    if v + 8 > le {
+        return -1;
+    }
+    if !hsl_eq_ci(&buf[v], 5, &"HTTP/"[0: 5], 5) {
+        return -1;
+    }
+    if buf[v + 5] != ('1' as byte) || buf[v + 6] != ('.' as byte) {
+        return -1;
+    }
+    if buf[v + 7] == ('0' as byte) {
+        out.minor = 0;
+    } else if buf[v + 7] == ('1' as byte) {
+        out.minor = 1;
+    } else {
+        return -1;
+    }
+
+    // 头部行
+    var pos: usize = le + 2;
+    while pos < end {
+        var eol: usize = pos;
+        while eol < end && !(buf[eol] == (13 as byte) && buf[eol + 1] == (10 as byte)) {
+            eol = eol + 1;
+        }
+        var colon: usize = pos;
+        while colon < eol && buf[colon] != (':' as byte) {
+            colon = colon + 1;
+        }
+        if colon >= eol {
+            return -1;
+        }
+        var n0: usize = 0;
+        var n1: usize = 0;
+        hsl_trim(buf, pos, colon, &n0, &n1);
+        var v0: usize = 0;
+        var v1: usize = 0;
+        hsl_trim(buf, colon + 1, eol, &v0, &v1);
+        const name_len: usize = n1 - n0;
+        const val_len: usize = v1 - v0;
+        if name_len == 0 {
+            return -1;
+        }
+        if hsl_eq_ci(&buf[n0], name_len, &"content-length"[0: 14], 14) {
+            var cl: i64 = 0;
+            var d: usize = 0;
+            while d < val_len {
+                const c: byte = buf[v0 + d];
+                if c < ('0' as byte) || c > ('9' as byte) {
+                    return -1;
+                }
+                const nv: i64 = cl *% (10 as i64) +% ((c as i64) -% 48);
+                if nv < cl {
+                    return -1;          // 溢出
+                }
+                cl = nv;
+                d = d + 1;
+            }
+            if d == 0 {
+                return -1;
+            }
+            if out.content_length >= 0 && out.content_length != cl {
+                return -1;              // 两个不同的 CL：请求走私风险，直接拒
+            }
+            out.content_length = cl;
+        } else if hsl_eq_ci(&buf[n0], name_len, &"transfer-encoding"[0: 17], 17) {
+            if hsl_eq_ci(&buf[v0], val_len, &"chunked"[0: 7], 7) {
+                out.chunked = true;
+            } else {
+                return -1;              // 只支持 chunked
+            }
+        } else if hsl_eq_ci(&buf[n0], name_len, &"connection"[0: 10], 10) {
+            if hsl_eq_ci(&buf[v0], val_len, &"close"[0: 5], 5) {
+                out.keep_alive = false;
+            } else if hsl_eq_ci(&buf[v0], val_len, &"keep-alive"[0: 10], 10) {
+                out.keep_alive = true;
+            }
+        } else if hsl_eq_ci(&buf[n0], name_len, &"expect"[0: 6], 6) {
+            if hsl_eq_ci(&buf[v0], val_len, &"100-continue"[0: 12], 12) {
+                out.expect_continue = true;
+            }
+        }
+        pos = eol + 2;
+    }
+    // 默认 keep-alive 策略：1.1 默认保持，1.0 默认关（除非显式 keep-alive）
+    if out.minor == 0 {
+        if !out.keep_alive {
+            out.keep_alive = false;
+        }
+    } else {
+        // 只有显式 close 才关：Connection 头已把 keep_alive 置 false
+        if out.keep_alive == false {
+            // 没写 Connection: close 时默认保持
+            var saw_close: bool = false;
+            var q: usize = le + 2;
+            while q < end {
+                var e2: usize = q;
+                while e2 < end && !(buf[e2] == (13 as byte) && buf[e2 + 1] == (10 as byte)) {
+                    e2 = e2 + 1;
+                }
+                var c2: usize = q;
+                while c2 < e2 && buf[c2] != (':' as byte) {
+                    c2 = c2 + 1;
+                }
+                if c2 < e2 {
+                    var t0: usize = 0;
+                    var t1: usize = 0;
+                    hsl_trim(buf, q, c2, &t0, &t1);
+                    var u0: usize = 0;
+                    var u1: usize = 0;
+                    hsl_trim(buf, c2 + 1, e2, &u0, &u1);
+                    if hsl_eq_ci(&buf[t0], t1 - t0, &"connection"[0: 10], 10)
+                        && hsl_eq_ci(&buf[u0], u1 - u0, &"close"[0: 5], 5) {
+                        saw_close = true;
+                    }
+                }
+                q = e2 + 2;
+            }
+            out.keep_alive = !saw_close;
+        }
+    }
+    return 1;
+}
+
+export fn hsrv_reason(status: i32) &[byte] {
+    if status == 200 {
+        return &"OK"[0: 2];
+    }
+    if status == 201 {
+        return &"Created"[0: 7];
+    }
+    if status == 204 {
+        return &"No Content"[0: 10];
+    }
+    if status == 400 {
+        return &"Bad Request"[0: 11];
+    }
+    if status == 401 {
+        return &"Unauthorized"[0: 12];
+    }
+    if status == 403 {
+        return &"Forbidden"[0: 9];
+    }
+    if status == 404 {
+        return &"Not Found"[0: 9];
+    }
+    if status == 413 {
+        return &"Payload Too Large"[0: 17];
+    }
+    if status == 421 {
+        return &"Misdirected Request"[0: 19];
+    }
+    if status == 429 {
+        return &"Too Many Requests"[0: 17];
+    }
+    if status == 500 {
+        return &"Internal Server Error"[0: 21];
+    }
+    if status == 502 {
+        return &"Bad Gateway"[0: 11];
+    }
+    if status == 503 {
+        return &"Service Unavailable"[0: 19];
+    }
+    return &"Unknown"[0: 7];
+}
+
+fn hsl_put(out: &byte, cap: usize, off: &usize, s: &[byte], n: usize) bool {
+    var i: usize = 0;
+    while i < n {
+        if off[0] >= cap {
+            return false;
+        }
+        out[off[0]] = s[i];
+        off[0] = off[0] + 1;
+        i = i + 1;
+    }
+    return true;
+}
+
+fn hsl_put_u64(out: &byte, cap: usize, off: &usize, v: u64) bool {
+    var tmp: [byte: 24] = [0: 24];
+    var n: usize = 0;
+    var x: u64 = v;
+    if x == 0 {
+        tmp[0] = '0' as byte;
+        n = 1;
+    } else {
+        while x > 0 && n < 24 {
+            tmp[n] = ('0' as byte) +% ((x % (10 as u64)) as byte);
+            x = x / (10 as u64);
+            n = n + 1;
+        }
+    }
+    var i: usize = n;
+    while i > 0 {
+        if off[0] >= cap {
+            return false;
+        }
+        out[off[0]] = tmp[i - 1];
+        off[0] = off[0] + 1;
+        i = i - 1;
+    }
+    return true;
+}
+
+/// 写响应头。`content_length` 为 -1 且 `chunked` 为真时写 chunked 头。
+export fn hsrv_resp_head(out: &byte, cap: usize, status: i32, ctype: &[byte],
+    ctype_len: usize, content_length: i64, chunked: bool, keep_alive: bool) usize {
+    var off: usize = 0;
+    _ = hsl_put(out, cap, &off, &"HTTP/1.1 "[0: 9], 9);
+    _ = hsl_put_u64(out, cap, &off, status as u64);
+    _ = hsl_put(out, cap, &off, &" "[0: 1], 1);
+    const r: &[byte] = hsrv_reason(status);
+    var rl: usize = 0;
+    while r[rl] != (0 as byte) {
+        rl = rl + 1;
+    }
+    _ = hsl_put(out, cap, &off, r, rl);
+    _ = hsl_put(out, cap, &off, &"\r\n"[0: 2], 2);
+    if ctype_len > 0 {
+        _ = hsl_put(out, cap, &off, &"Content-Type: "[0: 14], 14);
+        _ = hsl_put(out, cap, &off, ctype, ctype_len);
+        _ = hsl_put(out, cap, &off, &"\r\n"[0: 2], 2);
+    }
+    if chunked {
+        _ = hsl_put(out, cap, &off, &"Transfer-Encoding: chunked\r\n"[0: 28], 28);
+    } else if content_length >= 0 {
+        _ = hsl_put(out, cap, &off, &"Content-Length: "[0: 16], 16);
+        _ = hsl_put_u64(out, cap, &off, content_length as u64);
+        _ = hsl_put(out, cap, &off, &"\r\n"[0: 2], 2);
+    }
+    if keep_alive {
+        _ = hsl_put(out, cap, &off, &"Connection: keep-alive\r\n"[0: 24], 24);
+    } else {
+        _ = hsl_put(out, cap, &off, &"Connection: close\r\n"[0: 19], 19);
+    }
+    _ = hsl_put(out, cap, &off, &"\r\n"[0: 2], 2);
+    return off;
+}
+
+/// 写一个 chunk（`<hex>\r\n<data>\r\n`）。
+export fn hsrv_chunk(out: &byte, cap: usize, data: &[byte], n: usize) usize {
+    var off: usize = 0;
+    if n == 0 {
+        return 0;
+    }
+    const hex: &[byte] = &"0123456789abcdef"[0: 16];
+    var tmp: [byte: 16] = [0: 16];
+    var hn: usize = 0;
+    var x: u64 = n as u64;
+    if x == 0 {
+        tmp[0] = '0' as byte;
+        hn = 1;
+    } else {
+        while x > 0 && hn < 16 {
+            tmp[hn] = hex[x % (16 as u64)];
+            x = x / (16 as u64);
+            hn = hn + 1;
+        }
+    }
+    var i: usize = hn;
+    while i > 0 {
+        if off >= cap {
+            return off;
+        }
+        out[off] = tmp[i - 1];
+        off = off + 1;
+        i = i - 1;
+    }
+    _ = hsl_put(out, cap, &off, &"\r\n"[0: 2], 2);
+    _ = hsl_put(out, cap, &off, data, n);
+    _ = hsl_put(out, cap, &off, &"\r\n"[0: 2], 2);
+    return off;
+}
+
+/// 写最后一个 chunk。
+export fn hsrv_chunk_last(out: &byte, cap: usize) usize {
+    var off: usize = 0;
+    _ = hsl_put(out, cap, &off, &"0\r\n\r\n"[0: 5], 5);
+    return off;
+}
+
+/// body 上限检查：超过 `limit` 时调用方回 413。
+export fn hsrv_body_ok(have: u64, limit: u64) bool {
+    if limit == 0 {
+        return true;
+    }
+    return have <= limit;
+}
