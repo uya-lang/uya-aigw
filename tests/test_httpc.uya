@@ -1,0 +1,97 @@
+// tests/test_httpc.uya — HTTP/1.1 解析与请求构造单测（无网络）
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+fn test_find_head_end() !void {
+    var b: Buf = buf_new(64);
+    defer { buf_free(&b); }
+    _ = buf_append(&b, &"HTTP/1.1 200 OK\r\nA: b\r\n"[0: 23], 23);
+    try assert_eq_i32(httpc_find_head_end(b.ptr as &const byte, b.len) as i32, -1);
+    _ = buf_append(&b, &"\r\n"[0: 2], 2);
+    try assert_eq_i32(httpc_find_head_end(b.ptr as &const byte, b.len) as i32, 25);
+}
+
+fn test_status_line() !void {
+    try assert_eq_i32(httpc_parse_status_line(&"HTTP/1.1 200 OK"[0: 15], 15), 200);
+    try assert_eq_i32(httpc_parse_status_line(&"HTTP/1.1 404 Not Found"[0: 22], 22), 404);
+    try assert_eq_i32(httpc_parse_status_line(&"garbage"[0: 7], 7), -1);
+}
+
+fn test_parse_head() !void {
+    var hb: Buf = buf_new(256);
+    defer { buf_free(&hb); }
+    _ = buf_append(&hb, &"HTTP/1.1 200 OK\r\n"[0: 17], 17);
+    _ = buf_append(&hb, &"Content-Length: 5\r\n"[0: 19], 19);
+    _ = buf_append(&hb, &"Transfer-Encoding: chunked\r\n"[0: 28], 28);
+    _ = buf_append(&hb, &"Connection: close\r\n"[0: 19], 19);
+    _ = buf_append(&hb, &"\r\n"[0: 2], 2);
+
+    var headers: [HttpcHeader: 64] = [];
+    var count: usize = 0;
+    var head: HttpcHead = HttpcHead{};
+    try httpc_parse_head(hb.ptr as &const byte, hb.len, &headers[0], &count, &head);
+    try assert_eq_i32(head.status, 200);
+    try assert_eq_i32(count as i32, 3);
+    try assert_eq_i32(head.content_length as i32, 5);
+    try assert_eq_bool(head.chunked, true);
+    try assert_eq_bool(head.connection_close, true);
+
+    var vo: usize = 0;
+    var vl: usize = 0;
+    try assert_eq_bool(httpc_header_find(&headers[0], count,
+        hb.ptr as &const byte, &"content-length"[0: 14], 14, &vo, &vl), true);
+    try assert_eq_i32(vl as i32, 1);
+    try assert_eq_i32(hb.ptr[vo] as i32, '5' as i32);
+}
+
+fn test_chunked() !void {
+    var cb: Buf = buf_new(64);
+    defer { buf_free(&cb); }
+    _ = buf_append(&cb, &"5\r\nhello\r\n0\r\n\r\n"[0: 15], 15);
+    var out: [byte: 16] = [0: 16];
+    var olen: usize = 0;
+    var npos: usize = 0;
+    try assert_eq_i32(httpc_chunk_next(cb.ptr as &const byte, cb.len, 0,
+        &out[0], 16, &olen, &npos), 1);
+    try assert_eq_i32(olen as i32, 5);
+    try assert_eq_i32(out[0] as i32, 'h' as i32);
+    try assert_eq_i32(npos as i32, 10);
+    try assert_eq_i32(httpc_chunk_next(cb.ptr as &const byte, cb.len, npos,
+        &out[0], 16, &olen, &npos), 0);
+
+    try assert_eq_i32(httpc_chunk_next(cb.ptr as &const byte, 8, 0,
+        &out[0], 16, &olen, &npos), -1);
+
+    var bad: Buf = buf_new(16);
+    defer { buf_free(&bad); }
+    _ = buf_append(&bad, &"zz\r\n"[0: 4], 4);
+    try assert_eq_i32(httpc_chunk_next(bad.ptr as &const byte, 4, 0,
+        &out[0], 16, &olen, &npos), -2);
+
+    var tr: Buf = buf_new(32);
+    defer { buf_free(&tr); }
+    _ = buf_append(&tr, &"0\r\nX: y\r\n\r\n"[0: 11], 11);
+    try assert_eq_i32(httpc_chunk_next(tr.ptr as &const byte, 11, 0,
+        &out[0], 16, &olen, &npos), 0);
+    try assert_eq_i32(npos as i32, 11);
+}
+
+fn test_request() !void {
+    var req: Buf = buf_new(256);
+    defer { buf_free(&req); }
+    const ok: bool = httpc_build_request(&req,
+        &"GET"[0: 3], 3, &"example.com"[0: 11], 11, &"/x"[0: 2], 2,
+        &"User-Agent: t\r\n"[0: 15], 15, 0);
+    try assert_eq_bool(ok, true);
+    const view: &[byte] = req.ptr[0: req.len];
+    try assert_eq_bool(find_sub(view, &"Host: example.com"[0: 17], 0) >= 0, true);
+    try assert_eq_bool(find_sub(view, &"Content-Length: 0"[0: 17], 0) >= 0, true);
+    try assert_eq_bool(find_sub(view, &"Connection: keep-alive"[0: 21], 0) >= 0, true);
+}
+
+test "find_head_end" { run_test("find_head_end", test_find_head_end); }
+test "status_line" { run_test("status_line", test_status_line); }
+test "parse_head" { run_test("parse_head", test_parse_head); }
+test "chunked" { run_test("chunked", test_chunked); }
+test "request" { run_test("request", test_request); }

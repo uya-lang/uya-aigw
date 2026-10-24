@@ -1,0 +1,430 @@
+// src/net/httpc.uya — HTTP/1.1 请求构造与响应头/分块解析（跑在 TlsxConn 上）
+//
+// 纯函数（可离线单测）：
+//   httpc_find_head_end / httpc_parse_status_line / httpc_parse_head /
+//   httpc_header_find / httpc_chunk_next / httpc_build_request
+// 异步（需要真实连接）：
+//   httpc_write_request_async / httpc_read_head_async / httpc_read_body_cl_async
+//
+// 约定：头部上限 32 KiB，最多 64 个头；不主动要 gzip；不处理 HTTP/2。
+
+use libc.stdlib;
+
+export const HTTPC_MAX_HEAD: usize = 32768;
+export const HTTPC_MAX_HEADERS: usize = 64;
+
+export error HttpcIncomplete;
+export error HttpcBadResponse;
+export error HttpcTooLarge;
+export error HttpcBadChunk;
+
+export struct HttpcHeader {
+    name_off: usize,
+    name_len: usize,
+    val_off: usize,
+    val_len: usize,
+}
+
+export struct HttpcHead {
+    status: i32,
+    head_len: usize,
+    header_count: usize,
+    content_length: isize,   // -1 = 未知
+    chunked: bool,
+    connection_close: bool,
+    no_body: bool,
+    total: usize,            // 读头时实际缓冲的字节数（含 head 之后的 body 前缀）
+}
+
+fn httpc_lower(b: byte) byte {
+    if b >= ('A' as byte) && b <= ('Z' as byte) {
+        return (b +% 32) as byte;
+    }
+    return b;
+}
+
+fn httpc_is_digit(b: byte) bool {
+    return b >= ('0' as byte) && b <= ('9' as byte);
+}
+
+fn httpc_eq_nocase(a: &const byte, an: usize, b: &const byte, bn: usize) bool {
+    if an != bn {
+        return false;
+    }
+    var i: usize = 0;
+    while i < an {
+        if httpc_lower(a[i]) != httpc_lower(b[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn httpc_contains_nocase(hay: &const byte, hn: usize, needle: &const byte, nn: usize) bool {
+    if nn == 0 || hn < nn {
+        return false;
+    }
+    var i: usize = 0;
+    while i +% nn <= hn {
+        var k: usize = 0;
+        var eq: bool = true;
+        while k < nn {
+            if httpc_lower(hay[i + k]) != httpc_lower(needle[k]) {
+                eq = false;
+                break;
+            }
+            k = k + 1;
+        }
+        if eq {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn httpc_parse_dec(s: &const byte, sn: usize, out: &usize) bool {
+    if sn == 0 || sn > 18 {
+        return false;
+    }
+    var v: usize = 0;
+    var i: usize = 0;
+    while i < sn {
+        const c: byte = s[i];
+        if !httpc_is_digit(c) {
+            return false;
+        }
+        v = v *% (10 as usize) +% ((c as usize) - 48);
+        i = i + 1;
+    }
+    out[0] = v;
+    return true;
+}
+
+/// 找头部结束位置（返回结束后的下标；找不到 -1）。兼容 \r\n\r\n 与 \n\n。
+export fn httpc_find_head_end(b: &const byte, n: usize) isize {
+    var i: usize = 0;
+    while i +% 4 <= n {
+        if b[i] == (13 as byte) && b[i + 1] == (10 as byte)
+            && b[i + 2] == (13 as byte) && b[i + 3] == (10 as byte) {
+            return (i as isize) + 4;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i +% 2 <= n {
+        if b[i] == (10 as byte) && b[i + 1] == (10 as byte) {
+            return (i as isize) + 2;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// 解析 "HTTP/1.1 200 OK" 里的三位状态码；失败 -1。
+export fn httpc_parse_status_line(line: &const byte, ln: usize) i32 {
+    var i: usize = 0;
+    while i < ln && line[i] != (32 as byte) {
+        i = i + 1;
+    }
+    while i < ln && line[i] == (32 as byte) {
+        i = i + 1;
+    }
+    if i +% 3 > ln {
+        return -1;
+    }
+    if !httpc_is_digit(line[i]) || !httpc_is_digit(line[i + 1]) || !httpc_is_digit(line[i + 2]) {
+        return -1;
+    }
+    return (((line[i] as i32) -% 48) *% 100)
+        +% (((line[i + 1] as i32) -% 48) *% 10)
+        +% ((line[i + 2] as i32) -% 48);
+}
+
+fn httpc_line_end(b: &const byte, n: usize, from: usize) usize {
+    var i: usize = from;
+    while i < n && b[i] != (10 as byte) {
+        i = i + 1;
+    }
+    return i;
+}
+
+/// 解析响应头（b[0..n] 必须恰好包含到 \r\n\r\n）。成功填 headers/count/head。
+export fn httpc_parse_head(b: &const byte, n: usize, headers: &HttpcHeader,
+    count: &usize, head: &HttpcHead) !void {
+    count[0] = 0;
+    head.status = -1;
+    head.head_len = n;
+    head.header_count = 0;
+    head.content_length = -1;
+    head.chunked = false;
+    head.connection_close = false;
+    head.no_body = false;
+    if n == 0 {
+        return error.HttpcBadResponse;
+    }
+    const se: usize = httpc_line_end(b, n, 0);
+    head.status = httpc_parse_status_line(&b[0], se);
+    if head.status < 100 {
+        return error.HttpcBadResponse;
+    }
+    var pos: usize = se +% 1;
+    while pos < n {
+        const le: usize = httpc_line_end(b, n, pos);
+        var ll: usize = le;
+        if ll > pos && b[ll - 1] == (13 as byte) {
+            ll = ll - 1;
+        }
+        if ll == pos {
+            break;
+        }
+        var c: usize = pos;
+        while c < ll && b[c] != (58 as byte) {
+            c = c + 1;
+        }
+        if c < ll {
+            var ne: usize = c;
+            while ne > pos && (b[ne - 1] == (32 as byte) || b[ne - 1] == (9 as byte)) {
+                ne = ne - 1;
+            }
+            var vs: usize = c +% 1;
+            while vs < ll && (b[vs] == (32 as byte) || b[vs] == (9 as byte)) {
+                vs = vs + 1;
+            }
+            var ve: usize = ll;
+            while ve > vs && (b[ve - 1] == (32 as byte) || b[ve - 1] == (9 as byte)) {
+                ve = ve - 1;
+            }
+            if count[0] < HTTPC_MAX_HEADERS {
+                headers[count[0]].name_off = pos;
+                headers[count[0]].name_len = ne - pos;
+                headers[count[0]].val_off = vs;
+                headers[count[0]].val_len = ve - vs;
+                count[0] = count[0] + 1;
+            }
+            const name: &const byte = &b[pos];
+            const nlen: usize = ne - pos;
+            const val: &const byte = &b[vs];
+            const vlen: usize = ve - vs;
+            if httpc_eq_nocase(name, nlen, &"content-length"[0: 14], 14) {
+                var v: usize = 0;
+                if httpc_parse_dec(val, vlen, &v) {
+                    head.content_length = v as isize;
+                } else {
+                    return error.HttpcBadResponse;
+                }
+            } else if httpc_eq_nocase(name, nlen, &"transfer-encoding"[0: 17], 17) {
+                if httpc_contains_nocase(val, vlen, &"chunked"[0: 7], 7) {
+                    head.chunked = true;
+                }
+            } else if httpc_eq_nocase(name, nlen, &"connection"[0: 10], 10) {
+                if httpc_contains_nocase(val, vlen, &"close"[0: 5], 5) {
+                    head.connection_close = true;
+                }
+            }
+        }
+        pos = le +% 1;
+    }
+    head.header_count = count[0];
+    if head.status == 204 || head.status == 304 || head.status < 200 {
+        head.no_body = true;
+    }
+    return;
+}
+
+/// 按名字查头（大小写不敏感）；命中返回值区间。
+export fn httpc_header_find(headers: &const HttpcHeader, count: usize,
+    b: &const byte, name: &const byte, name_len: usize,
+    val_off: &usize, val_len: &usize) bool {
+    var i: usize = 0;
+    while i < count && i < HTTPC_MAX_HEADERS {
+        const h: &const HttpcHeader = &headers[i];
+        if httpc_eq_nocase(&b[h.name_off], h.name_len, name, name_len) {
+            val_off[0] = h.val_off;
+            val_len[0] = h.val_len;
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// 分块解码：从 b[pos..n] 解一块到 out。返回 1=解出一块，0=结束，-1=数据不够，-2=畸形/输出不够。
+export fn httpc_chunk_next(b: &const byte, n: usize, pos: usize,
+    out: &byte, out_cap: usize, out_len: &usize, new_pos: &usize) i32 {
+    out_len[0] = 0;
+    new_pos[0] = pos;
+    if pos >= n {
+        return -1;
+    }
+    var i: usize = pos;
+    var size: usize = 0;
+    var digits: usize = 0;
+    while i < n {
+        const c: byte = b[i];
+        if httpc_is_digit(c) {
+            size = size *% (16 as usize) +% ((c as usize) - (48 as usize));
+            digits = digits + 1;
+            if digits > 8 {
+                return -2;
+            }
+        } else if (c >= ('a' as byte) && c <= ('f' as byte)) {
+            size = size *% (16 as usize) +% ((c as usize) - (87 as usize));
+            digits = digits + 1;
+            if digits > 8 {
+                return -2;
+            }
+        } else if (c >= ('A' as byte) && c <= ('F' as byte)) {
+            size = size *% (16 as usize) +% ((c as usize) - (55 as usize));
+            digits = digits + 1;
+            if digits > 8 {
+                return -2;
+            }
+        } else if c == (59 as byte) {
+            // ';' 扩展：跳到行尾
+            while i < n && b[i] != (10 as byte) {
+                i = i + 1;
+            }
+            break;
+        } else {
+            break;
+        }
+        i = i + 1;
+    }
+    if digits == 0 {
+        return -2;
+    }
+    // 跳到 CRLF 之后
+    while i < n && b[i] != (10 as byte) {
+        i = i + 1;
+    }
+    if i >= n {
+        return -1;
+    }
+    i = i + 1;
+    if size == 0 {
+        // trailer：连续的 header 行，以空行结束
+        while i < n {
+            const le: usize = httpc_line_end(b, n, i);
+            var ll: usize = le;
+            if ll > i && b[ll - 1] == (13 as byte) {
+                ll = ll - 1;
+            }
+            const empty: bool = ll == i;
+            i = le + 1;
+            if empty {
+                new_pos[0] = i;
+                return 0;
+            }
+        }
+        return -1;
+    }
+    if i +% size +% 2 > n {
+        return -1;
+    }
+    if size > out_cap {
+        return -2;
+    }
+    var k: usize = 0;
+    while k < size {
+        out[k] = b[i + k];
+        k = k + 1;
+    }
+    out_len[0] = size;
+    new_pos[0] = i +% size +% 2;
+    return 1;
+}
+
+/// 构造请求：method + path + Host + extra + Content-Length + Connection + body 占位。
+export fn httpc_build_request(buf: &Buf, method: &const byte, method_len: usize,
+    host: &const byte, host_len: usize, path: &const byte, path_len: usize,
+    extra: &const byte, extra_len: usize, body_len: usize) bool {
+    if !buf_append(buf, method, method_len) { return false; }
+    if !buf_append_byte(buf, 32) { return false; }
+    if !buf_append(buf, path, path_len) { return false; }
+    if !buf_append(buf, &" HTTP/1.1\r\nHost: "[0: 17], 17) { return false; }
+    if !buf_append(buf, host, host_len) { return false; }
+    if !buf_append(buf, &"\r\n"[0: 2], 2) { return false; }
+    if extra_len > 0 {
+        if !buf_append(buf, extra, extra_len) { return false; }
+    }
+    if !buf_append(buf, &"Content-Length: "[0: 16], 16) { return false; }
+    if !buf_append_u64(buf, body_len as u64) { return false; }
+    if !buf_append(buf, &"\r\nConnection: keep-alive\r\n\r\n"[0: 30], 30) { return false; }
+    return true;
+}
+
+/// 写出完整请求（头 + body）。
+export @async_fn fn httpc_write_request_async(c: &TlsxConn,
+    method: &const byte, method_len: usize, host: &const byte, host_len: usize,
+    path: &const byte, path_len: usize, extra: &const byte, extra_len: usize,
+    body: &const byte, body_len: usize) Future<!usize> {
+    var req: Buf = buf_new(1024 +% body_len);
+    defer { buf_free(&req); }
+    if !httpc_build_request(&req, method, method_len, host, host_len,
+        path, path_len, extra, extra_len, body_len) {
+        return error.HttpcTooLarge;
+    }
+    if body_len > 0 {
+        if !buf_append(&req, body, body_len) {
+            return error.HttpcTooLarge;
+        }
+    }
+    const w: usize = try @await tlsx_write_async(c, req.ptr as &const byte, req.len);
+    return w;
+}
+
+/// 读到响应头结束；跳过 1xx（含 100-continue）。head.total 为缓冲区实际字节数。
+export @async_fn fn httpc_read_head_async(c: &TlsxConn, buf: &byte, cap: usize,
+    headers: &HttpcHeader, count: &usize, head: &HttpcHead) Future<!i32> {
+    var filled: usize = 0;
+    while filled < cap {
+        const n: usize = try @await tlsx_read_async(c, &buf[filled], cap - filled);
+        if n == 0 {
+            return -1;
+        }
+        filled = filled +% n;
+        const he: isize = httpc_find_head_end(buf, filled);
+        if he < 0 {
+            continue;
+        }
+        const hl: usize = he as usize;
+        httpc_parse_head(buf, hl, headers, count, head) catch {
+            return -2;
+        };
+        if head.status >= 100 && head.status < 200 {
+            // 1xx：丢掉这段头，把剩余字节挪到前面，继续读最终响应
+            var k: usize = 0;
+            while k +% hl < filled {
+                buf[k] = buf[hl + k];
+                k = k + 1;
+            }
+            filled = filled - hl;
+            continue;
+        }
+        head.head_len = hl;
+        head.total = filled;
+        return 0;
+    }
+    return -3;
+}
+
+/// 按 Content-Length 读 body（不够就返回实际读到的）。
+export @async_fn fn httpc_read_body_cl_async(c: &TlsxConn, out: &byte, cap: usize,
+    need: usize, got: &usize) Future<!i32> {
+    var off: usize = 0;
+    while off < need && off < cap {
+        var want: usize = need - off;
+        if want > cap - off {
+            want = cap - off;
+        }
+        const n: usize = try @await tlsx_read_async(c, &out[off], want);
+        if n == 0 {
+            break;
+        }
+        off = off +% n;
+    }
+    got[0] = off;
+    return 0;
+}
