@@ -18,3 +18,4 @@
 | TLS-07 | 2026-10-24 | `git log --grep=TLS-07` | `src/net/ssex.uya`：增量 SSE 解析（多行 data/event/id/注释/CRLF）、`[DONE]` 判定、跨包分帧、行/数据上限；`tests/test_ssex.uya` 6 组用例全过 |
 | TLS-08 | 2026-10-24 | `git log --grep=TLS-08` | `src/net/httpc_pool.uya`：SSRF 私网拒绝（RFC1918/loopback/link-local/CGNAT/保留段）、可重试状态码分类、指数退避（Retry-After 优先）、按 (host,port,trust) 连接池 + idle TTL + LRU；`tests/test_httpc_pool.uya` 6 组用例全过；代理 CONNECT 因需 TlsxConn 并入 TLS-09 |
 | TLS-09A | 2026-10-24 | `git log --grep=TLS-09A` | `src/providers/http.uya`：密钥解析（env/file/literal）、模型别名、鉴权头（Bearer/x-api-key/api-key/query）、OpenAI 风格错误体（最小转义）；`tests/test_provider_http.uya` 6 组用例全过；异步 chat 调用留在 TLS-09 |
+| TLS-09B | 2026-10-24 | `git log --grep=TLS-09B` | `src/net/proxyx.uya`：http 代理 URL 解析、no_proxy 匹配（`*`/精确/后缀）、CONNECT 请求构造（含 Basic 认证）；`tests/test_proxyx.uya` 3 组用例全过 |

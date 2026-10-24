@@ -1,0 +1,56 @@
+// tests/test_proxyx.uya — 代理解析 / no_proxy / CONNECT 单测
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+fn test_parse() !void {
+    var p: ProxyCfg = ProxyCfg{};
+    try assert_eq_bool(proxy_parse(&"http://127.0.0.1:8080"[0: 21], 21, &p), true);
+    try assert_eq_i32(p.host_len as i32, 9);
+    try assert_eq_i32(p.port as i32, 8080);
+    try assert_eq_bool(p.has_auth, false);
+
+    var q: ProxyCfg = ProxyCfg{};
+    try assert_eq_bool(proxy_parse(&"http://u:p@proxy.local:3128"[0: 27], 27, &q), true);
+    try assert_eq_bool(q.has_auth, true);
+    try assert_eq_i32(q.user_len as i32, 1);
+    try assert_eq_i32(q.pass_len as i32, 1);
+    try assert_eq_i32(q.host_len as i32, 11);
+    try assert_eq_i32(q.port as i32, 3128);
+
+    var r: ProxyCfg = ProxyCfg{};
+    try assert_eq_bool(proxy_parse(&"https://x:1"[0: 11], 11, &r), false);
+}
+
+fn test_bypass() !void {
+    const list: &[byte] = &"localhost, .local, example.com"[0: 30];
+    try assert_eq_bool(proxy_bypass(list, 30, &"localhost"[0: 9], 9), true);
+    try assert_eq_bool(proxy_bypass(list, 30, &"api.local"[0: 9], 9), true);
+    try assert_eq_bool(proxy_bypass(list, 30, &"example.com"[0: 11], 11), true);
+    try assert_eq_bool(proxy_bypass(list, 30, &"foo.example.com"[0: 15], 15), true);
+    try assert_eq_bool(proxy_bypass(list, 30, &"other.com"[0: 9], 9), false);
+    try assert_eq_bool(proxy_bypass(&"*"[0: 1], 1, &"a.b"[0: 3], 3), true);
+}
+
+fn test_connect() !void {
+    var q: ProxyCfg = ProxyCfg{};
+    _ = proxy_parse(&"http://u:p@proxy.local:3128"[0: 27], 27, &q);
+    var b: Buf = buf_new(512);
+    defer { buf_free(&b); }
+    try assert_eq_bool(proxy_build_connect(&q, &"api.example.com"[0: 15], 15, 443, &b), true);
+    try assert_eq_bool(find_sub(b.ptr[0: b.len],
+        &"CONNECT api.example.com:443 HTTP/1.1"[0: 36], 0) >= 0, true);
+    try assert_eq_bool(find_sub(b.ptr[0: b.len], &"Basic dTpw"[0: 10], 0) >= 0, true);
+
+    var p: ProxyCfg = ProxyCfg{};
+    _ = proxy_parse(&"http://127.0.0.1:8080"[0: 21], 21, &p);
+    var b2: Buf = buf_new(256);
+    defer { buf_free(&b2); }
+    try assert_eq_bool(proxy_build_connect(&p, &"x.test"[0: 6], 6, 80, &b2), true);
+    try assert_eq_bool(find_sub(b2.ptr[0: b2.len],
+        &"Proxy-Authorization"[0: 19], 0) < 0, true);
+}
+
+test "parse" { run_test("parse", test_parse); }
+test "bypass" { run_test("bypass", test_bypass); }
+test "connect" { run_test("connect", test_connect); }

@@ -1,0 +1,191 @@
+// src/net/proxyx.uya — HTTP 代理：URL 解析、no_proxy 匹配、CONNECT 请求构造
+//
+// 只支持 http:// 代理（TLS 代理 / SOCKS 不在本期）；CONNECT 隧道内的 TLS 仍是端到端。
+
+use std.encoding.base64.encode_base64;
+
+export const PROXY_HOST_MAX: usize = 253;
+
+export struct ProxyCfg {
+    host: [byte: PROXY_HOST_MAX],
+    host_len: usize,
+    port: u16,
+    user: [byte: 128],
+    user_len: usize,
+    pass: [byte: 128],
+    pass_len: usize,
+    has_auth: bool,
+}
+
+fn proxy_lower(b: byte) byte {
+    if b >= ('A' as byte) && b <= ('Z' as byte) {
+        return (b +% 32) as byte;
+    }
+    return b;
+}
+
+fn proxy_eq_nocase(a: &const byte, an: usize, b: &const byte, bn: usize) bool {
+    if an != bn {
+        return false;
+    }
+    var i: usize = 0;
+    while i < an {
+        if proxy_lower(a[i]) != proxy_lower(b[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn proxy_copy(dst: &byte, cap: usize, src: &const byte, n: usize) bool {
+    if n > cap {
+        return false;
+    }
+    var i: usize = 0;
+    while i < n {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+    return true;
+}
+
+/// 解析 "http://[user:pass@]host[:port]"。默认端口 80；拒绝非 http scheme。
+export fn proxy_parse(url: &const byte, n: usize, out: &ProxyCfg) bool {
+    out.host_len = 0;
+    out.port = 0;
+    out.user_len = 0;
+    out.pass_len = 0;
+    out.has_auth = false;
+    if n < 8 || !proxy_eq_nocase(&url[0], 7, &"http://"[0: 7], 7) {
+        return false;
+    }
+    var i: usize = 7;
+    var at: usize = i;
+    while at < n && url[at] != ('@' as byte) && url[at] != ('/' as byte) {
+        at = at + 1;
+    }
+    var host_start: usize = i;
+    if at < n && url[at] == ('@' as byte) {
+        var colon: usize = i;
+        while colon < at && url[colon] != (':' as byte) {
+            colon = colon + 1;
+        }
+        if colon > i {
+            if !proxy_copy(&out.user[0], 128, &url[i], colon - i) {
+                return false;
+            }
+            out.user_len = colon - i;
+            if colon < at {
+                if !proxy_copy(&out.pass[0], 128, &url[colon + 1], at - colon - 1) {
+                    return false;
+                }
+                out.pass_len = at - colon - 1;
+            }
+            out.has_auth = true;
+        }
+        host_start = at + 1;
+    }
+    var host_end: usize = host_start;
+    while host_end < n && url[host_end] != (':' as byte) && url[host_end] != ('/' as byte) {
+        host_end = host_end + 1;
+    }
+    if host_end == host_start || host_end - host_start > PROXY_HOST_MAX {
+        return false;
+    }
+    if !proxy_copy(&out.host[0], PROXY_HOST_MAX, &url[host_start], host_end - host_start) {
+        return false;
+    }
+    out.host_len = host_end - host_start;
+    var port: u16 = 80;
+    if host_end < n && url[host_end] == (':' as byte) {
+        var p: usize = host_end + 1;
+        var v: i32 = 0;
+        var d: usize = 0;
+        while p < n && url[p] >= ('0' as byte) && url[p] <= ('9' as byte) {
+            v = v *% 10 +% ((url[p] as i32) -% 48);
+            d = d + 1;
+            p = p + 1;
+        }
+        if d == 0 || v <= 0 || v > 65535 {
+            return false;
+        }
+        port = v as u16;
+    }
+    out.port = port;
+    return true;
+}
+
+/// no_proxy：逗号分隔；`*` 全匹配；`.local` / `local` 都按后缀匹配。
+export fn proxy_bypass(list: &const byte, n: usize, host: &const byte, hn: usize) bool {
+    var pos: usize = 0;
+    while pos < n {
+        var end: usize = pos;
+        while end < n && list[end] != (',' as byte) {
+            end = end + 1;
+        }
+        var s: usize = pos;
+        while s < end && (list[s] == (32 as byte) || list[s] == (9 as byte)) {
+            s = s + 1;
+        }
+        var e: usize = end;
+        while e > s && (list[e - 1] == (32 as byte) || list[e - 1] == (9 as byte)) {
+            e = e - 1;
+        }
+        if e > s {
+            if e - s == 1 && list[s] == (42 as byte) {
+                return true;
+            }
+            var start: usize = s;
+            if list[start] == (46 as byte) {
+                start = start + 1;
+            }
+            const il: usize = e - start;
+            if il > 0 {
+                if il == hn && proxy_eq_nocase(&host[0], hn, &list[start], il) {
+                    return true;
+                }
+                if hn > il && host[hn - il - 1] == (46 as byte)
+                    && proxy_eq_nocase(&host[hn - il], il, &list[start], il) {
+                    return true;
+                }
+            }
+        }
+        pos = end +% 1;
+    }
+    return false;
+}
+
+/// 构造 CONNECT 请求（含可选 Proxy-Authorization: Basic）。
+export fn proxy_build_connect(p: &const ProxyCfg, target: &const byte, tn: usize,
+    tport: u16, out: &Buf) bool {
+    if !buf_append_cstr(out, "CONNECT " as &const byte) { return false; }
+    if !buf_append(out, target, tn) { return false; }
+    if !buf_append_cstr(out, ":" as &const byte) { return false; }
+    if !buf_append_u64(out, tport as u64) { return false; }
+    if !buf_append_cstr(out, " HTTP/1.1\r\nHost: " as &const byte) { return false; }
+    if !buf_append(out, target, tn) { return false; }
+    if !buf_append_cstr(out, ":" as &const byte) { return false; }
+    if !buf_append_u64(out, tport as u64) { return false; }
+    if !buf_append_cstr(out, "\r\n" as &const byte) { return false; }
+    if p.has_auth {
+        var cred: [byte: 256] = [0: 256];
+        var clen: usize = 0;
+        if !proxy_copy(&cred[0], 256, &p.user[0], p.user_len) { return false; }
+        clen = p.user_len;
+        if clen < 256 {
+            cred[clen] = 58; // ':'
+            clen = clen + 1;
+        }
+        if !proxy_copy(&cred[clen], 256 - clen, &p.pass[0], p.pass_len) { return false; }
+        clen = clen + p.pass_len;
+        var b64: [byte: 512] = [0: 512];
+        const bn: usize = encode_base64(cred[0: clen], b64[0: 512]) catch {
+            return false;
+        };
+        if !buf_append_cstr(out, "Proxy-Authorization: Basic " as &const byte) { return false; }
+        if !buf_append(out, &b64[0], bn) { return false; }
+        if !buf_append_cstr(out, "\r\n" as &const byte) { return false; }
+    }
+    return buf_append_cstr(out, "\r\n" as &const byte);
+}
