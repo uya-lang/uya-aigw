@@ -33,7 +33,7 @@ Phase A0 (SQLite spike) 可与 Phase T 并行 ─────┘
 
 | ID | 任务 | 验收 | 依赖 |
 |---|---|---|---|
-| A0 | **spike**：`@c_import` + SQLite `select 1` + `money.c` `__int128`、Makefile | `make check/build`；`/healthz`；金额单测 | DOC-01 |
+| A0 | **spike**：SQLite `select 1`（`@c_import`）— `money.c __int128` 部分已完成 | `make check/build`；`/healthz`；金额单测 | DOC-01 |
 | A1 | 单线程 epoll 事件循环、0.0.0.0 监听、动态不限 body、chunked、100-continue、keep-alive、SSE、优雅停机 | 64 MiB body；512 并发 SSE；线程数恒 1 | A0 |
 | A2 | schema/迁移 + users/keys/OTP/会话 + rate card + schedule 解析 + 每日备份 + journal | 登录→建 key→调用；时段单测；备份/恢复冒烟 | A1 |
 | A3 | 插件池：常驻、min/max、idle 回收、崩溃退避、cancel、ping/pong | 复用、缩容、崩溃恢复 | A1 |

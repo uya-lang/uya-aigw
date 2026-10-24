@@ -1,0 +1,196 @@
+// src/core/money.uya — 金额：整数 nano-USD、解析、格式化、定价
+//
+// 为什么不用 f64：0.00098 这类金额在二进制浮点里存不准，累计几十万条就是肉眼可见的
+// 对账差额。这里一律 i64 nano-USD（1 USD = 1e9），乘除的 128 位中间值交给 money.c。
+//
+// 约定：费率是「每 100 万 tokens 多少 nano-USD」；成本 = tokens * rate / 1e6 四舍五入。
+
+@c_import("money.c");
+
+extern fn aigw_mul_div(a: i64, b: i64, c: i64) i64;
+extern fn aigw_mul_div_round(a: i64, b: i64, c: i64) i64;
+extern fn aigw_price_nano(tokens: i64, rate_nano_per_mtok: i64) i64;
+extern fn aigw_scale_permille(nano: i64, permille: i64) i64;
+extern fn aigw_add_sat(a: i64, b: i64) i64;
+
+export const MONEY_NANO_PER_USD: i64 = 1000000000;
+export const MONEY_NANO_PER_CENT: i64 = 10000000;
+export const MONEY_TOKENS_PER_UNIT: i64 = 1000000;
+
+export error MoneyBadInput;
+export error MoneyOverflow;
+
+/// 成本（nano）：tokens × rate（nano/1M tokens）/ 1e6，四舍五入。
+export fn money_cost_nano(tokens: i64, rate_nano_per_mtok: i64) i64 {
+    if tokens < 0 || rate_nano_per_mtok < 0 {
+        return 0;
+    }
+    return aigw_price_nano(tokens, rate_nano_per_mtok);
+}
+
+/// 峰谷折扣/加价：按千分比缩放（permille=1000 表示不变）。
+export fn money_scale_permille(nano: i64, permille: i64) i64 {
+    if permille < 0 {
+        return nano;
+    }
+    return aigw_scale_permille(nano, permille);
+}
+
+export fn money_add(a: i64, b: i64) i64 {
+    return aigw_add_sat(a, b);
+}
+
+/// 分（cents）→ nano 的四舍五入换算（账单展示用）。
+export fn money_nano_to_cents(nano: i64) i64 {
+    return aigw_mul_div_round(nano, 1, MONEY_NANO_PER_CENT);
+}
+
+/// 解析 "$1.234567" / "1.234567" / "0.000000001" → nano；最多 9 位小数。
+/// 负号允许（退款/调整），其余非法字符一律失败。
+export fn money_parse_nano(s: &[byte], out: &i64) !void {
+    var i: usize = 0;
+    var neg: bool = false;
+    if s.len == 0 {
+        return error.MoneyBadInput;
+    }
+    if s[0] == ('-' as byte) {
+        neg = true;
+        i = 1;
+    } else if s[0] == ('+' as byte) {
+        i = 1;
+    } else if s[0] == ('$' as byte) {
+        i = 1;
+    }
+    if i < s.len && s[i] == ('$' as byte) {
+        i = 1;
+    }
+    if i >= s.len {
+        return error.MoneyBadInput;
+    }
+    var whole: i64 = 0;
+    var digits: usize = 0;
+    while i < s.len && s[i] >= ('0' as byte) && s[i] <= ('9' as byte) {
+        whole = whole *% (10 as i64) +% ((s[i] as i64) -% 48);
+        if whole > (1000000000000 as i64) {
+            return error.MoneyOverflow;
+        }
+        digits = digits + 1;
+        i = i + 1;
+    }
+    if digits == 0 {
+        return error.MoneyBadInput;
+    }
+    var frac: i64 = 0;
+    var fcount: usize = 0;
+    if i < s.len && s[i] == ('.' as byte) {
+        i = i + 1;
+        while i < s.len && s[i] >= ('0' as byte) && s[i] <= ('9' as byte) {
+            if fcount >= 9 {
+                return error.MoneyBadInput;
+            }
+            frac = frac *% (10 as i64) +% ((s[i] as i64) -% 48);
+            fcount = fcount + 1;
+            i = i + 1;
+        }
+        if fcount == 0 {
+            return error.MoneyBadInput;
+        }
+    }
+    if i != s.len {
+        return error.MoneyBadInput;
+    }
+    var scale: i64 = 1;
+    var k: usize = fcount;
+    while k < 9 {
+        scale = scale *% (10 as i64);
+        k = k + 1;
+    }
+    var nano: i64 = whole *% MONEY_NANO_PER_USD;
+    nano = aigw_add_sat(nano, frac *% scale);
+    if neg {
+        nano = 0 -% nano;
+    }
+    out[0] = nano;
+    return;
+}
+
+fn money_push(out: &byte, cap: usize, off: &usize, b: byte) bool {
+    if off[0] >= cap {
+        return false;
+    }
+    out[off[0]] = b;
+    off[0] = off[0] + 1;
+    return true;
+}
+
+/// 格式化：1e9 nano = 1 USD，最少 2 位、最多 6 位小数，去掉多余的 0。
+/// 例：980000 → "$0.00098"；1234567890 → "$1.234568"（四舍五入到 6 位）。
+export fn money_format(out: &byte, cap: usize, nano: i64) usize {
+    var off: usize = 0;
+    var v: i64 = nano;
+    if v < 0 {
+        if !money_push(out, cap, &off, '-' as byte) {
+            return off;
+        }
+        v = 0 -% v;
+    }
+    if !money_push(out, cap, &off, '$' as byte) {
+        return off;
+    }
+    const whole: i64 = v / MONEY_NANO_PER_USD;
+    var rem: i64 = v -% (whole *% MONEY_NANO_PER_USD);
+    // 先按百万分之一美元四舍五入，再输出 6 位
+    const micros: i64 = aigw_mul_div_round(rem, 1, 1000 as i64);
+    var w: i64 = whole;
+    if micros >= (1000000 as i64) {
+        w = w +% 1;
+    }
+    var digits: [byte: 20] = [0: 20];
+    var dn: usize = 0;
+    var x: i64 = w;
+    if x == 0 {
+        digits[0] = '0' as byte;
+        dn = 1;
+    } else {
+        while x > 0 && dn < 20 {
+            digits[dn] = ('0' as byte) +% ((x % (10 as i64)) as byte);
+            x = x / (10 as i64);
+            dn = dn + 1;
+        }
+    }
+    var d: usize = dn;
+    while d > 0 {
+        if !money_push(out, cap, &off, digits[d - 1]) {
+            return off;
+        }
+        d = d - 1;
+    }
+    if !money_push(out, cap, &off, '.' as byte) {
+        return off;
+    }
+    var frac: i64 = 0;
+    if micros < (1000000 as i64) {
+        frac = micros;
+    }
+    var buf: [byte: 6] = [0: 6];
+    var f: usize = 6;
+    var fr: i64 = frac;
+    while f > 0 {
+        f = f - 1;
+        buf[f] = ('0' as byte) +% ((fr % (10 as i64)) as byte);
+        fr = fr / (10 as i64);
+    }
+    // 去掉尾部 0，但至少保留 2 位
+    var keep: usize = 6;
+    while keep > 2 && buf[keep - 1] == ('0' as byte) {
+        keep = keep - 1;
+    }
+    var q: usize = 0;
+    while q < keep {
+        if !money_push(out, cap, &off, buf[q]) {
+            return off;
+        }
+        q = q + 1;
+    }
+    return off;
+}

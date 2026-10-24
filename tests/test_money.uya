@@ -1,0 +1,78 @@
+// tests/test_money.uya — 金额单测（nano-USD、定价、解析、格式化）
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+fn test_cost() !void {
+    // 1000 tokens × 3 nano/1M tokens → 0.003 nano → 四舍五入 0
+    try assert_eq_i32(money_cost_nano(1000, 3) as i32, 0);
+    // 1e6 tokens × 1000 nano/1M = 1000 nano
+    try assert_eq_i32(money_cost_nano(1000000, 1000) as i32, 1000);
+    // 688 output tokens × 1.425e9 nano/1M ≈ 980,400 nano
+    try assert_eq_i32(money_cost_nano(688, 1425000000) as i32, 980400);
+    // 负数一律 0
+    try assert_eq_i32(money_cost_nano(-5, 1000) as i32, 0);
+}
+
+fn test_big_no_overflow() !void {
+    // 1e12 tokens × 1e9 nano/1M = 1e15 nano（f64 会丢精度，这里必须精确）
+    try assert_eq_i32(money_cost_nano(1000000000000, 1000000000) as i32, 1000000000000000 as i32);
+}
+
+fn test_permille() !void {
+    try assert_eq_i32(money_scale_permille(1000000, 1000) as i32, 1000000);
+    try assert_eq_i32(money_scale_permille(1000000, 500) as i32, 500000);
+    try assert_eq_i32(money_scale_permille(1000000, 1500) as i32, 1500000);
+}
+
+fn test_cents() !void {
+    try assert_eq_i32(money_nano_to_cents(10000000) as i32, 1);
+    try assert_eq_i32(money_nano_to_cents(15000000) as i32, 2);
+    try assert_eq_i32(money_nano_to_cents(0) as i32, 0);
+}
+
+fn test_parse() !void {
+    var v: i64 = 0;
+    try money_parse_nano(&"1.5"[0: 3], &v);
+    try assert_eq_i32(v as i32, 1500000000 as i32);
+    try money_parse_nano(&"$0.00098"[0: 8], &v);
+    try assert_eq_i32(v as i32, 980000);
+    try money_parse_nano(&"0.000000001"[0: 11], &v);
+    try assert_eq_i32(v as i32, 1);
+    try money_parse_nano(&"-2.25"[0: 5], &v);
+    try assert_eq_i32(v as i32, -2250000000 as i32);
+
+    var bad: bool = false;
+    _ = money_parse_nano(&"1.2.3"[0: 5], &v) catch |_| { bad = true; };
+    try assert_eq_bool(bad, true);
+    bad = false;
+    _ = money_parse_nano(&"abc"[0: 3], &v) catch |_| { bad = true; };
+    try assert_eq_bool(bad, true);
+}
+
+fn test_format() !void {
+    var b: [byte: 32] = [0: 32];
+    var n: usize = money_format(&b[0], 32, 980000);
+    try assert_eq_i32(n as i32, 8);
+    var got: &[byte] = &b[0: 8];
+    try assert_eq_i32(got[0] as i32, '$' as i32);
+    try assert_eq_i32(got[1] as i32, '0' as i32);
+    try assert_eq_i32(got[2] as i32, '.' as i32);
+    try assert_eq_i32(got[3] as i32, '0' as i32);
+    try assert_eq_i32(got[7] as i32, '8' as i32);
+
+    n = money_format(&b[0], 32, 0);
+    try assert_eq_i32(n as i32, 5);          // "$0.00"
+    n = money_format(&b[0], 32, 1500000000);
+    try assert_eq_i32(n as i32, 5);          // "$1.50"
+    try assert_eq_i32(b[0] as i32, '$' as i32);
+    try assert_eq_i32(b[1] as i32, '1' as i32);
+    try assert_eq_i32(b[2] as i32, '.' as i32);
+}
+
+test "cost" { run_test("cost", test_cost); }
+test "big_no_overflow" { run_test("big_no_overflow", test_big_no_overflow); }
+test "permille" { run_test("permille", test_permille); }
+test "cents" { run_test("cents", test_cents); }
+test "parse" { run_test("parse", test_parse); }
+test "format" { run_test("format", test_format); }
