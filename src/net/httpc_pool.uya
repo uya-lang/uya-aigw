@@ -1,0 +1,290 @@
+// src/net/httpc_pool.uya — 连接池策略、重试分类、SSRF 私网检查
+//
+// 纯策略（可离线单测）：
+//   - httpc_ipv4_is_private / httpc_host_allowed：默认拒绝私网目标；
+//   - httpc_status_retryable / httpc_backoff_ms：只重试可重试的状态码；
+//   - ConnPool：按 (host, port, trust) 复用，idle TTL 过期清理，满时 LRU 淘汰。
+//
+// 代理 CONNECT 需要真实 TlsxConn，放在 TLS-09 的 provider 层接入（TODO 已注明）。
+
+export const POOL_MAX_SLOTS: usize = 64;
+export const POOL_IDLE_TTL_MS: u64 = 60000;
+export const POOL_HOST_MAX: usize = 253;
+
+export struct PoolSlot {
+    used: bool,
+    host: [byte: POOL_HOST_MAX],
+    host_len: usize,
+    port: u16,
+    trust: u8,
+    idle_since: u64,
+    token: i32,
+}
+
+export struct ConnPool {
+    slots: [PoolSlot: POOL_MAX_SLOTS],
+    hits: usize,
+    misses: usize,
+}
+
+fn pool_lower(b: byte) byte {
+    if b >= ('A' as byte) && b <= ('Z' as byte) {
+        return (b +% 32) as byte;
+    }
+    return b;
+}
+
+fn pool_eq_nocase(a: &const byte, an: usize, b: &const byte, bn: usize) bool {
+    if an != bn {
+        return false;
+    }
+    var i: usize = 0;
+    while i < an {
+        if pool_lower(a[i]) != pool_lower(b[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn pool_ends_with_nocase(a: &const byte, an: usize, suffix: &const byte, sn: usize) bool {
+    if sn > an {
+        return false;
+    }
+    var i: usize = 0;
+    while i < sn {
+        if pool_lower(a[an - sn + i]) != pool_lower(suffix[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn pool_parse_ipv4(s: &const byte, n: usize, out: &byte) bool {
+    var oi: usize = 0;
+    var val: i32 = 0;
+    var digits: i32 = 0;
+    var i: usize = 0;
+    while i < n {
+        const c: byte = s[i];
+        if c == ('.' as byte) {
+            if digits == 0 || oi >= 3 {
+                return false;
+            }
+            out[oi] = val as byte;
+            oi = oi + 1;
+            val = 0;
+            digits = 0;
+        } else if c >= ('0' as byte) && c <= ('9' as byte) {
+            val = val *% 10 +% ((c as i32) - 48);
+            if val > 255 {
+                return false;
+            }
+            digits = digits + 1;
+            if digits > 3 {
+                return false;
+            }
+        } else {
+            return false;
+        }
+        i = i + 1;
+    }
+    if oi != 3 || digits == 0 {
+        return false;
+    }
+    out[3] = val as byte;
+    return true;
+}
+
+/// RFC1918 / loopback / link-local / CGNAT / 保留段 / 组播：一律视为私网。
+export fn httpc_ipv4_is_private(ip: &const byte) bool {
+    const a: i32 = ip[0] as i32;
+    const b: i32 = ip[1] as i32;
+    const c: i32 = ip[2] as i32;
+    if a == 0 || a == 10 || a == 127 {
+        return true;
+    }
+    if a == 169 && b == 254 {
+        return true;
+    }
+    if a == 172 && b >= 16 && b <= 31 {
+        return true;
+    }
+    if a == 192 && b == 168 {
+        return true;
+    }
+    if a == 100 && b >= 64 && b <= 127 {
+        return true;
+    }
+    if a == 192 && b == 0 && c == 0 {
+        return true;
+    }
+    if a == 198 && (b == 18 || b == 19) {
+        return true;
+    }
+    if a >= 224 {
+        return true;
+    }
+    return false;
+}
+
+/// 目标是否允许：字面量私网、localhost、*.local 默认拒绝；域名留给连接时再查（TLS-09）。
+export fn httpc_host_allowed(host: &const byte, host_len: usize, allow_private: bool) bool {
+    if allow_private {
+        return true;
+    }
+    if host_len == 0 {
+        return false;
+    }
+    if pool_eq_nocase(host, host_len, &"localhost"[0: 9], 9) {
+        return false;
+    }
+    if pool_ends_with_nocase(host, host_len, &".local"[0: 6], 6) {
+        return false;
+    }
+    var ip: [byte: 4] = [0: 4];
+    if pool_parse_ipv4(host, host_len, &ip[0]) {
+        return !httpc_ipv4_is_private(&ip[0]);
+    }
+    return true;
+}
+
+/// 可重试：408 / 425 / 429 / 500 / 502 / 503 / 504。4xx 其余一律不重试。
+export fn httpc_status_retryable(status: i32) bool {
+    if status == 408 || status == 425 || status == 429 {
+        return true;
+    }
+    if status == 500 || status == 502 || status == 503 || status == 504 {
+        return true;
+    }
+    return false;
+}
+
+/// 指数退避：base * 2^attempt，上限 30s；Retry-After（秒）优先，上限 60s。
+export fn httpc_backoff_ms(attempt: i32, base_ms: u32, retry_after_s: u32) u32 {
+    if retry_after_s > 0 {
+        var ms: u32 = retry_after_s *% (1000 as u32);
+        if ms > (60000 as u32) {
+            ms = 60000;
+        }
+        return ms;
+    }
+    var v: u32 = base_ms;
+    var i: i32 = 0;
+    while i < attempt && v < (30000 as u32) {
+        v = v *% (2 as u32);
+        i = i + 1;
+    }
+    if v > (30000 as u32) {
+        v = 30000;
+    }
+    return v;
+}
+
+export fn pool_init(p: &ConnPool) void {
+    var i: usize = 0;
+    while i < POOL_MAX_SLOTS {
+        p.slots[i].used = false;
+        p.slots[i].host_len = 0;
+        p.slots[i].port = 0;
+        p.slots[i].trust = 0;
+        p.slots[i].idle_since = 0;
+        p.slots[i].token = 0;
+        i = i + 1;
+    }
+    p.hits = 0;
+    p.misses = 0;
+}
+
+/// 命中返回 token；过期条目顺手清掉。
+export fn pool_find(p: &ConnPool, host: &const byte, host_len: usize, port: u16,
+    trust: u8, now: u64) i32 {
+    var i: usize = 0;
+    while i < POOL_MAX_SLOTS {
+        const s: &PoolSlot = &p.slots[i];
+        if s.used {
+            if now >= s.idle_since +% POOL_IDLE_TTL_MS {
+                s.used = false;
+            } else if s.port == port && s.trust == trust && s.host_len == host_len
+                && pool_eq_nocase(&s.host[0], s.host_len, host, host_len) {
+                s.idle_since = now;
+                p.hits = p.hits +% 1;
+                return s.token;
+            }
+        }
+        i = i + 1;
+    }
+    p.misses = p.misses +% 1;
+    return -1;
+}
+
+/// 插入/覆盖一个条目；满时按 idle_since 最旧淘汰。
+export fn pool_insert(p: &ConnPool, host: &const byte, host_len: usize, port: u16,
+    trust: u8, now: u64, token: i32) void {
+    if host_len > POOL_HOST_MAX {
+        return;
+    }
+    var idx: usize = POOL_MAX_SLOTS;
+    var i: usize = 0;
+    while i < POOL_MAX_SLOTS {
+        if !p.slots[i].used {
+            idx = i;
+            break;
+        }
+        i = i + 1;
+    }
+    if idx == POOL_MAX_SLOTS {
+        idx = 0;
+        var oldest: u64 = p.slots[0].idle_since;
+        i = 1;
+        while i < POOL_MAX_SLOTS {
+            if p.slots[i].idle_since < oldest {
+                oldest = p.slots[i].idle_since;
+                idx = i;
+            }
+            i = i + 1;
+        }
+    }
+    if idx >= POOL_MAX_SLOTS {
+        return;
+    }
+    const s: &PoolSlot = &p.slots[idx];
+    s.used = true;
+    s.host_len = host_len;
+    var k: usize = 0;
+    while k < host_len {
+        s.host[k] = pool_lower(host[k]);
+        k = k + 1;
+    }
+    s.port = port;
+    s.trust = trust;
+    s.idle_since = now;
+    s.token = token;
+}
+
+export fn pool_remove(p: &ConnPool, token: i32) void {
+    var i: usize = 0;
+    while i < POOL_MAX_SLOTS {
+        if p.slots[i].used && p.slots[i].token == token {
+            p.slots[i].used = false;
+        }
+        i = i + 1;
+    }
+}
+
+/// 清理过期条目，返回清理数量。
+export fn pool_prune(p: &ConnPool, now: u64) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while i < POOL_MAX_SLOTS {
+        const s: &PoolSlot = &p.slots[i];
+        if s.used && now >= s.idle_since +% POOL_IDLE_TTL_MS {
+            s.used = false;
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}

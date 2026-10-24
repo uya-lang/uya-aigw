@@ -1,0 +1,108 @@
+// tests/test_httpc_pool.uya — SSRF / 重试 / 连接池策略单测（无网络）
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+fn test_private_ip() !void {
+    var ip: [byte: 4] = [0: 4];
+
+    ip[0] = 10;
+    ip[1] = 1;
+    try assert_eq_bool(httpc_ipv4_is_private(&ip[0]), true);
+
+    ip[0] = 172;
+    ip[1] = 16;
+    try assert_eq_bool(httpc_ipv4_is_private(&ip[0]), true);
+
+    ip[0] = 192;
+    ip[1] = 168;
+    try assert_eq_bool(httpc_ipv4_is_private(&ip[0]), true);
+
+    ip[0] = 127;
+    ip[1] = 0;
+    ip[2] = 0;
+    ip[3] = 1;
+    try assert_eq_bool(httpc_ipv4_is_private(&ip[0]), true);
+
+    ip[0] = 169;
+    ip[1] = 254;
+    try assert_eq_bool(httpc_ipv4_is_private(&ip[0]), true);
+
+    ip[0] = 8;
+    ip[1] = 8;
+    ip[2] = 8;
+    ip[3] = 8;
+    try assert_eq_bool(httpc_ipv4_is_private(&ip[0]), false);
+
+    ip[0] = 1;
+    ip[1] = 1;
+    ip[2] = 1;
+    ip[3] = 1;
+    try assert_eq_bool(httpc_ipv4_is_private(&ip[0]), false);
+}
+
+fn test_host_allowed() !void {
+    try assert_eq_bool(httpc_host_allowed(&"127.0.0.1"[0: 9], 9, false), false);
+    try assert_eq_bool(httpc_host_allowed(&"10.0.0.5"[0: 8], 8, false), false);
+    try assert_eq_bool(httpc_host_allowed(&"localhost"[0: 9], 9, false), false);
+    try assert_eq_bool(httpc_host_allowed(&"db.local"[0: 8], 8, false), false);
+    try assert_eq_bool(httpc_host_allowed(&"example.com"[0: 11], 11, false), true);
+    try assert_eq_bool(httpc_host_allowed(&"8.8.8.8"[0: 7], 7, false), true);
+    try assert_eq_bool(httpc_host_allowed(&"127.0.0.1"[0: 9], 9, true), true);
+}
+
+fn test_retryable() !void {
+    try assert_eq_bool(httpc_status_retryable(200), false);
+    try assert_eq_bool(httpc_status_retryable(400), false);
+    try assert_eq_bool(httpc_status_retryable(401), false);
+    try assert_eq_bool(httpc_status_retryable(404), false);
+    try assert_eq_bool(httpc_status_retryable(408), true);
+    try assert_eq_bool(httpc_status_retryable(429), true);
+    try assert_eq_bool(httpc_status_retryable(500), true);
+    try assert_eq_bool(httpc_status_retryable(502), true);
+    try assert_eq_bool(httpc_status_retryable(503), true);
+    try assert_eq_bool(httpc_status_retryable(504), true);
+}
+
+fn test_backoff() !void {
+    try assert_eq_i32(httpc_backoff_ms(0, 500, 0) as i32, 500);
+    try assert_eq_i32(httpc_backoff_ms(1, 500, 0) as i32, 1000);
+    try assert_eq_i32(httpc_backoff_ms(10, 500, 0) as i32, 30000);
+    try assert_eq_i32(httpc_backoff_ms(0, 500, 3) as i32, 3000);
+    try assert_eq_i32(httpc_backoff_ms(0, 500, 120) as i32, 60000);
+}
+
+fn test_pool() !void {
+    var p: ConnPool = ConnPool{};
+    pool_init(&p);
+
+    pool_insert(&p, &"a.com"[0: 5], 5, 443, 1, 1000, 7);
+    try assert_eq_i32(pool_find(&p, &"A.com"[0: 5], 5, 443, 1, 2000), 7);
+    try assert_eq_i32(pool_find(&p, &"a.com"[0: 5], 5, 444, 1, 2000), -1);
+    try assert_eq_i32(pool_find(&p, &"a.com"[0: 5], 5, 443, 2, 2000), -1);
+
+    // 过期：idle_since 被 find 更新为 2000
+    try assert_eq_i32(pool_prune(&p, 2000 + 60000) as i32, 1);
+    try assert_eq_i32(pool_find(&p, &"a.com"[0: 5], 5, 443, 1, 62001), -1);
+}
+
+fn test_pool_evict() !void {
+    var p: ConnPool = ConnPool{};
+    pool_init(&p);
+    var i: usize = 0;
+    while i < 64 {
+        pool_insert(&p, &"h.com"[0: 5], 5, (i as u16) +% 1, 0, 1000 +% (i as u64), i as i32);
+        i = i + 1;
+    }
+    // 第 65 条：淘汰最旧的（port 1）
+    pool_insert(&p, &"h.com"[0: 5], 5, 100, 0, 5000, 999);
+    try assert_eq_i32(pool_find(&p, &"h.com"[0: 5], 5, 1, 0, 5001), -1);
+    try assert_eq_i32(pool_find(&p, &"h.com"[0: 5], 5, 100, 0, 5001), 999);
+}
+
+test "private_ip" { run_test("private_ip", test_private_ip); }
+test "host_allowed" { run_test("host_allowed", test_host_allowed); }
+test "retryable" { run_test("retryable", test_retryable); }
+test "backoff" { run_test("backoff", test_backoff); }
+test "pool" { run_test("pool", test_pool); }
+test "pool_evict" { run_test("pool_evict", test_pool_evict); }
