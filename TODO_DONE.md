@@ -25,4 +25,4 @@
 | TLS-09 (stream) | 2026-10-24 | `git log --grep=TLS-09` | `htc_next_event_async`：chunked 解帧后喂 SSE、终止块识别、`[DONE]` 收尾；本机 Python TLS 上游 `PROV-OK stream events=4 done=1`，整链 `PROV-ALL-OK` |
 | TLS-10 | 2026-10-24 | `git log --grep=TLS-10` | `tests/provider_spike.sh`：本机 Python TLS 上游（三级链 + SAN=localhost）+ `tests/provider_spike_main.uya`；`PROV-OK plain` / `PROV-OK chunked` / `PROV-OK stream events=4 done=1` → `PROV-ALL-OK`，已进 `tests/run_all.sh` |
 | TLS-11 | 2026-10-24 | `git log --grep=TLS-11` | `src/cli/tls_cmd.uya` + `src/app.uya`：`aigw tls probe <host> --port N --ca pem` 打印指纹/verified/链结论，`aigw tls pin <host> <sha256> --file tsv` 入库；`tests/tls_cli_spike.sh` 输出 `CLI-ALL-OK` |
-| TLS-09E (调研) | 2026-10-24 | `git log --grep=TLS-09E` | 流式读超时：`async_fd_read_deadline_future` 与 `async_wait_readable` 两种写法实测均不可用（首帧 0 / events=0），根因与两条候选修法写入 findings §9；读路径保持无超时，流式 e2e 仍 `PROV-ALL-OK` |
+| TLS-09E (调研) | 2026-10-24 | `git log --grep=TLS-09E` | 流式读超时：三种写法（`async_fd_read_deadline_future` / 嵌套 `async_wait_readable` / 单层 wait+sync read）实测均不可用（首帧 0 / events=0），证据与候选修法写入 findings §9；`tlsx_read_deadline_async` 已实现但未接入，流式保持无超时，e2e 仍 `PROV-ALL-OK` |

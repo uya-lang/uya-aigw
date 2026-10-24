@@ -89,10 +89,10 @@ export fn htc_call_free(call: &HtcCall) void {
     if room == 0 {
         return -1;
     }
-    // TLS-09E（未完成）：流式读超时依赖一个「可取消的等待」原语。实测把
-    // async_wait_readable 嵌到 record 读之前会立刻返回 0（嵌套等待抢同一组 Waker 槽），
-    // 见 TODO.md TLS-09E 与 docs/design/tls-spike-findings.md §9。在拿到调度器时间轮
-    // 之前保持无超时读；上层用「[DONE] 收尾 + 客户端断开即取消」兜底。
+    // TLS-09E（未接入）：`tlsx_read_deadline_async` 已实现单层等待版，但在本机上游上
+    // 流式首帧仍返回 0（三种写法都撞同一处调度器行为，见 findings §9）。在拿到时间轮或
+    // 把 deadline 下沉进 https_read_some 之前，流式保持无超时读：`[DONE]` 收尾 +
+    // 客户端断开传播取消兜底。
     _ = deadline;
     const n: usize = try @await tlsx_read_async(&call.conn,
         &call.body.ptr[call.body.len], room);

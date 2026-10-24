@@ -117,7 +117,8 @@ TLS-SPIKE-OK n=31
 | 写法 | 结果 |
 |---|---|
 | `async_fd_read_deadline_future` 直接读 record 头/载荷 | 首帧即返回 0（本机 Python 上游上一个 record 被切成多段时语义不符） |
-| `async_wait_readable(fd, deadline)` + 普通 record 读 | 流式路径 `events=0`（嵌套的 readiness 等待与内层 `tlsx_read_async` 的 Waker 注册抢同一组槽，`WAKER_IO_SLOT_MAX = 4`） |
+| `async_wait_readable(fd, deadline)` + 普通 record 读 | 流式路径 `events=0` |
+| 单层版：`async_wait_readable` 等待 + 同步 `https_read_some` 读完整 record（`tlsx_fill_deadline_async`） | 仍 `events=0`；说明问题不在嵌套等待，而在「先等后读」这个组合本身与调度器的交互 |
 
 两条候选修法（后续任务）：
 
