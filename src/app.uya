@@ -1,6 +1,7 @@
-// src/app.uya — aigw 入口：命令行分发（当前只有 `tls` 子命令）
+// src/app.uya — aigw 入口：命令行分发（`serve` 与 `tls` 两个子命令）
 //
 // 用法：
+//   aigw serve [--host 0.0.0.0] [--port 8080]
 //   aigw tls probe <host> [--port N] [--ca <pem>]
 //   aigw tls pin   <host> <sha256hex> [--file <tsv>]
 
@@ -27,8 +28,25 @@ fn arg_u16(p: &byte) u16 {
 }
 
 fn usage() i32 {
-    printf("usage:\n  aigw tls probe <host> [--port N] [--ca <pem>]\n  aigw tls pin <host> <sha256hex> [--file <tsv>]\n" as *byte);
+    printf("usage:\n  aigw serve [--host 0.0.0.0] [--port 8080]\n  aigw tls probe <host> [--port N] [--ca <pem>]\n  aigw tls pin <host> <sha256hex> [--file <tsv>]\n" as *byte);
     return 2;
+}
+
+/// `aigw serve`：起服务、打印实际端口、跑 event loop。
+/// `--port 0` 让内核挑端口（回归脚本靠这条读取真实端口）。
+fn serve_main(host: &[byte], port: u16) i32 {
+    const lfd: i32 = serve_listen(host, port) catch |_| {
+        printf("listen failed\n" as *byte);
+        return 1;
+    };
+    printf("listen port=%d\n" as *byte, serve_port(lfd) as i32);
+    var stats: ServeStats = ServeStats{};
+    const rc: !i32 = block_on<i32>(serve_loop_async(lfd, &stats, 0));
+    const r: i32 = rc catch |_| {
+        -1;
+    };
+    tcpx_close(lfd);
+    return r;
 }
 
 export fn main() i32 {
@@ -42,10 +60,46 @@ export fn main() i32 {
         argc = argc + 1;
         i = i + 1;
     }
-    if argc < 4 {
+    if argc < 2 {
         return usage();
     }
     const a1: &byte = get_argv(1);
+
+    // ---- serve ----
+    if arg_eq(a1, "serve" as &const byte) {
+        var host: [byte: 16] = [0: 16];
+        host[0] = '0';
+        host[1] = '.';
+        host[2] = '0';
+        host[3] = '.';
+        host[4] = '0';
+        host[5] = '.';
+        host[6] = '0';
+        var host_len: usize = 7;
+        var port: u16 = 8080;
+        var k: i32 = 2;
+        while k + 1 < argc {
+            const f: &byte = get_argv(k);
+            const v: &byte = get_argv(k + 1);
+            if arg_eq(f, "--port" as &const byte) {
+                port = arg_u16(v);
+            } else if arg_eq(f, "--host" as &const byte) {
+                const vn: usize = arg_len(v);
+                var m: usize = 0;
+                while m < vn && m < 16 {
+                    host[m] = v[m];
+                    m = m + 1;
+                }
+                host_len = m;
+            }
+            k = k + 2;
+        }
+        return serve_main(host[0: host_len], port);
+    }
+
+    if argc < 4 {
+        return usage();
+    }
     const a2: &byte = get_argv(2);
     if !arg_eq(a1, "tls" as &const byte) {
         return usage();
@@ -53,6 +107,7 @@ export fn main() i32 {
     const hostp: &byte = get_argv(3);
     const host_len: usize = arg_len(hostp);
 
+    // ---- tls probe ----
     if arg_eq(a2, "probe" as &const byte) {
         var port: u16 = 443;
         var ca: [byte: 512] = [0: 512];
@@ -76,6 +131,8 @@ export fn main() i32 {
         }
         return tls_cmd_probe(hostp[0: host_len], port, ca[0: ca_len]);
     }
+
+    // ---- tls pin ----
     if arg_eq(a2, "pin" as &const byte) {
         if argc < 5 {
             return usage();
@@ -85,7 +142,7 @@ export fn main() i32 {
         const dflt: &const byte = "data/tls_pins.tsv" as &const byte;
         var file_len: usize = arg_len(dflt as &byte);
         var m: usize = 0;
-        while m < file_len {
+        while m < file_len && m < 512 {
             file[m] = dflt[m];
             m = m + 1;
         }

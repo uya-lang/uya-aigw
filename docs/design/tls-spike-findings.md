@@ -214,3 +214,25 @@ $ curl -sv http://127.0.0.1:18994/healthz
 脚本化回归（`tests/serve_smoke.sh`）最后一版仍在「起服务→curl」这一步失败（手工同样二进制却正常，
 怀疑脚本里的就绪探测与 `set -e` 组合），因此本任务**未提交**，代码已回退，等下一轮补上再进
 `run_all.sh`。
+### A1 服务端：Uya 0.11 的三条硬约束（实测，含踩坑过程）
+
+写 `src/net/serve.uya`（监听 + keep-alive + 包体排空 + 路由）时撞到三件事，
+全部是「C 后端生成非法代码」而非业务逻辑问题：
+
+1. **`&"lit"[0]` 生成 `&(uint8_t*)lit[0]`** —— 非法 C（lvalue required）。
+   要指针只能 `&"lit"[0: n]`（切片）或先在本地数组里拷贝。
+2. **切片字面量只能做函数调用实参**。一旦赋给局部变量、模块常量或 `@await` 调用的帧字段，
+   生成 `x = &(struct uya_slice_uint8_t){...}`（指针赋给结构体）：模块常量直接编译失败
+   （文件作用域的非恒定初始化），局部变量/帧字段则在编译通过后拿到**零缓冲**——
+   症状是「响应头完全正确、Content-Length 也对，body 全是 NUL」。
+   → 异步函数一律 `&const byte` + 长度；字面量取指针走普通函数 `srv_ptr(&"lit"[0: n])`。
+3. **`if/else` 分支里放多个 `try @await`** 会生成重复的 C 标签
+   （`duplicate label '_uya_async_if_exit_...'`）。→ 分支只算「状态码 + 指针 + 长度」，
+   真正的 `@await` 只留一处。
+
+顺带两个运维教训：
+- 调试期间发现**上一轮遗留的 `aigw serve` 进程**还占着端口，加上脚本里 `uya build` 失败时
+  `[ -x build/aigw ]` 仍然通过（旧二进制还在），连续几轮其实是在诊断旧行为。现在
+  `tests/serve_smoke.sh` 构建前先 `rm -f build/aigw` 并检查 `uya build` 的退出码。
+- `pkill -f "aigw serve"` 会匹配到执行它的那个 `bash -c` 自身（命令行里含该字符串），
+  把自己的 shell 杀掉。用 `pkill -x aigw`。

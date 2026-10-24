@@ -1,0 +1,452 @@
+// src/net/serve.uya — A1 的服务端骨架：监听 + keep-alive + 请求体排空 + 路由
+//
+// 覆盖的能力（用户验收里能先做的部分）：
+//   - `0.0.0.0:port` 监听，`--port 0` 由内核选端口（回归脚本用）
+//   - 每连接 keep-alive 循环：Content-Length 与 chunked 请求体都完整排空，
+//     保证同一个连接上的下一个请求不会读到上一个的包体
+//   - `Expect: 100-continue`：先回 100 再收 body
+//   - 请求体可以大于缓冲区（分片丢弃，不占内存），为后面 64 MiB 验收铺路
+//   - `/healthz`、`/v1/models`（占位）、其余 404、解析失败 400
+//
+// 还没做：并发（当前串行 accept，一个连接处理完才接下一个）、SSE 长连接、
+// 优雅停机的信号处理。这些留到 A1 后续，本文件只保证「能起、能回、不串包」。
+//
+// 两个 Uya 0.11 的坑，本文件刻意绕开（详见 docs/design/tls-spike-findings.md §10）：
+//   1. `@async_fn` 里把**切片字面量**赋给局部变量或 `@await` 帧参数，会生成
+//      `x = &slice_tmp`（指针赋给结构体）：能编译，运行时拿到零缓冲。
+//      → 所有响应体/类型串都提升成模块级 `const`，异步函数里只引用标识符。
+//   2. `@await f() catch |_| {}` 写成表达式会生成非法 C。
+//      → 一律拆成 `const rf: !T = @await f();` + `const v: T = rf catch |_| ...;`
+//
+// 异步嵌套深度守则（TLS-09E 的教训）：`serve_loop_async`(1) → `serve_conn_async`(2)
+// → `srv_fill`/`srv_send`(3) → `async_fd_read_future`/`async_fd_write_all`(4)。
+// 不要再往里加 `@async_fn` 层，否则 Waker IO 槽会在真正需要等待时耗尽。
+
+use libc.syscall;
+
+/// 单个连接的读写缓冲。请求体不需要整块驻留，所以 16 KiB 足够。
+export const SRV_REQ_CAP: usize = 16384;
+export const SRV_BACKLOG: i32 = 128;
+
+export error ListenFailed;
+export error BadIp;
+
+/// 从切片取底层指针。存在的唯一理由：`@async_fn` 的参数不能用切片类型
+/// （异步帧字段赋值会退化成「指针赋给结构体」），而 `&"x"[0]` 又会生成非法 C：
+/// 所以字面量统一走这个普通函数（普通调用的切片实参是合法的）。
+fn srv_ptr(s: &[byte]) &const byte {
+    return s.ptr;
+}
+
+export struct ServeStats {
+    conns: u64,
+    requests: u64,
+    bad: u64,
+}
+
+/// 点分十进制 → 打包的 4 字节（高位在前）。返回值而不是写 `&byte` 出参，
+/// 是为了绕开「异步链路里指针出参可能被丢写」这一整类问题。
+export fn serve_parse_ipv4(s: &[byte]) !u32 {
+    var octet: usize = 0;
+    var val: u32 = 0;
+    var digits: usize = 0;
+    var packed: u32 = 0;
+    var i: usize = 0;
+    while i < s.len {
+        const c: byte = s[i];
+        if c >= ('0' as byte) && c <= ('9' as byte) {
+            val = val *% 10 +% ((c as u32) - 48);
+            if val > 255 {
+                return error.BadIp;
+            }
+            digits = digits + 1;
+        } else if c == ('.' as byte) {
+            if digits == 0 || octet >= 3 {
+                return error.BadIp;
+            }
+            packed = (packed *% 256) +% val;
+            octet = octet + 1;
+            val = 0;
+            digits = 0;
+        } else {
+            return error.BadIp;
+        }
+        i = i + 1;
+    }
+    if digits == 0 || octet != 3 {
+        return error.BadIp;
+    }
+    packed = (packed *% 256) +% val;
+    return packed;
+}
+
+/// 建监听 socket 并 listen。失败统一折叠成 `error.ListenFailed`。
+export fn serve_listen(ip: &[byte], port: u16) !i32 {
+    const packed: u32 = serve_parse_ipv4(ip) catch |_| {
+        return error.BadIp;
+    };
+    const fd: i32 = try sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    var one: i32 = 1;
+    _ = sys_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one as &void, 4 as u32) catch |_| {
+        _ = sys_close(fd) catch {};
+        return error.ListenFailed;
+    };
+    // 写进**本地数组**（不是指针出参），再交给 sockaddr 序列化。
+    var ipb: [byte: 4] = [0: 4];
+    ipb[0] = ((packed >> 24) & 255u32) as byte;
+    ipb[1] = ((packed >> 16) & 255u32) as byte;
+    ipb[2] = ((packed >> 8) & 255u32) as byte;
+    ipb[3] = (packed & 255u32) as byte;
+    var addr: [byte: 16] = [0: 16];
+    tcpx_sockaddr_v4(&ipb[0], port, &addr[0]);
+    _ = sys_bind(fd, &addr[0] as &void, 16 as u32) catch |_| {
+        _ = sys_close(fd) catch {};
+        return error.ListenFailed;
+    };
+    _ = sys_listen(fd, SRV_BACKLOG) catch |_| {
+        _ = sys_close(fd) catch {};
+        return error.ListenFailed;
+    };
+    tcpx_set_nonblocking(fd) catch |_| {};
+    return fd;
+}
+
+/// 监听口的本地端口（`port` 传 0 时由内核选）。
+export fn serve_port(fd: i32) u16 {
+    var alen: u32 = 16;
+    var out: [byte: 16] = [0: 16];
+    _ = sys_getsockname(fd, &out[0] as &void, &alen) catch |_| {
+        return 0;
+    };
+    return ((out[2] as u16) * 256) + (out[3] as u16);
+}
+
+/// 回一个完整响应。1=成功，-1=出错。
+@async_fn fn srv_send(fd: i32, status: i32, body: &const byte, n: usize,
+    keep: bool) Future<!i32> {
+    var hdr: [byte: 512] = [0: 512];
+    const hn: usize = hsrv_resp_head(&hdr[0], 512, status, &"application/json"[0: 16], 16,
+        n as i64, false, keep);
+    const wh: !usize = @await async_fd_write_all(fd, &hdr[0], hn);
+    const rw: usize = wh catch |_| {
+        return -1;
+    };
+    if rw == 0 {
+        return -1;
+    }
+    if n > 0 {
+        const wb: !usize = @await async_fd_write_all(fd, body, n);
+        const rb: usize = wb catch |_| {
+            return -1;
+        };
+        if rb == 0 {
+            return -1;
+        }
+    }
+    return 1;
+}
+
+/// 保证 `len[0] >= want`（`want <= SRV_REQ_CAP`）。1=凑够，0=对端关闭，-1=出错。
+@async_fn fn srv_fill(fd: i32, buf: &byte, len: &usize, want: usize) Future<!i32> {
+    if want > SRV_REQ_CAP {
+        return -1;
+    }
+    while len[0] < want {
+        if len[0] >= SRV_REQ_CAP {
+            return -1;
+        }
+        const rf: !usize = @await async_fd_read_future(fd, &buf[len[0]],
+            SRV_REQ_CAP - len[0]);
+        const n: usize = rf catch |_| {
+            return -1;
+        };
+        if n == 0 {
+            return 0;
+        }
+        len[0] = len[0] +% n;
+    }
+    return 1;
+}
+
+/// 把 `buf[pos..len]` 移到缓冲区开头（不涉及 IO，所以是普通函数）。
+fn srv_compact(buf: &[byte], len: &usize, pos: &usize) void {
+    if pos[0] == 0 {
+        return;
+    }
+    var n: usize = 0;
+    var i: usize = pos[0];
+    while i < len[0] {
+        if i >= SRV_REQ_CAP {
+            break;
+        }
+        if n >= SRV_REQ_CAP {
+            break;
+        }
+        const v: byte = buf[i];
+        buf[n] = v;
+        n = n + 1;
+        i = i + 1;
+    }
+    len[0] = n;
+    pos[0] = 0;
+}
+
+fn srv_find_crlf(buf: &byte, len: usize) i64 {
+    var i: usize = 0;
+    while i + 1 < len {
+        if i + 1 >= SRV_REQ_CAP {
+            return -1;
+        }
+        if buf[i] == (13 as byte) && buf[i + 1] == (10 as byte) {
+            return i as i64;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// chunk 大小行（十六进制）。`;` 之后是扩展，忽略。
+fn srv_hex_size(buf: &byte, end: usize) i64 {
+    var v: i64 = 0;
+    var any: bool = false;
+    var i: usize = 0;
+    while i < end {
+        if i >= SRV_REQ_CAP {
+            return -1;
+        }
+        const c: byte = buf[i];
+        var d: i64 = -1;
+        if c >= ('0' as byte) && c <= ('9' as byte) {
+            d = (c as i64) - 48;
+        } else if c >= ('a' as byte) && c <= ('f' as byte) {
+            d = (c as i64) - 87;
+        } else if c >= ('A' as byte) && c <= ('F' as byte) {
+            d = (c as i64) - 55;
+        } else if c == (';' as byte) {
+            break;
+        } else {
+            return -1;
+        }
+        v = v *% 16 +% d;
+        if v < 0 {
+            return -1;
+        }
+        any = true;
+        i = i + 1;
+    }
+    if !any {
+        return -1;
+    }
+    return v;
+}
+
+/// 排空 chunked 请求体。`pos` 是当前读到缓冲区里的位置，返回时包体已消费完。
+@async_fn fn srv_drain_chunked(fd: i32, buf: &byte, len: &usize,
+    pos: &usize) Future<!i32> {
+    while true {
+        srv_compact(buf[0: SRV_REQ_CAP], len, pos);
+        var crlf: i64 = srv_find_crlf(buf, len[0]);
+        while crlf < 0 {
+            const r: i32 = try @await srv_fill(fd, buf, len, len[0] +% 1);
+            if r <= 0 {
+                return r;
+            }
+            crlf = srv_find_crlf(buf, len[0]);
+        }
+        if crlf < 0 {
+            return -1;
+        }
+        const cl: usize = crlf as usize;
+        const size: i64 = srv_hex_size(buf, cl);
+        if size < 0 {
+            return -1;
+        }
+        pos[0] = cl +% 2;
+        if size == 0 {
+            // 末尾 trailer：读到空行为止
+            while true {
+                if pos[0] + 1 < len[0] && pos[0] + 1 < SRV_REQ_CAP
+                    && buf[pos[0]] == (13 as byte) && buf[pos[0] + 1] == (10 as byte) {
+                    pos[0] = pos[0] +% 2;
+                    return 1;
+                }
+                const cr: i64 = srv_find_crlf(buf, len[0]);
+                if cr >= 0 {
+                    const cvu: usize = cr as usize;
+                    if cvu >= pos[0] {
+                        pos[0] = cvu +% 2;
+                        continue;
+                    }
+                }
+                const r: i32 = try @await srv_fill(fd, buf, len, len[0] +% 1);
+                if r <= 0 {
+                    return r;
+                }
+            }
+            return 1;
+        }
+        // 分片丢弃包体：允许单块大于缓冲区
+        var rem: usize = size as usize;
+        while rem > 0 {
+            if pos[0] < len[0] {
+                const avail: usize = len[0] - pos[0];
+                const take: usize = if avail < rem { avail } else { rem };
+                pos[0] = pos[0] +% take;
+                rem = rem -% take;
+            } else {
+                len[0] = 0;
+                pos[0] = 0;
+                const r: i32 = try @await srv_fill(fd, buf, len, 1);
+                if r <= 0 {
+                    return r;
+                }
+            }
+        }
+        // 块末尾的 CRLF
+        const e: i32 = try @await srv_fill(fd, buf, len, pos[0] +% 2);
+        if e <= 0 {
+            return e;
+        }
+        pos[0] = pos[0] +% 2;
+    }
+    return 1;
+}
+
+/// 处理一个连接上的所有请求。返回 0 正常结束。
+@async_fn fn serve_conn_async(fd: i32, stats: &ServeStats) Future<!i32> {
+    var buf: [byte: SRV_REQ_CAP] = [0: SRV_REQ_CAP];
+    var len: usize = 0;
+    while true {
+        // 1) 凑齐请求头
+        var req: HsrvReq = HsrvReq{};
+        while true {
+            const pr: i32 = hsrv_parse_head(&buf[0], len, HSRV_HEAD_MAX, &req);
+            if pr == 1 {
+                break;
+            }
+            if pr < 0 {
+                stats.bad = stats.bad +% 1;
+                const sr: !i32 = @await srv_send(fd, 400,
+                    srv_ptr(&"{\"error\":\"bad request\"}"[0: 23]), 23, false);
+                _ = sr catch |_| { 0; };
+                return 0;
+            }
+            const rf: i32 = try @await srv_fill(fd, &buf[0], &len, len +% 1);
+            if rf <= 0 {
+                return 0;
+            }
+        }
+
+        // 2) 100-continue：先给中间响应再收包体
+        if req.expect_continue && (req.content_length > 0 || req.chunked) {
+            const wc: !usize = @await async_fd_write_all(fd,
+                srv_ptr(&"HTTP/1.1 100 Continue\r\n\r\n"[0: 25]), 25);
+            const rc0: usize = wc catch |_| {
+                return 0;
+            };
+            if rc0 == 0 {
+                return 0;
+            }
+        }
+
+        // 3) 排空包体
+        var pos: usize = req.head_len;
+        if req.chunked {
+            const dr: i32 = try @await srv_drain_chunked(fd, &buf[0], &len, &pos);
+            if dr <= 0 {
+                return 0;
+            }
+        } else if req.content_length > 0 {
+            var left: usize = req.content_length as usize;
+            while left > 0 {
+                if pos < len {
+                    const avail: usize = len - pos;
+                    const take: usize = if avail < left { avail } else { left };
+                    pos = pos +% take;
+                    left = left -% take;
+                } else {
+                    len = 0;
+                    pos = 0;
+                    const rf: i32 = try @await srv_fill(fd, &buf[0], &len, 1);
+                    if rf <= 0 {
+                        return 0;
+                    }
+                }
+            }
+        }
+
+        // 4) 路由（每个分支直接调 `srv_send`，不在异步函数里构造切片局部变量）
+        stats.requests = stats.requests +% 1;
+        const keep: bool = req.keep_alive;
+        const is_head: bool = req.method_len == 4 && req.method[0] == ('H' as byte);
+        var is_health: bool = false;
+        if req.path_len == 8 && req.path[0] == ('/' as byte)
+            && req.path[1] == ('h' as byte) && req.path[2] == ('e' as byte)
+            && req.path[3] == ('a' as byte) && req.path[4] == ('l' as byte)
+            && req.path[5] == ('t' as byte) && req.path[6] == ('h' as byte)
+            && req.path[7] == ('z' as byte) {
+            is_health = true;
+        }
+        var is_models: bool = false;
+        if req.path_len == 10 && req.path[0] == ('/' as byte)
+            && req.path[1] == ('v' as byte) && req.path[2] == ('1' as byte)
+            && req.path[3] == ('/' as byte) && req.path[4] == ('m' as byte)
+            && req.path[5] == ('o' as byte) && req.path[6] == ('d' as byte)
+            && req.path[7] == ('e' as byte) && req.path[8] == ('l' as byte)
+            && req.path[9] == ('s' as byte) {
+            is_models = true;
+        }
+        // 每个分支只算「状态码 + 包体指针 + 长度」，真正的 @await 只在一个地方：
+        // 0.11 的后端在 if/else 里放多个 `try @await` 时会生成重复的 C 标签。
+        var st: i32 = 404;
+        var bn: usize = 22;
+        var bp: &const byte = srv_ptr(&"{\"error\":\"not found\"}"[0: 22]);
+        if is_head {
+            st = 200;
+            bn = 0;
+            bp = srv_ptr(&"x"[0: 0]);
+        } else if is_health {
+            st = 200;
+            bn = 11;
+            bp = srv_ptr(&"{\"ok\":true}"[0: 11]);
+        } else if is_models {
+            st = 200;
+            bn = 27;
+            bp = srv_ptr(&"{\"object\":\"list\",\"data\":[]}"[0: 27]);
+        }
+        const rs: i32 = try @await srv_send(fd, st, bp, bn, keep);
+        if rs <= 0 {
+            return 0;
+        }
+        if !keep {
+            return 0;
+        }
+        // 5) 处理完的字节丢掉，剩余的留给下一个请求（pipeline）
+        srv_compact(buf[0: SRV_REQ_CAP], &len, &pos);
+    }
+    return 0;
+}
+
+/// accept 循环。`stop_after` 为 0 表示常驻；否则处理这么多连接后返回（回归用）。
+export @async_fn fn serve_loop_async(listen_fd: i32, stats: &ServeStats,
+    stop_after: u64) Future<!i32> {
+    while true {
+        if stop_after != 0 && stats.conns >= stop_after {
+            return 0;
+        }
+        const af: !i32 = @await async_accept(listen_fd);
+        const cfd: i32 = af catch |_| {
+            continue;
+        };
+        if cfd < 0 {
+            continue;
+        }
+        stats.conns = stats.conns +% 1;
+        tcpx_set_nodelay(cfd);
+        tcpx_set_nonblocking(cfd) catch |_| {};
+        const rc: !i32 = @await serve_conn_async(cfd, stats);
+        _ = rc catch |_| { 0; };
+        tcpx_close(cfd);
+    }
+    return 0;
+}
