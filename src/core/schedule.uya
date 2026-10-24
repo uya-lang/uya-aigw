@@ -1,0 +1,329 @@
+// src/core/schedule.uya — A2 分时价目：时段规则解析与命中
+//
+// 规则语法（一行一条，`;` 分隔，第一条命中的生效，都不命中就是 1x）：
+//
+//   <days> <HH:MM>-<HH:MM> <factor>
+//
+//   days    mon|tue|wed|thu|fri|sat|sun，或用 `-` 连成区间（mon-fri）；
+//           也可写 daily / weekend / workday
+//   HH:MM   本地时间（按调用方给的时区偏移换算）
+//   factor  120% 表示 1.2 倍；2x 表示 2 倍；不带单位按百分比算
+//
+// 例子：
+//   "workday 09:00-18:00 120%; weekend 00:00-24:00 80%"
+//   "daily 22:00-06:00 60%"          跨零点的窗口
+//
+// 语义要点：
+//   * 时间窗口左闭右开 `[from, to)`；`from == to` 视为整天空窗口（不命中）。
+//   * 跨零点（from > to）按「当天 from 到次日 to」理解。
+//   * 判定用**请求开始时间**的本地时刻，node 与 controller 用同一个 ts 重算，
+//     结果逐 permille 一致（计费重算的前提）。
+//   * 倍率一律千分比整数：1000 = 原价，1200 = 1.2 倍。
+//
+// 本模块是纯函数，不碰库、不读时钟：`ts` 与 `tz_min` 都由调用方传入。
+
+export const SCHED_BASE_PERMILLE: i32 = 1000;
+export const SCHED_MAX_RULES: usize = 8;
+
+export error SchedInvalid;
+export error SchedTooMany;
+
+/// 一条时段规则。`day_from..day_to` 是周几（0=周一，6=周日），可跨周（fri-mon）。
+export struct SchedRule {
+    day_from: i32,
+    day_to: i32,
+    minute_from: i32,
+    minute_to: i32,
+    permille: i32,
+}
+
+/// 解析后的规则集。
+export struct Sched {
+    rules: [SchedRule: SCHED_MAX_RULES],
+    count: usize,
+}
+
+fn sched_eq(a: byte, b: byte) bool {
+    return a == b;
+}
+
+fn sched_digit(c: byte) i32 {
+    if c >= ('0' as byte) && c <= ('9' as byte) {
+        return (c as i32) - 48;
+    }
+    return 0 - 1;
+}
+
+/// 从 `pos` 跳过空格。
+fn sched_skip_space(s: &[byte], pos: &usize) void {
+    while pos[0] < s.len && s[pos[0]] == (' ' as byte) {
+        pos[0] = pos[0] + 1;
+    }
+}
+
+/// 取 `[pos, pos+n)` 与字面量比较（大小写不敏感）。
+fn sched_word_is(s: &[byte], pos: usize, lit: &[byte]) bool {
+    if pos + lit.len > s.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < lit.len {
+        var a: byte = s[pos + i];
+        var b: byte = lit[i];
+        if a >= ('A' as byte) && a <= ('Z' as byte) {
+            a = a + (32 as byte);
+        }
+        if b >= ('A' as byte) && b <= ('Z' as byte) {
+            b = b + (32 as byte);
+        }
+        if !sched_eq(a, b) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// 周几名字 → 0..6；不认识返回 -1。
+fn sched_day_of(s: &[byte], pos: usize) i32 {
+    if sched_word_is(s, pos, &"mon"[0: 3]) {
+        return 0;
+    }
+    if sched_word_is(s, pos, &"tue"[0: 3]) {
+        return 1;
+    }
+    if sched_word_is(s, pos, &"wed"[0: 3]) {
+        return 2;
+    }
+    if sched_word_is(s, pos, &"thu"[0: 3]) {
+        return 3;
+    }
+    if sched_word_is(s, pos, &"fri"[0: 3]) {
+        return 4;
+    }
+    if sched_word_is(s, pos, &"sat"[0: 3]) {
+        return 5;
+    }
+    if sched_word_is(s, pos, &"sun"[0: 3]) {
+        return 6;
+    }
+    return 0 - 1;
+}
+
+/// 解析 `HH:MM`，返回分钟数；失败 -1。
+fn sched_time_of(s: &[byte], pos: &usize) i32 {
+    const h1: i32 = sched_digit(s[pos[0]]);
+    const h2: i32 = sched_digit(s[pos[0] + 1]);
+    if h1 < 0 || h2 < 0 {
+        return 0 - 1;
+    }
+    if s[pos[0] + 2] != (':' as byte) {
+        return 0 - 1;
+    }
+    const m1: i32 = sched_digit(s[pos[0] + 3]);
+    const m2: i32 = sched_digit(s[pos[0] + 4]);
+    if m1 < 0 || m2 < 0 {
+        return 0 - 1;
+    }
+    const hh: i32 = (h1 *% 10) +% h2;
+    const mm: i32 = (m1 *% 10) +% m2;
+    if hh > 24 || mm > 59 {
+        return 0 - 1;
+    }
+    if hh == 24 && mm != 0 {
+        return 0 - 1;
+    }
+    pos[0] = pos[0] + 5;
+    return (hh *% 60) +% mm;
+}
+
+/// 解析倍率：`120%` → 1200，`2x` → 2000，裸数字按百分比。
+fn sched_factor_of(s: &[byte], pos: &usize) i32 {
+    var v: i32 = 0;
+    var any: bool = false;
+    while pos[0] < s.len {
+        const d: i32 = sched_digit(s[pos[0]]);
+        if d < 0 {
+            break;
+        }
+        v = (v *% 10) +% d;
+        any = true;
+        pos[0] = pos[0] + 1;
+    }
+    if !any || v <= 0 || v > 100000 {
+        return 0 - 1;
+    }
+    var permille: i32 = v *% 10;
+    if pos[0] < s.len && s[pos[0]] == ('x' as byte) {
+        permille = v *% 1000;
+        pos[0] = pos[0] + 1;
+    } else if pos[0] < s.len && s[pos[0]] == ('%' as byte) {
+        pos[0] = pos[0] + 1;
+    }
+    return permille;
+}
+
+/// 解析一天规则的 `<days>` 部分，写回 day_from/day_to。
+fn sched_days_of(s: &[byte], pos: &usize, r: &SchedRule) !void {
+    if sched_word_is(s, pos[0], &"daily"[0: 5]) {
+        r.day_from = 0;
+        r.day_to = 6;
+        pos[0] = pos[0] + 5;
+        return;
+    }
+    if sched_word_is(s, pos[0], &"workday"[0: 7]) {
+        r.day_from = 0;
+        r.day_to = 4;
+        pos[0] = pos[0] + 7;
+        return;
+    }
+    if sched_word_is(s, pos[0], &"weekend"[0: 7]) {
+        r.day_from = 5;
+        r.day_to = 6;
+        pos[0] = pos[0] + 7;
+        return;
+    }
+    const d1: i32 = sched_day_of(s, pos[0]);
+    if d1 < 0 {
+        return error.SchedInvalid;
+    }
+    pos[0] = pos[0] + 3;
+    r.day_from = d1;
+    r.day_to = d1;
+    if pos[0] < s.len && s[pos[0]] == ('-' as byte) {
+        const d2: i32 = sched_day_of(s, pos[0] + 1);
+        if d2 < 0 {
+            return error.SchedInvalid;
+        }
+        pos[0] = pos[0] + 4;
+        r.day_to = d2;
+    }
+    return;
+}
+
+/// 解析一整条规则集。空串表示「没有分时」——永远 1x。
+export fn schedule_parse(spec: &[byte], out: &Sched) !void {
+    out.count = 0;
+    var pos: usize = 0;
+    sched_skip_space(spec, &pos);
+    if pos >= spec.len {
+        return;
+    }
+    while pos < spec.len {
+        if out.count >= SCHED_MAX_RULES {
+            return error.SchedTooMany;
+        }
+        var r: SchedRule = SchedRule{
+            day_from: 0,
+            day_to: 0,
+            minute_from: 0,
+            minute_to: 0,
+            permille: SCHED_BASE_PERMILLE,
+        };
+        try sched_days_of(spec, &pos, &r);
+        sched_skip_space(spec, &pos);
+        const t1: i32 = sched_time_of(spec, &pos);
+        if t1 < 0 {
+            return error.SchedInvalid;
+        }
+        if pos >= spec.len || spec[pos] != ('-' as byte) {
+            return error.SchedInvalid;
+        }
+        pos = pos + 1;
+        const t2: i32 = sched_time_of(spec, &pos);
+        if t2 < 0 {
+            return error.SchedInvalid;
+        }
+        r.minute_from = t1;
+        r.minute_to = t2;
+        sched_skip_space(spec, &pos);
+        const f: i32 = sched_factor_of(spec, &pos);
+        if f < 0 {
+            return error.SchedInvalid;
+        }
+        r.permille = f;
+        const idx: usize = out.count;
+        if idx >= SCHED_MAX_RULES {
+            return error.SchedTooMany;
+        }
+        out.rules[idx].day_from = r.day_from;
+        out.rules[idx].day_to = r.day_to;
+        out.rules[idx].minute_from = r.minute_from;
+        out.rules[idx].minute_to = r.minute_to;
+        out.rules[idx].permille = r.permille;
+        out.count = out.count + 1;
+        sched_skip_space(spec, &pos);
+        if pos < spec.len {
+            if spec[pos] != (';' as byte) {
+                return error.SchedInvalid;
+            }
+            pos = pos + 1;
+            sched_skip_space(spec, &pos);
+        }
+    }
+    return;
+}
+
+/// 把 unix 秒换成本地「周几 + 当天分钟」。
+export fn schedule_local_parts(ts: i64, tz_min: i32, weekday_out: &i32, minute_out: &i32) void {
+    const shifted: i64 = ts +% ((tz_min as i64) *% (60 as i64));
+    var days: i64 = shifted / (86400 as i64);
+    var rem: i64 = shifted % (86400 as i64);
+    if rem < 0 {
+        days = days -% 1;
+        rem = rem +% (86400 as i64);
+    }
+    // 1970-01-01 是周四（周一=0 时是 3）。
+    var wd: i64 = (days +% 3) % (7 as i64);
+    if wd < 0 {
+        wd = wd +% (7 as i64);
+    }
+    weekday_out[0] = wd as i32;
+    minute_out[0] = (rem / (60 as i64)) as i32;
+}
+
+fn sched_day_in_range(day: i32, from: i32, to: i32) bool {
+    if from <= to {
+        return day >= from && day <= to;
+    }
+    // 跨周：fri-mon 表示 5,6,0,1
+    return day >= from || day <= to;
+}
+
+fn sched_minute_in_range(m: i32, from: i32, to: i32) bool {
+    if from == to {
+        return false;
+    }
+    if from < to {
+        return m >= from && m < to;
+    }
+    return m >= from || m < to;
+}
+
+/// 命中倍率：第一条命中规则的 permille，都不命中返回 1000。
+export fn schedule_permille(s: &Sched, ts: i64, tz_min: i32) i32 {
+    var wd: i32 = 0;
+    var minute: i32 = 0;
+    schedule_local_parts(ts, tz_min, &wd, &minute);
+    var i: usize = 0;
+    while i < s.count {
+        if i >= SCHED_MAX_RULES {
+            break;
+        }
+        if sched_day_in_range(wd, s.rules[i].day_from, s.rules[i].day_to)
+            && sched_minute_in_range(minute, s.rules[i].minute_from, s.rules[i].minute_to) {
+            return s.rules[i].permille;
+        }
+        i = i + 1;
+    }
+    return SCHED_BASE_PERMILLE;
+}
+
+/// 便捷封装：解析 + 取值。解析失败按 1x 处理（价目损坏不该让请求失败）。
+export fn schedule_permille_of(spec: &[byte], ts: i64, tz_min: i32) i32 {
+    var s: Sched = Sched{ rules: [], count: 0 };
+    schedule_parse(spec, &s) catch {
+        return SCHED_BASE_PERMILLE;
+    };
+    return schedule_permille(&s, ts, tz_min);
+}

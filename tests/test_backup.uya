@@ -1,0 +1,163 @@
+// tests/test_backup.uya — A2 每日备份：快照可读回 + 保留策略 + 日期换算
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+fn unlink_if_exists(c: &const byte) void {
+    _ = sys_unlink(c as *const byte) catch {};
+}
+
+/// 每轮先准备好目录并清掉上一轮的残留库文件（否则唯一约束会撞车）。
+fn prep() void {
+    _ = sys_mkdir("/tmp/aigw_backup_test" as *const byte, 493 as i32) catch {};
+    unlink_if_exists("/tmp/aigw_backup_test_src.db" as &const byte);
+    unlink_if_exists("/tmp/aigw_backup_test_src.db-wal" as &const byte);
+    unlink_if_exists("/tmp/aigw_backup_test_src.db-shm" as &const byte);
+    unlink_if_exists("/tmp/aigw_backup_test_src2.db" as &const byte);
+    unlink_if_exists("/tmp/aigw_backup_test_src3.db" as &const byte);
+    unlink_if_exists("/tmp/aigw_backup_test/aigw-20240101.db" as &const byte);
+    unlink_if_exists("/tmp/aigw_backup_test/aigw-20231230.db" as &const byte);
+    unlink_if_exists("/tmp/aigw_backup_test/aigw-20231222.db" as &const byte);
+    unlink_if_exists("/tmp/aigw_backup_test/aigw-20231221.db" as &const byte);
+}
+
+fn b(p: &const byte) &[byte] {
+    var n: usize = 0;
+    while p[n] != (0 as byte) {
+        n = n + 1;
+    }
+    return p[0: n];
+}
+
+fn test_stamp() !void {
+    prep();
+    var s: [byte: 16] = [0: 16];
+    // 1970-01-01
+    try assert_eq_i32(backup_stamp(0, &s[0], 16) as i32, 8);
+    try assert_eq_i32(s[0] as i32, '1' as i32);
+    try assert_eq_i32(s[7] as i32, '1' as i32);
+    // 2024-01-01 00:00:00 UTC
+    _ = backup_stamp(1704067200, &s[0], 16);
+    try assert_eq_i32(s[0] as i32, '2' as i32);
+    try assert_eq_i32(s[3] as i32, '4' as i32);
+    try assert_eq_i32(s[4] as i32, '0' as i32);
+    try assert_eq_i32(s[5] as i32, '1' as i32);
+    try assert_eq_i32(s[6] as i32, '0' as i32);
+    try assert_eq_i32(s[7] as i32, '1' as i32);
+    // 2024-02-29（闰日）
+    _ = backup_stamp(1709164800, &s[0], 16);
+    try assert_eq_i32(s[4] as i32, '0' as i32);
+    try assert_eq_i32(s[5] as i32, '2' as i32);
+    try assert_eq_i32(s[6] as i32, '2' as i32);
+    try assert_eq_i32(s[7] as i32, '9' as i32);
+    // 2025-12-31
+    _ = backup_stamp(1767139200, &s[0], 16);
+    try assert_eq_i32(s[0] as i32, '2' as i32);
+    try assert_eq_i32(s[1] as i32, '0' as i32);
+    try assert_eq_i32(s[2] as i32, '2' as i32);
+    try assert_eq_i32(s[3] as i32, '5' as i32);
+    try assert_eq_i32(s[4] as i32, '1' as i32);
+    try assert_eq_i32(s[5] as i32, '2' as i32);
+    try assert_eq_i32(s[6] as i32, '3' as i32);
+    try assert_eq_i32(s[7] as i32, '1' as i32);
+}
+
+fn test_path() !void {
+    prep();
+    var p: [byte: 512] = [0: 512];
+    const n: usize = backup_path(b("data/db" as &const byte), 1704067200, &p[0], 512);
+    try assert_eq_i32(n as i32, 24);
+    try assert_eq_i32(p[0] as i32, 'd' as i32);
+    try assert_eq_i32(p[7] as i32, '/' as i32);
+    try assert_eq_i32(p[8] as i32, 'a' as i32);
+    try assert_eq_i32(p[13] as i32, '2' as i32);
+    try assert_eq_i32(p[20] as i32, '1' as i32);
+    try assert_eq_i32(p[21] as i32, '.' as i32);
+    try assert_eq_i32(p[22] as i32, 'd' as i32);
+    try assert_eq_i32(p[23] as i32, 'b' as i32);
+}
+
+fn test_snapshot_roundtrip() !void {
+    prep();
+    const dir: &[byte] = b("/tmp/aigw_backup_test" as &const byte);
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    _ = try schema_open(&d, b("/tmp/aigw_backup_test_src.db" as &const byte));
+    try dbx_exec_cstr(&d, "insert into users(email, slug, created_at) values('b@example.com', 'u0000000009', 1700000000)" as &const byte);
+
+    var path: [byte: 512] = [0: 512];
+    const pn: usize = try backup_run(&d, dir, 1704067200, &path[0], 512);
+    try assert_eq_bool(pn > 0, true);
+
+    // 备份文件必须能独立打开，且数据在里面
+    var bd: Db = Db{ h: null };
+    defer { dbx_close(&bd); }
+    try dbx_open(&bd, path[0: pn]);
+    var n: i64 = 0;
+    try assert_eq_i32(dbx_scalar_i64(&bd, b("select count(*) from users" as &const byte), &n), 0);
+    try assert_eq_i32(n as i32, 1);
+    var email: [byte: 64] = [0: 64];
+    var st: DbStmt = try dbx_prepare(&bd, b("select email from users" as &const byte));
+    defer { dbx_finalize(&st); }
+    try assert_eq_i32(dbx_step(&st), 1);
+    const en: usize = dbx_col_text(&st, 0, &email[0], 64);
+    try assert_eq_i32(en as i32, 13);
+    try assert_eq_i32(email[0] as i32, 'b' as i32);
+
+    // 同一天再跑一次：目标已存在，按成功处理（不覆盖、不报错）
+    const pn2: usize = try backup_run(&d, dir, 1704067200, &path[0], 512);
+    try assert_eq_i32(pn2 as i32, pn as i32);
+}
+
+fn test_prune() !void {
+    prep();
+    const dir: &[byte] = b("/tmp/aigw_backup_test" as &const byte);
+    // 造两个旧备份（文件名按天回推）
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    _ = try schema_open(&d, b("/tmp/aigw_backup_test_src2.db" as &const byte));
+    var p: [byte: 512] = [0: 512];
+    const now: i64 = 1704067200;
+    _ = try backup_run(&d, dir, now -% (864000 as i64), &p[0], 512);
+    _ = try backup_run(&d, dir, now -% (950400 as i64), &p[0], 512);
+    // keep=7：10 天前、11 天前的都该被删
+    const removed: i32 = backup_prune(dir, now, 7);
+    try assert_eq_bool(removed >= 2, true);
+    // 再删一次没有副作用
+    try assert_eq_i32(backup_prune(dir, now, 7), 0);
+}
+
+fn test_prune_keeps_recent() !void {
+    prep();
+    const dir: &[byte] = b("/tmp/aigw_backup_test" as &const byte);
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    _ = try schema_open(&d, b("/tmp/aigw_backup_test_src3.db" as &const byte));
+    const now: i64 = 1704067200;
+    var p: [byte: 512] = [0: 512];
+    _ = try backup_run(&d, dir, now -% (172800 as i64), &p[0], 512);
+    const path_len: usize = pn_of(dir, now -% (172800 as i64), &p[0], 512);
+    _ = backup_prune(dir, now, 7);
+    var exists: bool = false;
+    var bd: Db = Db{ h: null };
+    const op: !void = dbx_open(&bd, p[0: path_len]);
+    _ = op catch {
+        exists = false;
+    };
+    if bd.h != null {
+        exists = true;
+        dbx_close(&bd);
+    }
+    try assert_eq_bool(exists, true);
+    try assert_eq_bool(path_len > 0, true);
+}
+
+fn pn_of(dir: &[byte], ts: i64, out: &byte, cap: usize) usize {
+    return backup_path(dir, ts, out, cap);
+}
+
+test "stamp" { run_test("stamp", test_stamp); }
+test "path" { run_test("path", test_path); }
+test "snapshot_roundtrip" { run_test("snapshot_roundtrip", test_snapshot_roundtrip); }
+test "prune" { run_test("prune", test_prune); }
+test "prune_keeps_recent" { run_test("prune_keeps_recent", test_prune_keeps_recent); }

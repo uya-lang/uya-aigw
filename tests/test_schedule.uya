@@ -1,0 +1,128 @@
+// tests/test_schedule.uya — A2 分时：规则解析与命中（纯函数，不碰库/时钟）
+//
+// ts 全部用「北京时间 2024-01-01（周一）…」的真实秒数，tz_min = 480。
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+// 2024-01-01 00:00:00 UTC = 周一；北京时间 = 08:00
+const MON_0000_UTC: i64 = 1704067200;
+
+/// 字面量 → 切片：长度现算，免得手数（数错一位就是另一个测试）。
+fn b(p: &const byte) &[byte] {
+    var n: usize = 0;
+    while p[n] != (0 as byte) {
+        n = n + 1;
+    }
+    return p[0: n];
+}
+
+fn permille_of(spec: &[byte], ts: i64) i32 {
+    return schedule_permille_of(spec, ts, 480);
+}
+
+fn test_weekday_window() !void {
+    // 北京时间周一 09:00 = UTC 01:00
+    const mon_0900_bj: i64 = MON_0000_UTC + 3600;
+    try assert_eq_i32(permille_of(b("workday 09:00-18:00 120%" as &const byte), mon_0900_bj), 1200);
+    // 周一 08:59 不在窗口
+    try assert_eq_i32(permille_of(b("workday 09:00-18:00 120%" as &const byte), mon_0900_bj - 60), 1000);
+    // 周一 18:00 是右开端点，不命中
+    try assert_eq_i32(permille_of(b("workday 09:00-18:00 120%" as &const byte), MON_0000_UTC + 10 * 3600), 1000);
+    // 周一 17:59 命中
+    try assert_eq_i32(permille_of(b("workday 09:00-18:00 120%" as &const byte), MON_0000_UTC + 9 * 3600 - 60), 1200);
+}
+
+fn test_weekend() !void {
+    // 2024-01-06 是周六：北京时间 12:00 = UTC 04:00
+    const sat_1200_bj: i64 = MON_0000_UTC + (5 * 86400) + 4 * 3600;
+    try assert_eq_i32(permille_of(b("weekend 00:00-24:00 80%" as &const byte), sat_1200_bj), 800);
+    // 周一同刻不命中
+    try assert_eq_i32(permille_of(b("weekend 00:00-24:00 80%" as &const byte), MON_0000_UTC + 4 * 3600), 1000);
+}
+
+fn test_daily_cross_midnight() !void {
+    // 北京时间 23:00 = UTC 15:00
+    const t_2300: i64 = MON_0000_UTC + 15 * 3600;
+    try assert_eq_i32(permille_of(b("daily 22:00-06:00 60%" as &const byte), t_2300), 600);
+    // 北京时间 05:59（次日）= UTC 21:59
+    try assert_eq_i32(permille_of(b("daily 22:00-06:00 60%" as &const byte), MON_0000_UTC + 21 * 3600 + 59 * 60), 600);
+    // 北京时间 06:00 不命中
+    try assert_eq_i32(permille_of(b("daily 22:00-06:00 60%" as &const byte), MON_0000_UTC + 22 * 3600), 1000);
+    // 北京时间 12:00 不命中
+    try assert_eq_i32(permille_of(b("daily 22:00-06:00 60%" as &const byte), MON_0000_UTC + 4 * 3600), 1000);
+}
+
+fn test_first_rule_wins() !void {
+    // 两条都命中时第一条生效
+    const spec: &[byte] = b("daily 00:00-24:00 150%; daily 00:00-24:00 50%" as &const byte);
+    try assert_eq_i32(permille_of(spec, MON_0000_UTC), 1500);
+}
+
+fn test_multiplier_forms() !void {
+    const t: i64 = MON_0000_UTC + 2 * 3600;
+    try assert_eq_i32(permille_of(b("daily 00:00-24:00 2x" as &const byte), t), 2000);
+    try assert_eq_i32(permille_of(b("daily 00:00-24:00 100%" as &const byte), t), 1000);
+    try assert_eq_i32(permille_of(b("daily 00:00-24:00 5" as &const byte), t), 50);
+}
+
+fn test_weekday_range_cross_week() !void {
+    // fri-mon 覆盖周五/六/日/一
+    const spec: &[byte] = b("fri-mon 00:00-24:00 90%" as &const byte);
+    // 2024-01-05 周五 北京时间 12:00
+    const fri: i64 = MON_0000_UTC + (4 * 86400) + 4 * 3600;
+    try assert_eq_i32(permille_of(spec, fri), 900);
+    // 2024-01-03 周三
+    const wed: i64 = MON_0000_UTC + (2 * 86400) + 4 * 3600;
+    try assert_eq_i32(permille_of(spec, wed), 1000);
+}
+
+fn test_empty_and_invalid() !void {
+    // 空规则 = 永远原价
+    try assert_eq_i32(permille_of(b("" as &const byte), MON_0000_UTC), 1000);
+    // 语法错的规则按原价处理，不抛给调用方
+    try assert_eq_i32(permille_of(b("nonsense" as &const byte), MON_0000_UTC), 1000);
+    try assert_eq_i32(permille_of(b("daily 25:00-26:00 1%" as &const byte), MON_0000_UTC), 1000);
+}
+
+fn test_parse_reports_errors() !void {
+    var s: Sched = Sched{ rules: [], count: 0 };
+    var bad: bool = false;
+    _ = schedule_parse(b("quick" as &const byte), &s) catch |_| {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+
+    // 合法规则数得对
+    try schedule_parse(b("workday 09:00-18:00 120%; weekend 00:00-24:00 80%" as &const byte), &s);
+    try assert_eq_i32(s.count as i32, 2);
+    try assert_eq_i32(s.rules[0].permille, 1200);
+    try assert_eq_i32(s.rules[1].day_from, 5);
+}
+
+fn test_local_parts() !void {
+    var wd: i32 = 0;
+    var minute: i32 = 0;
+    // 周一 00:00 UTC → 周一时 08:00（北京）
+    schedule_local_parts(MON_0000_UTC, 480, &wd, &minute);
+    try assert_eq_i32(wd, 0);
+    try assert_eq_i32(minute, 480);
+    // UTC 时区下是 00:00
+    schedule_local_parts(MON_0000_UTC, 0, &wd, &minute);
+    try assert_eq_i32(minute, 0);
+    // 周日 23:59 UTC 在西五区是周日 18:59
+    const sun: i64 = MON_0000_UTC + (6 * 86400) + 23 * 3600 + 59 * 60;
+    schedule_local_parts(sun, 0 - 300, &wd, &minute);
+    try assert_eq_i32(wd, 6);
+    try assert_eq_i32(minute, (18 * 60) + 59);
+}
+
+test "weekday_window" { run_test("weekday_window", test_weekday_window); }
+test "weekend" { run_test("weekend", test_weekend); }
+test "daily_cross_midnight" { run_test("daily_cross_midnight", test_daily_cross_midnight); }
+test "first_rule_wins" { run_test("first_rule_wins", test_first_rule_wins); }
+test "multiplier_forms" { run_test("multiplier_forms", test_multiplier_forms); }
+test "weekday_range_cross_week" { run_test("weekday_range_cross_week", test_weekday_range_cross_week); }
+test "empty_and_invalid" { run_test("empty_and_invalid", test_empty_and_invalid); }
+test "parse_reports_errors" { run_test("parse_reports_errors", test_parse_reports_errors); }
+test "local_parts" { run_test("local_parts", test_local_parts); }

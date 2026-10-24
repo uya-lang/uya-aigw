@@ -1,0 +1,217 @@
+// src/core/backup.uya — A2 每日备份：一致性快照 + 保留份数
+//
+// 做法：`VACUUM INTO '<dir>/aigw-YYYYMMDD.db'`。
+//   * VACUUM INTO 是 sqlite 的一致性快照（读事务内拷页），不需要停写、不需要拷贝 -wal/-shm。
+//   * 目标文件已存在时会报错——同一天重复跑等于「今天已经有备份了」，按成功处理。
+//   * 保留策略按天回推：删掉 `keep` 天之前的候选文件名（不扫目录，路径可由时间反推）。
+//
+// 注意：VACUUM 会短时间占住写锁。A2 里是每日 03:00 的低峰任务，可接受；
+// 集群阶段（B1）再改成子进程，避免拖慢热路径。
+
+use libc.syscall;
+
+export error BackupFailed;
+
+/// 一年里的每月天数（平年）；闰年 2 月由 `backup_month_len` 单独处理。
+const BACKUP_MONTHS: [i32: 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+fn backup_is_leap(y: i32) bool {
+    if y % 4 != 0 {
+        return false;
+    }
+    if y % 100 != 0 {
+        return true;
+    }
+    return y % 400 == 0;
+}
+
+fn backup_month_len(y: i32, m: i32) i32 {
+    if m == 2 && backup_is_leap(y) {
+        return 29;
+    }
+    var i: i32 = 0;
+    var v: i32 = 31;
+    while i < 12 {
+        if i == m -% 1 && i < 12 {
+            v = BACKUP_MONTHS[i];
+        }
+        i = i + 1;
+    }
+    return v;
+}
+
+fn backup_put2(out: &byte, off: &usize, v: i32) void {
+    const hi: i32 = (v / 10) % 10;
+    const lo: i32 = v % 10;
+    out[off[0]] = (48 as i32 +% hi) as byte;
+    out[off[0] +% 1] = (48 as i32 +% lo) as byte;
+    off[0] = off[0] +% 2;
+}
+
+/// unix 秒 → `YYYYMMDD`（UTC），返回写入长度（8）。
+export fn backup_stamp(ts: i64, out: &byte, cap: usize) usize {
+    if cap < 8 {
+        return 0;
+    }
+    var days: i64 = ts / (86400 as i64);
+    if ts < 0 && ts % (86400 as i64) != 0 {
+        days = days -% 1;
+    }
+    var year: i32 = 1970;
+    var d: i64 = days;
+    while true {
+        const ylen: i64 = if backup_is_leap(year) { 366 as i64 } else { 365 as i64 };
+        if d < ylen {
+            break;
+        }
+        d = d -% ylen;
+        year = year + 1;
+    }
+    var month: i32 = 1;
+    while month < 12 {
+        const mlen: i64 = backup_month_len(year, month) as i64;
+        if d < mlen {
+            break;
+        }
+        d = d -% mlen;
+        month = month + 1;
+    }
+    const day: i32 = (d as i32) +% 1;
+    var off: usize = 0;
+    backup_put2(out, &off, year / 100);
+    backup_put2(out, &off, year % 100);
+    backup_put2(out, &off, month);
+    backup_put2(out, &off, day);
+    return off;
+}
+
+/// 拼 `<dir>/aigw-<stamp>.db`，返回长度（0 = 放不下）。
+export fn backup_path(dir: &[byte], ts: i64, out: &byte, cap: usize) usize {
+    var off: usize = 0;
+    var i: usize = 0;
+    while i < dir.len {
+        if off >= cap {
+            return 0;
+        }
+        out[off] = dir[i];
+        off = off + 1;
+        i = i + 1;
+    }
+    const tail: &[byte] = &"/aigw-"[0: 6];
+    i = 0;
+    while i < tail.len {
+        if off >= cap {
+            return 0;
+        }
+        out[off] = tail[i];
+        off = off + 1;
+        i = i + 1;
+    }
+    if backup_stamp(ts, &out[off], cap - off) != 8 {
+        return 0;
+    }
+    off = off + 8;
+    const ext: &[byte] = &".db"[0: 3];
+    i = 0;
+    while i < ext.len {
+        if off >= cap {
+            return 0;
+        }
+        out[off] = ext[i];
+        off = off + 1;
+        i = i + 1;
+    }
+    return off;
+}
+
+/// 路径里有单引号就没法安全拼进 SQL —— 直接拒绝（我们不生成这种目录名）。
+fn backup_path_ok(p: &byte, n: usize) bool {
+    var i: usize = 0;
+    while i < n {
+        if p[i] == (0x27 as byte) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// 做一次快照，把落盘路径写回 `out_path`。返回路径长度。
+/// 目标已存在（今天备份过了）也返回成功。
+export fn backup_run(d: &Db, dir: &[byte], ts: i64, out_path: &byte, cap: usize) !usize {
+    var path: [byte: 512] = [0: 512];
+    const pn: usize = backup_path(dir, ts, &path[0], 512);
+    if pn == 0 {
+        return error.BackupFailed;
+    }
+    if !backup_path_ok(&path[0], pn) {
+        return error.BackupFailed;
+    }
+    // vacuum into '<path>'
+    var sql: [byte: 1024] = [0: 1024];
+    var off: usize = 0;
+    const head: &[byte] = &"vacuum into '"[0: 13];
+    var i: usize = 0;
+    while i < head.len {
+        sql[off] = head[i];
+        off = off + 1;
+        i = i + 1;
+    }
+    i = 0;
+    while i < pn {
+        sql[off] = path[i];
+        off = off + 1;
+        i = i + 1;
+    }
+    sql[off] = 0x27 as byte;
+    off = off + 1;
+    sql[off] = 0 as byte;
+    dbx_exec_cstr(d, &sql[0] as &const byte) catch |_| {
+        // 目标已存在（今天备份过了）不算失败
+        const fd: !i32 = sys_open(&path[0] as *const byte, 0 as i32, 0);
+        const h: i32 = fd catch {
+            0 - 1;
+        };
+        if h < 0 {
+            return error.BackupFailed;
+        }
+        _ = sys_close(h) catch {};
+    };
+    if out_path != null && cap > 0 {
+        i = 0;
+        while i < pn && i < cap {
+            out_path[i] = path[i];
+            i = i + 1;
+        }
+    }
+    return pn;
+}
+
+/// 保留策略：把 `keep` 天之前的备份文件删掉（按名字回推，不扫目录）。
+/// 返回删掉的个数。文件本来就不存在不算错。
+export fn backup_prune(dir: &[byte], ts: i64, keep: i32) i32 {
+    var k: i32 = keep;
+    if k < 1 {
+        k = 1;
+    }
+    var removed: i32 = 0;
+    var day: i32 = k;
+    while day < k +% 30 {
+        const older: i64 = ts -% ((day as i64) *% (86400 as i64));
+        var path: [byte: 512] = [0: 512];
+        const pn: usize = backup_path(dir, older, &path[0], 512);
+        if pn == 0 {
+            break;
+        }
+        path[pn] = 0 as byte;
+        const r: !i32 = sys_unlink(&path[0] as *const byte);
+        const rc: i32 = r catch {
+            0 - 1;
+        };
+        if rc == 0 {
+            removed = removed + 1;
+        }
+        day = day +% 1;
+    }
+    return removed;
+}
