@@ -196,26 +196,44 @@ fn tlsx_flight_done(flight: &const byte, len: usize) bool {
         }
     }
 
-    // 消费服务端第二 flight（CCS + Finished），不解析内容，只保证不留在 socket 里。
-    var saw_ccs: bool = false;
-    var saw_fin: bool = false;
-    var guard: usize = 0;
-    var rec2: [byte: TLSX_HS_SEND_MAX] = [0: TLSX_HS_SEND_MAX];
-    while guard < 8 && !(saw_ccs && saw_fin) {
-        var rl2: usize = 0;
-        const r2: i32 = try @await tlsx_hs_read_record_async(fd, &rec2[0],
-            TLSX_HS_SEND_MAX, &rl2);
-        if r2 != 1 {
-            break;
-        }
-        const rt: byte = rec2[0];
-        if rt == (20 as byte) {
-            saw_ccs = true;
-        }
-        if rt == (22 as byte) {
-            saw_fin = true;
-        }
-        guard = guard + 1;
+    // 服务端第二 flight：CCS（明文）+ Finished（加密）。
+    // Finished 必须经 record_decrypt 解一遍再丢弃，否则服务端方向的 read_seq 停在 0，
+    // 之后的应用数据全部解不开（表现为 TLS record layer failure）。
+    var ccs: [byte: 64] = [0: 64];
+    var ccs_len: usize = 0;
+    const cr: i32 = try @await tlsx_hs_read_record_async(fd, &ccs[0], 64, &ccs_len);
+    if cr != 1 || ccs[0] != (20 as byte) {
+        return error.TlsxHandshakeFailed;
+    }
+    var fin: [byte: 4096] = [0: 4096];
+    var fin_len: usize = 0;
+    const fr2: i32 = try @await tlsx_hs_read_record_async(fd, &fin[0], 4096, &fin_len);
+    if fr2 != 1 {
+        return error.TlsxHandshakeFailed;
+    }
+    // 把 CCS+Finished 拼回一条 flight，交给状态机的 WAIT_SERVER_FINISHED 分支解析。
+    // 必须走状态机：Finished 是加密记录，只有 record_decrypt 才能把服务端方向的
+    // read_seq 推到 1；自己解一遍再丢弃会让后续应用数据全部解不开。
+    var second: [byte: 6144] = [0: 6144];
+    var total: usize = 0;
+    var i2: usize = 0;
+    while i2 < ccs_len {
+        second[i2] = ccs[i2];
+        i2 = i2 + 1;
+    }
+    total = ccs_len;
+    i2 = 0;
+    while i2 < fin_len {
+        second[total + i2] = fin[i2];
+        i2 = i2 + 1;
+    }
+    total = total +% fin_len;
+    ctx.hs.state = HS_STATE_WAIT_SERVER_FINISHED;
+    var slen3: usize = 0;
+    const st3: i32 = ssl_handshake_step(ctx, &second[0], total, &send[0],
+        TLSX_HS_SEND_MAX, &slen3);
+    if st3 == HS_STATUS_ERROR {
+        return error.TlsxHandshakeFailed;
     }
     return 0;
 }
@@ -337,12 +355,46 @@ export @async_fn fn tlsx_conn_open_async(fd: i32, host: &[byte], mode: u8,
     return 0;
 }
 
+const TLSX_REC_MAX: usize = 17408;
+
+/// 应用数据读：读一条完整 TLS record → record_decrypt → 明文。
 export @async_fn fn tlsx_read_async(c: &TlsxConn, out: &byte, max: usize) Future<!usize> {
-    const r: usize = try @await https_read_some_async(c.fd, out, max);
-    return r;
+    var rec: [byte: TLSX_REC_MAX] = [0: TLSX_REC_MAX];
+    while true {
+        var rl: usize = 0;
+        const r: i32 = try @await tlsx_hs_read_record_async(c.fd, &rec[0], TLSX_REC_MAX, &rl);
+        if r != 1 {
+            return 0 as usize;
+        }
+        var plen: usize = 0;
+        var cons: usize = 0;
+        ssl_read(c.ctx, &rec[0], rl, out, max, &plen, &cons) catch |_| {
+            return error.ConnectionClosed;
+        };
+        if plen > 0 {
+            return plen;
+        }
+    }
 }
 
+/// 应用数据写：record_encrypt → 写出密文（按 8 KiB 分片）。
 export @async_fn fn tlsx_write_async(c: &TlsxConn, src: &const byte, n: usize) Future<!usize> {
-    const r: usize = try @await https_write_all_async(c.fd, src, n);
-    return r;
+    var cipher: [byte: TLSX_REC_MAX] = [0: TLSX_REC_MAX];
+    var off: usize = 0;
+    while off < n {
+        var chunk: usize = n - off;
+        if chunk > 8192 {
+            chunk = 8192;
+        }
+        var clen: usize = 0;
+        ssl_write(c.ctx, &src[off], chunk, &cipher[0], TLSX_REC_MAX, &clen) catch |_| {
+            return error.ConnectionClosed;
+        };
+        const w: usize = try @await https_write_all_async(c.fd, &cipher[0], clen);
+        if w != clen {
+            return error.ConnectionClosed;
+        }
+        off = off +% chunk;
+    }
+    return n;
 }

@@ -1,0 +1,202 @@
+// tests/provider_spike_main.uya — TLS-09 端到端：本机 TLS 上游（非流式 CL / chunked / SSE）
+use libc.stdlib;
+use std.io.file;
+
+extern "libc" fn printf(fmt: *byte, ...) i32;
+
+fn zlen(p: &const byte) usize {
+    var n: usize = 0;
+    while p[n] != (0 as byte) {
+        n = n + 1;
+    }
+    return n;
+}
+
+fn parse_u16(s: &[byte]) u16 {
+    var v: u16 = 0;
+    var i: usize = 0;
+    while i < s.len {
+        const c: byte = s[i];
+        if c >= ('0' as byte) && c <= ('9' as byte) {
+            v = v *% (10 as u16) +% ((c as u16) -% (48 as u16));
+        }
+        i = i + 1;
+    }
+    return v;
+}
+
+fn load_file(path: &const byte, out: &byte, cap: usize, out_len: &usize) bool {
+    out_len[0] = 0;
+    const f: File = file_open(path, 0, 0) catch |_| {
+        return false;
+    };
+    var total: usize = 0;
+    while total < cap {
+        const n: isize = file_read(&f, &out[total], cap - total);
+        if n <= 0 {
+            break;
+        }
+        total = total +% (n as usize);
+    }
+    file_close(&f) catch |_| { };
+    out_len[0] = total;
+    return total > 0;
+}
+
+fn setup(ctx: &HtcCtx, cfg: &HttppConfig, port: u16, bundle: &byte, bundle_len: usize) void {
+    htc_ctx_init(ctx, TLSX_MODE_CHAIN);
+    ctx.allow_private = true;
+    if bundle_len > 0 && bundle_len <= HTC_BUNDLE_MAX {
+        var i: usize = 0;
+        while i < bundle_len {
+            ctx.bundle[i] = bundle[i];
+            i = i + 1;
+        }
+        ctx.bundle_len = bundle_len;
+    }
+    cfg.port = port;
+    cfg.auth_type = HTTPP_AUTH_BEARER;
+    _ = httpp_set_secret(cfg, &"literal:sk-test"[0: 15], 15);
+    _ = httpp_set_host(cfg, &"localhost"[0: 9], 9);
+}
+
+/// 非流式 + Content-Length。
+fn step_plain(ctx: &HtcCtx, cfg: &const HttppConfig, now: u64) i32 {
+    var call: HtcCall = HtcCall{};
+    htc_call_init(&call);
+    defer { htc_call_free(&call); }
+    var empty: [byte: 1] = [0: 1];
+    const nop: &[byte] = &empty[0: 0];
+    const o: !i32 = block_on<i32>(htc_open_async(cfg, ctx, &"GET"[0: 3],
+        &"/v1/models"[0: 10], nop, false, now, now +% (5000 as u64), &call));
+    _ = o catch |err| {
+        printf("PROV-FAIL plain open err=%d\n" as *byte, @error_id(err) as i32);
+        return 1;
+    };
+    var out: [byte: 4096] = [0: 4096];
+    var got: usize = 0;
+    const b: !i32 = block_on<i32>(htc_body_async(&call, &out[0], 4096, &got));
+    _ = b catch |_| {
+        printf("PROV-FAIL plain body\n" as *byte);
+        return 2;
+    };
+    if call.head.status != 200 || got == 0 {
+        printf("PROV-FAIL plain status=%d got=%d\n" as *byte,
+            call.head.status, got as i32);
+        return 3;
+    }
+    printf("PROV-OK plain status=%d got=%d first=%c\n" as *byte,
+        call.head.status, got as i32, out[0]);
+    return 0;
+}
+
+/// 非流式 + chunked。
+fn step_chunked(ctx: &HtcCtx, cfg: &const HttppConfig, now: u64) i32 {
+    var call: HtcCall = HtcCall{};
+    htc_call_init(&call);
+    defer { htc_call_free(&call); }
+    const payload: &[byte] = &"{\"echo\":1}"[0: 10];
+    const o: !i32 = block_on<i32>(htc_open_async(cfg, ctx, &"POST"[0: 4],
+        &"/v1/echo"[0: 8], payload, false, now, now +% (5000 as u64), &call));
+    _ = o catch |_| {
+        printf("PROV-FAIL chunk open\n" as *byte);
+        return 4;
+    };
+    var out: [byte: 4096] = [0: 4096];
+    var got: usize = 0;
+    const b: !i32 = block_on<i32>(htc_body_async(&call, &out[0], 4096, &got));
+    _ = b catch |_| {
+        printf("PROV-FAIL chunk body\n" as *byte);
+        return 5;
+    };
+    if !call.head.chunked || got == 0 || out[0] != ('{' as byte) {
+        printf("PROV-FAIL chunk chunked=%d got=%d\n" as *byte,
+            call.head.chunked as i32, got as i32);
+        return 6;
+    }
+    printf("PROV-OK chunked got=%d\n" as *byte, got as i32);
+    return 0;
+}
+
+/// 流式 SSE：应收到 3 个数据事件 + [DONE]。
+fn step_stream(ctx: &HtcCtx, cfg: &const HttppConfig, now: u64) i32 {
+    var call: HtcCall = HtcCall{};
+    htc_call_init(&call);
+    defer { htc_call_free(&call); }
+    const payload: &[byte] = &"{\"stream\":true}"[0: 15];
+    const o: !i32 = block_on<i32>(htc_open_async(cfg, ctx, &"POST"[0: 4],
+        &"/v1/chat/completions"[0: 19], payload, true, now, now +% (5000 as u64), &call));
+    _ = o catch |_| {
+        printf("PROV-FAIL stream open\n" as *byte);
+        return 7;
+    };
+    var events: i32 = 0;
+    var saw_done: bool = false;
+    while events < 16 {
+        var has: bool = false;
+        const r: !i32 = block_on<i32>(htc_next_event_async(&call, &has));
+        const rr: i32 = r catch |_| {
+            printf("PROV-FAIL stream parse\n" as *byte);
+            return 8;
+        };
+        if rr == 0 || !has {
+            break;
+        }
+        events = events + 1;
+        if sse_is_done(&call.sse) {
+            saw_done = true;
+        }
+        sse_consume(&call.sse);
+    }
+    if events < 4 || !saw_done {
+        printf("PROV-FAIL stream events=%d done=%d\n" as *byte,
+            events, saw_done as i32);
+        return 9;
+    }
+    printf("PROV-OK stream events=%d done=%d\n" as *byte, events, saw_done as i32);
+    return 0;
+}
+
+export fn main() i32 {
+    const ps: &byte = getenv("AIGW_TLS_PORT" as &const byte);
+    const rs: &byte = getenv("AIGW_TLS_ROOT" as &const byte);
+    if (ps as usize) == 0 || (rs as usize) == 0 {
+        return 1;
+    }
+    const port: u16 = parse_u16(ps[0: zlen(ps)]);
+    var bundle: [byte: HTC_BUNDLE_MAX] = [0: HTC_BUNDLE_MAX];
+    var bundle_len: usize = 0;
+    if !load_file(rs, &bundle[0], HTC_BUNDLE_MAX, &bundle_len) {
+        printf("PROV-FAIL no bundle\n" as *byte);
+        return 2;
+    }
+
+    var ctx: HtcCtx = HtcCtx{};
+    var cfg: HttppConfig = httpp_empty();
+    setup(&ctx, &cfg, port, &bundle[0], bundle_len);
+    const now: u64 = now_ms() catch |_| { 0 as u64; };
+
+    printf("SPIKE cfg host_len=%d port=%d priv=%d rl=%d mode=%d blen=%d now=%d\n" as *byte,
+        cfg.host_len as i32, cfg.port as i32, ctx.allow_private as i32, ctx.resolv_len as i32,
+        ctx.mode as i32, ctx.bundle_len as i32, now as i32);
+    var addrs: DnsxAddrs = DnsxAddrs{};
+    const rf: !i32 = block_on<i32>(dnsx_resolve_async(&cfg.host[0: cfg.host_len],
+        &ctx.cache, &ctx.resolv[0: ctx.resolv_len], now, &addrs));
+    const rv: i32 = rf catch |_| { -99; };
+    printf("SPIKE dns r=%d v4n=%d allowed=%d\n" as *byte, rv, addrs.v4_n as i32,
+        httpc_host_allowed(&cfg.host[0], cfg.host_len, ctx.allow_private) as i32);
+    var rc: i32 = step_plain(&ctx, &cfg, now);
+    if rc != 0 {
+        return rc;
+    }
+    rc = step_chunked(&ctx, &cfg, now);
+    if rc != 0 {
+        return rc;
+    }
+    rc = step_stream(&ctx, &cfg, now);
+    if rc != 0 {
+        return rc;
+    }
+    printf("PROV-ALL-OK\n" as *byte);
+    return 0;
+}

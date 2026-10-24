@@ -21,3 +21,4 @@
 | TLS-09B | 2026-10-24 | `git log --grep=TLS-09B` | `src/net/proxyx.uya`：http 代理 URL 解析、no_proxy 匹配（`*`/精确/后缀）、CONNECT 请求构造（含 Basic 认证）；`tests/test_proxyx.uya` 3 组用例全过 |
 | TLS-09C | 2026-10-24 | `git log --grep=TLS-09C` | `src/providers/http.uya`：`httpp_set_host` + `httpp_build_request`（method + base_path + path + Host/port + 鉴权 + Content-Type/Accept + Content-Length + body）；`tests/test_provider_http.uya` 新增 build_request 用例 |
 | TLS-09D | 2026-10-24 | `git log --grep=TLS-09D` | `src/providers/http.uya`：`httpp_status_kind`（400/401/403/404/408/429/5xx → 错误 kind）；`tests/test_provider_http.uya` 新增 status_kind 用例（16 个用例全过） |
+| TLS-09 | 2026-10-24 | `git log --grep=TLS-09` | `src/providers/httpcall.uya`：DNS→TCP→可恢复握手→写请求→读响应头→非流式 body（Content-Length/chunked/EOF）；`tlsx_read_async`/`tlsx_write_async` 改为 record_decrypt/record_encrypt，第二 flight 经 `WAIT_SERVER_FINISHED` 状态机解析（read_seq 才能推进）；本机 Python TLS 上游 `PROV-OK plain` / `PROV-OK chunked` |

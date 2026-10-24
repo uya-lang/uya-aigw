@@ -11,6 +11,7 @@
 // 依赖：std.net.dns（异步查询）、std.time（调用方传入 now_ms）。
 
 use std.net.dns;
+use std.io.file;
 
 export error DnsxNoResolver;
 
@@ -399,7 +400,7 @@ export fn dnsx_cache_put_negative(c: &DnsxCache, host: &[byte], now_ms: u64) voi
 
 /// 异步解析：字面量/localhost/缓存优先，未命中走 std.net.dns 的 A/AAAA 异步查询。
 /// 返回 1=有地址，0=NXDOMAIN（已负缓存）；网络错误走 error。
-@async_fn fn dnsx_resolve_async(host: &[byte], c: &DnsxCache, resolv: &[byte],
+export @async_fn fn dnsx_resolve_async(host: &[byte], c: &DnsxCache, resolv: &[byte],
     now_ms: u64, out: &DnsxAddrs) Future<!i32> {
     dnsx_addrs_clear(out);
     if host.len == 0 {
@@ -445,4 +446,24 @@ export fn dnsx_cache_put_negative(c: &DnsxCache, host: &[byte], now_ms: u64) voi
     }
     dnsx_cache_put(c, host, out, 60, now_ms);
     return 1;
+}
+
+/// 读 resolv.conf（默认 /etc/resolv.conf），返回可传给 dnsx_resolve_async 的字节。
+export fn dnsx_load_resolv(out: &byte, cap: usize, out_len: &usize) bool {
+    out_len[0] = 0;
+    const path: &const byte = "/etc/resolv.conf" as &const byte;
+    const f: File = file_open(path, 0, 0) catch |_| {
+        return false;
+    };
+    var total: usize = 0;
+    while total < cap {
+        const n: isize = file_read(&f, &out[total], cap - total);
+        if n <= 0 {
+            break;
+        }
+        total = total +% (n as usize);
+    }
+    file_close(&f) catch |_| { };
+    out_len[0] = total;
+    return total > 0;
 }

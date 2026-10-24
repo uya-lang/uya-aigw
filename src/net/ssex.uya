@@ -26,11 +26,13 @@ export struct SseEvent {
 export struct SseParser {
     line: [byte: SSE_MAX_LINE],
     line_len: usize,
+    consumed: usize,
     ev: SseEvent,
 }
 
 export fn sse_init(p: &SseParser) void {
     p.line_len = 0;
+    p.consumed = 0;
     p.ev.event_len = 0;
     p.ev.data_len = 0;
     p.ev.id_len = 0;
@@ -74,6 +76,7 @@ fn sse_copy(dst: &byte, cap: usize, src: &const byte, n: usize) bool {
 
 /// 处理一段字节；返回 1=有事件，0=需要更多，-1=行超长，-2=字段/数据超限。
 export fn sse_feed(p: &SseParser, b: &const byte, n: usize) i32 {
+    p.consumed = 0;
     var i: usize = 0;
     while i < n {
         const c: byte = b[i];
@@ -85,6 +88,7 @@ export fn sse_feed(p: &SseParser, b: &const byte, n: usize) i32 {
             if ll == 0 {
                 if p.ev.has_event || p.ev.has_data {
                     p.line_len = 0;
+                    p.consumed = i + 1;
                     return 1;
                 }
             } else if p.line[0] == (58 as byte) {
@@ -138,6 +142,7 @@ export fn sse_feed(p: &SseParser, b: &const byte, n: usize) i32 {
             p.line_len = p.line_len + 1;
         }
         i = i + 1;
+        p.consumed = i;
     }
     return 0;
 }

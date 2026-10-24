@@ -1,0 +1,343 @@
+// src/providers/httpcall.uya — 供应商异步调用：DNS → TCP → TLS → 请求 → 响应
+//
+// 一次调用分三步（每步都可 await，绝不阻塞事件循环）：
+//   1) htc_open_async：解析、连接、握手、写请求、读响应头；
+//   2) htc_body_async：非流式，一次读完（Content-Length / chunked / 读到 EOF）；
+//   3) htc_next_event_async：流式（SSE），一次返回一个事件。
+//
+// 信任：SAN + 四档（pin/tofu/chain/none），由 ctx.mode 决定；SSRF 私网默认拒绝。
+
+use libc.heap;
+
+export error HtcNoAddress;
+export error HtcBlocked;
+export error HtcBadResponse;
+export error HtcConnectFailed;
+
+export const HTC_RESOLV_MAX: usize = 512;
+export const HTC_BUNDLE_MAX: usize = 8192;
+export const HTC_PINS_MAX: usize = 256;
+export const HTC_BODY_INIT: usize = 8192;
+
+export struct HtcCtx {
+    cache: DnsxCache,
+    resolv: [byte: HTC_RESOLV_MAX],
+    resolv_len: usize,
+    mode: u8,
+    pins: [byte: HTC_PINS_MAX],
+    pin_count: usize,
+    bundle: [byte: HTC_BUNDLE_MAX],
+    bundle_len: usize,
+    tofu: TlsxPins,
+    allow_learn: bool,
+    allow_private: bool,
+}
+
+export fn htc_ctx_init(ctx: &HtcCtx, mode: u8) void {
+    dnsx_cache_init(&ctx.cache);
+    dnsx_load_resolv(&ctx.resolv[0], HTC_RESOLV_MAX, &ctx.resolv_len);
+    ctx.mode = mode;
+    ctx.pin_count = 0;
+    ctx.bundle_len = 0;
+    tlsx_pins_init(&ctx.tofu);
+    ctx.allow_learn = true;
+    ctx.allow_private = false;
+}
+
+export struct HtcCall {
+    conn: TlsxConn,
+    headers: [HttpcHeader: HTTPC_MAX_HEADERS],
+    header_count: usize,
+    head: HttpcHead,
+    body: Buf,
+    body_off: usize,
+    plain: Buf,
+    plain_off: usize,
+    chunk_pos: usize,
+    chunk_eof: bool,
+    stream: bool,
+    done: bool,
+    sse: SseParser,
+}
+
+export fn htc_call_init(call: &HtcCall) void {
+    call.conn = tlsx_conn_empty();
+    call.header_count = 0;
+    call.head = HttpcHead{};
+    call.body = buf_new(HTC_BODY_INIT);
+    call.body_off = 0;
+    call.plain = buf_new(HTC_BODY_INIT);
+    call.plain_off = 0;
+    call.chunk_pos = 0;
+    call.chunk_eof = false;
+    call.stream = false;
+    call.done = false;
+    sse_init(&call.sse);
+}
+
+export fn htc_call_free(call: &HtcCall) void {
+    tlsx_conn_free(&call.conn);
+    buf_free(&call.body);
+    buf_free(&call.plain);
+}
+
+@async_fn fn htc_read_more_async(call: &HtcCall) Future<!i32> {
+    if !buf_reserve(&call.body, 4096) {
+        return -1;
+    }
+    const room: usize = call.body.cap - call.body.len;
+    if room == 0 {
+        return -1;
+    }
+    const n: usize = try @await tlsx_read_async(&call.conn, &call.body.ptr[call.body.len], room);
+    if n == 0 {
+        return 0;
+    }
+    call.body.len = call.body.len +% n;
+    return 1;
+}
+
+/// 建连 + 握手 + 发请求 + 读响应头。返回 0 成功；其余为 error。
+export @async_fn fn htc_open_async(cfg: &const HttppConfig, ctx: &HtcCtx,
+    method: &[byte], path: &[byte], payload: &[byte], stream: bool,
+    now_ms: u64, deadline: u64, call: &HtcCall) Future<!i32> {
+    if !httpc_host_allowed(&cfg.host[0], cfg.host_len, ctx.allow_private) {
+        return error.HtcBlocked;
+    }
+    var addrs: DnsxAddrs = DnsxAddrs{};
+    const dnsf: Future<!i32> = dnsx_resolve_async(&cfg.host[0: cfg.host_len], &ctx.cache,
+        &ctx.resolv[0: ctx.resolv_len], now_ms, &addrs);
+    const dnsr: !i32 = @await dnsf;
+    var rr: i32 = 0;
+    rr = dnsr catch |_| {
+        return error.HtcNoAddress;
+    };
+    if rr != 1 || addrs.v4_n == 0 {
+        return error.HtcNoAddress;
+    }
+    const fd: i32 = try @await tcpx_connect_v4_async(&addrs.v4[0], cfg.port, deadline);
+    const tf: Future<!i32> = tlsx_conn_open_async(fd, &cfg.host[0: cfg.host_len],
+        ctx.mode, &ctx.pins[0], ctx.pin_count, &ctx.bundle[0], ctx.bundle_len,
+        &ctx.tofu, ctx.allow_learn, now_ms, &call.conn);
+    const tr: !i32 = @await tf;
+    var orr: i32 = 0;
+    orr = tr catch |_| {
+        return error.HtcConnectFailed;
+    };
+
+    var empty: [byte: 1] = [0: 1];
+    var pptr: &const byte = &empty[0];
+    var plen: usize = 0;
+    if payload.len > 0 {
+        pptr = &payload[0];
+        plen = payload.len;
+    }
+    var req: Buf = buf_new(1024 +% plen);
+    defer { buf_free(&req); }
+    if !httpp_build_request(cfg, &method[0], method.len, &path[0], path.len,
+        pptr, plen, stream, &req) {
+        return error.HtcBadResponse;
+    }
+    const wf: Future<!usize> = tlsx_write_async(&call.conn, req.ptr as &const byte, req.len);
+    const wr: !usize = @await wf;
+    var w: usize = 0;
+    w = wr catch |_| {
+        return error.HtcBadResponse;
+    };
+    if w != req.len {
+        return error.HtcBadResponse;
+    }
+    call.stream = stream;
+    if !buf_reserve(&call.body, HTC_BODY_INIT) {
+        return error.HtcBadResponse;
+    }
+    const hr: i32 = try @await httpc_read_head_async(&call.conn, call.body.ptr,
+        call.body.cap, &call.headers[0], &call.header_count, &call.head);
+    if hr == -3 {
+        return error.HtcBadResponse;
+    }
+    if hr != 0 {
+        return error.HtcConnectFailed;
+    }
+    call.body.len = call.head.total;
+    call.body_off = call.head.head_len;
+    call.chunk_pos = call.head.head_len;
+    return 0;
+}
+
+fn htc_chunk_terminated(call: &const HtcCall) bool {
+    const hl: usize = call.head.head_len;
+    const total: usize = call.body.len;
+    if total < hl {
+        return false;
+    }
+    // 终止块：body 以 "0\r\n\r\n" 开头，或任意位置出现 "\r\n0\r\n\r\n"
+    if total >= hl +% 5 && call.body.ptr[hl] == (48 as byte)
+        && call.body.ptr[hl + 1] == (13 as byte) && call.body.ptr[hl + 2] == (10 as byte)
+        && call.body.ptr[hl + 3] == (13 as byte) && call.body.ptr[hl + 4] == (10 as byte) {
+        return true;
+    }
+    var i: usize = hl;
+    while i +% 7 <= total {
+        if call.body.ptr[i] == (13 as byte) && call.body.ptr[i + 1] == (10 as byte)
+            && call.body.ptr[i + 2] == (48 as byte) && call.body.ptr[i + 3] == (13 as byte)
+            && call.body.ptr[i + 4] == (10 as byte) && call.body.ptr[i + 5] == (13 as byte)
+            && call.body.ptr[i + 6] == (10 as byte) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// 非流式：读完整个 body 并解码（Content-Length / chunked / EOF）。
+export @async_fn fn htc_body_async(call: &HtcCall, out: &byte, cap: usize,
+    got: &usize) Future<!i32> {
+    got[0] = 0;
+    const hl: usize = call.head.head_len;
+    if call.head.no_body {
+        call.done = true;
+        return 0;
+    }
+    if call.head.chunked {
+        while !htc_chunk_terminated(call) {
+            const r: i32 = try @await htc_read_more_async(call);
+            if r <= 0 {
+                break;
+            }
+        }
+        var pos: usize = hl;
+        var total: usize = 0;
+        while pos < call.body.len && total < cap {
+            var olen: usize = 0;
+            var npos: usize = 0;
+            const cr: i32 = httpc_chunk_next(call.body.ptr, call.body.len, pos,
+                &out[total], cap - total, &olen, &npos);
+            if cr == 0 {
+                break;
+            }
+            if cr < 0 {
+                break;
+            }
+            total = total +% olen;
+            pos = npos;
+        }
+        got[0] = total;
+        call.done = true;
+        return 0;
+    }
+    if call.head.content_length >= 0 {
+        const need: usize = hl +% (call.head.content_length as usize);
+        while call.body.len < need {
+            const r: i32 = try @await htc_read_more_async(call);
+            if r <= 0 {
+                break;
+            }
+        }
+        var have: usize = 0;
+        if call.body.len > hl {
+            have = call.body.len - hl;
+        }
+        if have > cap {
+            have = cap;
+        }
+        var k: usize = 0;
+        while k < have {
+            out[k] = call.body.ptr[hl + k];
+            k = k + 1;
+        }
+        got[0] = have;
+        call.done = true;
+        return 0;
+    }
+    // 无长度：读到连接关闭
+    while call.body.len - hl < cap {
+        const r: i32 = try @await htc_read_more_async(call);
+        if r <= 0 {
+            break;
+        }
+    }
+    var have2: usize = 0;
+    if call.body.len > hl {
+        have2 = call.body.len - hl;
+    }
+    if have2 > cap {
+        have2 = cap;
+    }
+    var k2: usize = 0;
+    while k2 < have2 {
+        out[k2] = call.body.ptr[hl + k2];
+        k2 = k2 + 1;
+    }
+    got[0] = have2;
+    call.done = true;
+    return 0;
+}
+
+fn htc_pump_plain(call: &HtcCall) i32 {
+    if call.head.chunked {
+        while call.chunk_pos < call.body.len {
+            var tmp: [byte: 8192] = [0: 8192];
+            var olen: usize = 0;
+            var npos: usize = 0;
+            const r: i32 = httpc_chunk_next(call.body.ptr, call.body.len, call.chunk_pos,
+                &tmp[0], 8192, &olen, &npos);
+            if r == 0 {
+                call.chunk_eof = true;
+                return 1;
+            }
+            if r < 0 {
+                return -1;
+            }
+            if olen > 0 && !buf_append(&call.plain, &tmp[0], olen) {
+                return -1;
+            }
+            call.chunk_pos = npos;
+            return 1;
+        }
+        return 0;
+    }
+    if call.body_off < call.body.len {
+        const n: usize = call.body.len - call.body_off;
+        if !buf_append(&call.plain, &call.body.ptr[call.body_off], n) {
+            return -1;
+        }
+        call.body_off = call.body.len;
+        return 1;
+    }
+    return 0;
+}
+
+/// 流式：返回 1=有事件（call.sse.ev），0=结束，-1=解析错误。
+/// chunked 响应会先解帧再喂给 SSE 解析器（SSE 数据在 chunk 负载里）。
+export @async_fn fn htc_next_event_async(call: &HtcCall, has: &bool) Future<!i32> {
+    has[0] = false;
+    while true {
+        if call.plain_off < call.plain.len {
+            const r: i32 = sse_feed(&call.sse, &call.plain.ptr[call.plain_off],
+                call.plain.len - call.plain_off);
+            call.plain_off = call.plain_off +% call.sse.consumed;
+            if r == 1 {
+                has[0] = true;
+                return 1;
+            }
+            if r < 0 {
+                return -1;
+            }
+        }
+        const p: i32 = htc_pump_plain(call);
+        if p < 0 {
+            return -1;
+        }
+        if p > 0 {
+            continue;
+        }
+        if call.head.chunked && call.chunk_eof {
+            return 0;
+        }
+        const rr: i32 = try @await htc_read_more_async(call);
+        if rr <= 0 {
+            return 0;
+        }
+    }
+}
