@@ -1,0 +1,106 @@
+// src/core/dbx.uya — SQLite 门面（A0 spike 的最小可用面）
+//
+// 只暴露三件事：打开、执行、取单值。够验证 `@c_import` + sqlite3 在我们的构建里能用，
+// 也够后面几张表（用户、密钥、请求日志、账本）先跑起来。
+//
+// 句柄是 C 侧的不透明 `void *`，装在 `Db` 里；错误信息走 `dbx_last_error()`。
+// 对外参数一律是 Uya 切片，内部拷进定长缓冲并补 NUL —— 普通函数不能拿 `*const byte`
+// 这种 FFI 指针类型当参数（编译器直接拒）。
+
+@c_import("../../third_party/sqlite/sqlite3.c", "-DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION=1", "-lm");
+@c_import("dbx_shim.c", "", "-ldl -lpthread");
+
+extern fn aigw_db_open(path: *const byte) &byte;
+extern fn aigw_db_close(h: &byte) void;
+extern fn aigw_db_exec(h: &byte, sql: *const byte) i32;
+extern fn aigw_db_scalar_i64(h: &byte, sql: *const byte, out: &i64) i32;
+extern fn aigw_db_last_error() &byte;
+extern fn aigw_sqlite_version() &byte;
+extern fn aigw_db_last_insert_rowid(h: &byte) i64;
+extern fn aigw_db_changes(h: &byte) i32;
+
+export const DBX_SQL_MAX: usize = 4096;
+
+export error DbOpenFailed;
+export error DbExecFailed;
+export error DbTooLong;
+
+export struct Db {
+    h: &byte,
+}
+
+/// 切片 → NUL 结尾的 C 字符串（拷进调用方给的缓冲）。
+fn dbx_cstr(buf: &byte, cap: usize, s: &[byte]) !void {
+    if s.len + 1 > cap {
+        return error.DbTooLong;
+    }
+    var i: usize = 0;
+    while i < s.len {
+        buf[i] = s[i];
+        i = i + 1;
+    }
+    buf[i] = 0 as byte;
+    return;
+}
+
+/// 打开数据库；路径是 Uya 切片（":memory:" 可做单测）。
+export fn dbx_open(d: &Db, path: &[byte]) !void {
+    var p: [byte: 512] = [0: 512];
+    try dbx_cstr(&p[0], 512, path);
+    const h: &byte = aigw_db_open(&p[0] as *const byte);
+    if h == null {
+        return error.DbOpenFailed;
+    }
+    d.h = h;
+    return;
+}
+
+export fn dbx_close(d: &Db) void {
+    if d.h != null {
+        aigw_db_close(d.h);
+        d.h = null;
+    }
+}
+
+export fn dbx_exec(d: &Db, sql: &[byte]) !void {
+    var b: [byte: DBX_SQL_MAX] = [0: DBX_SQL_MAX];
+    try dbx_cstr(&b[0], DBX_SQL_MAX, sql);
+    if aigw_db_exec(d.h, &b[0] as *const byte) != 0 {
+        return error.DbExecFailed;
+    }
+    return;
+}
+
+/// 单值查询：有行返回 0 并写 out；无行返回 1；出错返回 -1。
+export fn dbx_scalar_i64(d: &Db, sql: &[byte], out: &i64) i32 {
+    var b: [byte: DBX_SQL_MAX] = [0: DBX_SQL_MAX];
+    dbx_cstr(&b[0], DBX_SQL_MAX, sql) catch |_| {
+        return -2;
+    };
+    return aigw_db_scalar_i64(d.h, &b[0] as *const byte, out);
+}
+
+export fn dbx_last_error() &byte {
+    return aigw_db_last_error();
+}
+
+export fn dbx_version() &byte {
+    return aigw_sqlite_version();
+}
+
+export fn dbx_last_insert_rowid(d: &Db) i64 {
+    return aigw_db_last_insert_rowid(d.h);
+}
+
+export fn dbx_changes(d: &Db) i32 {
+    return aigw_db_changes(d.h);
+}
+
+/// C 字符串长度（Uya 侧的 `len` 对 `&byte` 不可用）。
+export fn dbx_strlen(p: &byte) usize {
+    var i: usize = 0;
+    while p[i] != (0 as byte) {
+        i = i + 1;
+    }
+    return i;
+}

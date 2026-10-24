@@ -1,0 +1,71 @@
+// tests/test_dbx.uya — A0 spike：@c_import + SQLite 真的能用
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+fn test_version() !void {
+    const v: &byte = dbx_version();
+    try assert_eq_bool(dbx_strlen(v) >= 5, true);
+    try assert_eq_i32(v[0] as i32, '3' as i32);
+}
+
+fn test_select_one() !void {
+    var d: Db = Db{ h: null };
+    try dbx_open(&d, &":memory:"[0: 8]);
+    defer { dbx_close(&d); }
+    var v: i64 = 0;
+    try assert_eq_i32(dbx_scalar_i64(&d, &"select 1"[0: 8], &v), 0);
+    try assert_eq_i32(v as i32, 1);
+}
+
+fn test_create_insert_select() !void {
+    var d: Db = Db{ h: null };
+    try dbx_open(&d, &":memory:"[0: 8]);
+    defer { dbx_close(&d); }
+    try dbx_exec(&d, &"create table t(id integer primary key, name text not null, nano integer not null)"[0: 81]);
+    try dbx_exec(&d, &"insert into t(name, nano) values('a', 980000)"[0: 45]);
+    try dbx_exec(&d, &"insert into t(name, nano) values('b', 1500000000)"[0: 49]);
+    var n: i64 = 0;
+    try assert_eq_i32(dbx_scalar_i64(&d, &"select count(*) from t"[0: 22], &n), 0);
+    try assert_eq_i32(n as i32, 2);
+    try assert_eq_i32(dbx_scalar_i64(&d, &"select nano from t where name='a'"[0: 33], &n), 0);
+    try assert_eq_i32(n as i32, 980000);
+    try assert_eq_i32(dbx_scalar_i64(&d, &"select sum(nano) from t"[0: 23], &n), 0);
+    try assert_eq_i32((n / (1000000 as i64)) as i32, 1500);
+}
+
+fn test_no_row_and_error() !void {
+    var d: Db = Db{ h: null };
+    try dbx_open(&d, &":memory:"[0: 8]);
+    defer { dbx_close(&d); }
+    try dbx_exec(&d, &"create table e(x integer)"[0: 25]);
+    var n: i64 = 0;
+    // 无行 → 1
+    try assert_eq_i32(dbx_scalar_i64(&d, &"select x from e"[0: 15], &n), 1);
+    // 语法错 → -1，且错误信息非空
+    try assert_eq_i32(dbx_scalar_i64(&d, &"select from"[0: 11], &n), -1);
+    const e: &byte = dbx_last_error();
+    try assert_eq_bool(e[0] != (0 as byte), true);
+    // exec 出错要返回 error
+    var failed: bool = false;
+    _ = dbx_exec(&d, &"insert into nope(x) values(1)"[0: 29]) catch |_| { failed = true; };
+    try assert_eq_bool(failed, true);
+}
+
+fn test_last_id_and_changes() !void {
+    var d: Db = Db{ h: null };
+    try dbx_open(&d, &":memory:"[0: 8]);
+    defer { dbx_close(&d); }
+    try dbx_exec(&d, &"create table c(id integer primary key, v integer)"[0: 49]);
+    try dbx_exec(&d, &"insert into c(v) values(7)"[0: 26]);
+    try assert_eq_i32(dbx_last_insert_rowid(&d) as i32, 1);
+    try assert_eq_i32(dbx_changes(&d), 1);
+    try dbx_exec(&d, &"update c set v = 9 where v = 7"[0: 30]);
+    try assert_eq_i32(dbx_changes(&d), 1);
+}
+
+test "version" { run_test("version", test_version); }
+test "select_one" { run_test("select_one", test_select_one); }
+test "create_insert_select" { run_test("create_insert_select", test_create_insert_select); }
+test "no_row_and_error" { run_test("no_row_and_error", test_no_row_and_error); }
+test "last_id_and_changes" { run_test("last_id_and_changes", test_last_id_and_changes); }
