@@ -137,3 +137,25 @@ TLS-SPIKE-OK n=31
 说明问题不在「等待原语」的选择，而在 deadline 读这条路径与 `htc_open_async` 留下的
 socket 状态/已缓冲数据之间。下一步应打印 `sys_poll` 的返回值与 `https_read_some` 的错误码
 定位（一次 instrumentation 即可），而不是再换第五种等待方式。
+### 结论修正：事件通知版**能读到数据**，问题不在等待原语
+
+按用户指引用 `async_wait_readable(fd, deadline)`（事件通知 / Waker 注册，非轮询）+
+同步 `https_read_some` 组出 `tlsx_fill_deadline_async`，并加临时打印后实测：
+
+```
+[DL] readable → filled need=5      (record 头)
+[DL] readable → filled need=44     (record 负载)
+... 共 4 条 record 全部读到
+[DL] wait err id=852389008         (第 5 次等待：deadline 到，正常收尾)
+```
+
+即：**等待、超时、按 deadline 退出全部正常**，4 条 record 也都读到并交给 `ssl_read` 了。
+但 `htc_next_event_async` 侧最终仍 `events=0`。
+
+所以 TLS-09E 剩下的不是「怎么等」，而是「读到的记录怎么拼回 SSE 事件」：
+下一步应在 `htc_next_event_async` 里打印每次 `htc_read_more_async` 的返回值、
+`call.body.len`、`httpc_chunk_next` 的返回码与 `sse_feed` 的返回码，
+确认是 chunked 帧被 record 边界切断后没有继续解，还是 `plain` 缓冲区没被消费。
+
+代码现状：`tlsx_read_deadline_async` 保持事件通知实现（未接入 `htc_read_more_async`），
+`httpcall` 走无超时读，e2e `PROV-ALL-OK`。

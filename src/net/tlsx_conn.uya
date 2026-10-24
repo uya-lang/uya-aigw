@@ -388,48 +388,23 @@ export @async_fn fn tlsx_read_async(c: &TlsxConn, out: &byte, max: usize) Future
     }
 }
 
-const TLSX_POLL_SLICE_MS: i32 = 50;
-
-/// 等 fd 可读，最多 `idle_ms`（0 = 不设超时）：1=可读，0=超时，-1=错误。
-///
-/// 做法照抄 uya-agent 的 `httpstream`（TUI 泵点那段）：**同步 `sys_poll` 切片**，
-/// 每片 ≤50 ms，按累计时间判超时。为什么不用 `async_wait_readable`：
-/// 它在外面再叠一层 Waker 注册，与本模块 record 读里的等待抢同一组 IO 槽
-/// （`WAKER_IO_SLOT_MAX = 4`），实测流式首帧就返回 0（findings §9）。
-@async_fn fn tlsx_wait_readable_idle_async(fd: i32, idle_ms: u64) Future<!i32> {
-    var spent: u64 = 0;
-    while true {
-        var slice: i32 = TLSX_POLL_SLICE_MS;
-        if idle_ms != 0 {
-            if spent >= idle_ms {
-                return 0;
-            }
-            const remain: u64 = idle_ms -% spent;
-            if remain < (50 as u64) {
-                slice = remain as i32;
-                if slice <= 0 {
-                    return 0;
-                }
-            }
-        }
-        var pfds: [PollFd: 1] = [PollFd{ fd: fd, events: POLLIN, revents: 0 }];
-        const pr: i32 = sys_poll(&pfds[0], 1, slice) catch |_| {
-            return -1;
-        };
-        if pr > 0 {
-            return 1;
-        }
-        spent = spent +% (slice as u64);
-    }
-    return 0;
+/// 等 fd 可读（事件通知，非轮询）：1=可读，0=超时，-1=错误。
+/// 用 std 的 readiness substrate `async_wait_readable`：它注册 Waker，由事件循环回调，
+/// 到 deadline 自己返回 `error.AsyncDeadlineExceeded`。
+@async_fn fn tlsx_wait_readable_idle_async(fd: i32, deadline: u64) Future<!i32> {
+    const w: !usize = @await async_wait_readable(fd, deadline);
+    _ = w catch |_| {
+        return 0;                   // AsyncDeadlineExceeded / Cancelled：本轮结束
+    };
+    return 1;
 }
 
-/// 在 idle_ms 内把 buf[0..need] 填满；超时/对端关闭返回 false。
+/// 在 deadline（绝对毫秒，0 = 不设超时）内把 buf[0..need] 填满；超时/对端关闭返回 false。
 @async_fn fn tlsx_fill_deadline_async(fd: i32, buf: &byte, need: usize,
-    idle_ms: u64) Future<!bool> {
+    deadline: u64) Future<!bool> {
     var have: usize = 0;
     while have < need {
-        const w: i32 = try @await tlsx_wait_readable_idle_async(fd, idle_ms);
+        const w: i32 = try @await tlsx_wait_readable_idle_async(fd, deadline);
         if w != 1 {
             return false;
         }
@@ -457,9 +432,16 @@ export @async_fn fn tlsx_read_deadline_async(c: &TlsxConn, out: &byte, max: usiz
     if idle_ms == 0 {
         return try @await tlsx_read_async(c, out, max);
     }
+    var deadline: u64 = 0;
+    if idle_ms != 0 {
+        const now: u64 = now_ms() catch |_| { 0 as u64; };
+        if now != 0 {
+            deadline = now +% idle_ms;
+        }
+    }
     var rec: [byte: TLSX_REC_MAX] = [0: TLSX_REC_MAX];
     while true {
-        const okh: bool = try @await tlsx_fill_deadline_async(c.fd, &rec[0], 5, idle_ms);
+        const okh: bool = try @await tlsx_fill_deadline_async(c.fd, &rec[0], 5, deadline);
         if !okh {
             return 0 as usize;
         }
@@ -468,7 +450,7 @@ export @async_fn fn tlsx_read_deadline_async(c: &TlsxConn, out: &byte, max: usiz
             return error.ConnectionClosed;
         }
         if len > 0 {
-            const okp: bool = try @await tlsx_fill_deadline_async(c.fd, &rec[5], len, idle_ms);
+            const okp: bool = try @await tlsx_fill_deadline_async(c.fd, &rec[5], len, deadline);
             if !okp {
                 return 0 as usize;
             }

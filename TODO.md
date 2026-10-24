@@ -25,7 +25,7 @@ Phase A0 (SQLite spike) 可与 Phase T 并行 ─────┘
 | ID | 任务 | 验收 | 依赖 |
 |---|---|---|---|
 | TLS-04 | `src/net/tlsx.uya`：指纹、pin、TOFU 多证书存储、链门控判定 | 同域多证书：已知通过；新证书链校验通过才追加；`none` 需显式开关 | TLS-03 |
-| TLS-09E | **流式读超时**：四种写法（deadline future / 嵌套 wait / 单层 wait+sync read / poll 切片）实测均返 0；先打 `sys_poll` 返回值与 `https_read_some` 错误码定位 | 上游半开时能返回而不是挂住 | TLS-09 |
+| TLS-09E | **流式读超时**：事件通知版等待/超时已验证可用（4 条 record 读全）；剩「record → SSE 事件」组装仍 events=0，按 findings §9「结论修正」逐层打日志定位 | 上游半开时能返回而不是挂住 | TLS-09 |
 
 ---
 

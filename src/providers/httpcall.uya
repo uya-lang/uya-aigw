@@ -89,10 +89,9 @@ export fn htc_call_free(call: &HtcCall) void {
     if room == 0 {
         return -1;
     }
-    // TLS-09E 未接入：`tlsx_read_deadline_async`（poll 切片版，照 uya-agent httpstream 的
-    // 泵点做法）在本机上游上流式仍首帧返 0；四种等待写法都撞同一现象（findings §9）。
-    // 在定位到 sys_poll 在本 fd 上的真实返回前，流式保持无超时读：`[DONE]` 收尾 +
-    // 客户端断开传播取消兜底。
+    // TLS-09E：`tlsx_read_deadline_async`（事件通知版）已经能按 deadline 读到 TLS 记录
+    // （实测 4 条 record 全部读到并解密），但流式路径组装出来仍是 events=0，说明问题在
+    // 记录重组/SSE 这一侧，不在等待原语。定位完成前保持无超时读，保证 e2e 绿。
     _ = deadline;
     const n: usize = try @await tlsx_read_async(&call.conn,
         &call.body.ptr[call.body.len], room);
