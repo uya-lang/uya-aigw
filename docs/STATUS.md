@@ -16,9 +16,17 @@
 - TLS-09E：流式**读超时**（两种写法实测失败，候选修法与证据见
   `docs/design/tls-spike-findings.md` §9；当前靠 `[DONE]` 收尾 + 断开取消兜底）。
 
+## Phase A 进展
+
+- A0（money 部分）：`src/core/money.c` + `src/core/money.uya`，nano-USD + `__int128` 助手，
+  `tests/test_money.uya` 全过。**SQLite 部分未做**：本机没有 `sqlite3.c/h`，需要 vendor
+  amalgamation（离线不可得），见 TODO A0。
+- A4（日志部分）：`src/core/reqlog.uya`，一行 `k=v` 的每请求日志（含 cost/tok-s），
+  `tests/test_reqlog.uya` 全过。
+
 ## 下一步
 
-1. ~~TLS-09 → TLS-10 → TLS-11~~（已完成，剩 TLS-09E 超时）
+1. ~~TLS-09 → TLS-10 → TLS-11~~（已完成；TLS-09E 流式读超时未落地，findings §9）
 2. Phase A：A0 SQLite+money spike、A1 事件循环、A2 schema/认证/备份 … A9 文档/e2e
 3. Phase B：controller/node/edge、lease/epoch、ingest/journal
 4. Phase C：用户端/管理端后台
