@@ -1,0 +1,36 @@
+// src/cluster/elect.uya — B1 controller A/S 选主（基于 meta.db 租约）
+//
+// 规则：抢到 `controller` 租约的是 active（leader），其余 standby；leader 每次 tick 续租。
+// standby 只在租约过期后接管；`standby 不备份`：备份前先确认自己是 leader。
+
+export const ELECT_LEASE_NAME: &const byte = "controller" as &const byte;
+export const ELECT_STANDBY: i32 = 0;
+export const ELECT_LEADER: i32 = 1;
+
+export error ElectFailed;
+
+/// 一次选主 tick：成功续租/抢到 → LEADER，否则 STANDBY。
+export fn elect_tick(d: &Db, node_id: &[byte], now: i64, ttl: i64) !i32 {
+    if node_id.len == 0 || ttl <= 0 {
+        return error.ElectFailed;
+    }
+    const got: bool = meta_lease_acquire(d, &"controller"[0: 10], node_id, ttl, now) catch {
+        return error.ElectFailed;
+    };
+    if got {
+        return ELECT_LEADER;
+    }
+    return ELECT_STANDBY;
+}
+
+/// 当前 leader 的节点 id（过期则返回 0 长度）。
+export fn elect_leader(d: &Db, now: i64, out: &byte, cap: usize) !usize {
+    return meta_lease_holder(d, &"controller"[0: 10], now, out, cap) catch {
+        0 as usize;
+    };
+}
+
+/// 是否允许执行备份（只有 leader 备份，standby 不备份）。
+export fn elect_may_backup(role: i32) bool {
+    return role == ELECT_LEADER;
+}

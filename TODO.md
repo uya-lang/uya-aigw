@@ -54,8 +54,9 @@ A4/A5/A8 进度（子项已完成记录见 `TODO_DONE.md`）：
 | B5 | ingest 幂等 + 金额/时段重算 + usage 分片 + spool + 吊销 + journal 重放 | 断网 30s 不丢不重；恢复对账一致 | B1/B3 |
 | B6 | 集群 e2e + 部署（1 controller + 3 node + 2 edge + nginx） | `cluster_e2e.sh` 全绿 | B1–B5 |
 
-B1 进度：`src/cluster/meta.uya`（meta.db 节点/配置/租约/journal 索引，21 断言）已完成；
-controller 进程、config 长轮询、A/S 选主、journal 摄取待做（见 `TODO_DONE.md`）。
+B1 进度：`src/cluster/meta.uya`（meta.db，21 断言）与 `src/cluster/elect.uya`
+（租约 A/S 选主 + standby 不备份，8 断言）已完成；controller 进程、config 长轮询、
+journal 摄取待做（见 `TODO_DONE.md`）。
 
 ---
 
