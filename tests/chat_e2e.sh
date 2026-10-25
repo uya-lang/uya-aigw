@@ -149,12 +149,13 @@ UYA_ROOT="$UYA_ROOT" "$UYA" build \
   src/net/x509min.uya src/net/chainx.uya src/net/urlx.uya src/net/dnsx.uya \
   src/net/tlsx.uya src/net/tlsx_conn.uya src/net/httpc.uya src/net/ssex.uya \
   src/net/httpc_pool.uya src/net/proxyx.uya src/providers/http.uya \
-  src/providers/httpcall.uya src/cli/tls_cmd.uya src/app.uya \
+  src/providers/httpcall.uya src/plugins/pool.uya src/providers/plug.uya src/cli/tls_cmd.uya src/app.uya \
   -o build/aigw >"$TMP/build.log" 2>&1 || { cat "$TMP/build.log" >&2; fail "aigw build"; }
 
 ./build/aigw serve --host 127.0.0.1 --port 0 --db "$SEED_DB" --data-dir "$TMP/data" \
   --ca "$TMP/root.pem" --dev-otp --admin-key test-admin \
-  --meta "$TMP/data/meta.db" --node-id node-a >"$TMP/serve.log" 2>&1 &
+  --meta "$TMP/data/meta.db" --node-id node-a \
+  --plugin-cmd "python3 $PWD/tests/plugin_chat.py $TMP/plug.pids" >"$TMP/serve.log" 2>&1 &
 SRV_PID=$!
 PORT=""
 for _ in $(seq 1 200); do
@@ -341,6 +342,18 @@ RETRIES=$(cat "$TMP/retry.txt" 2>/dev/null || echo 0)
 ELAPSED_MS=$(( (RT1 - RT0) / 1000000 ))
 [ "$ELAPSED_MS" -ge 200 ] || fail "backoff too fast: ${ELAPSED_MS}ms"
 echo "CHAT-RETRY attempts=$RETRIES elapsed=${ELAPSED_MS}ms"
+# 4q3) D5：stdio 插件供应商（kind=stdio）——进程复用、响应与用量都落账
+PLUG1=$(curl -s --max-time 20 -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  --data '{"model":"plug-model","messages":[{"role":"user","content":"hi"}]}' \
+  "$BASE/v1/chat/completions")
+echo "$PLUG1" | grep -q 'hello-from-plugin' || { echo "$PLUG1" >&2; fail "plug-model"; }
+PLUG2=$(curl -s --max-time 20 -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  --data '{"model":"plug-model","messages":[{"role":"user","content":"again"}]}' \
+  "$BASE/v1/chat/completions")
+echo "$PLUG2" | grep -q 'hello-from-plugin' || { echo "$PLUG2" >&2; fail "plug-model 2"; }
+PLUGPROCS=$(wc -l < "$TMP/plug.pids" 2>/dev/null | tr -d ' ')
+[ "$PLUGPROCS" = "1" ] || fail "plugin not reused: $PLUGPROCS processes"
+echo "CHAT-PLUG procs=$PLUGPROCS"
 # 熔断不影响其他模型
 MC=$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   --data '{"model":"mock-model","messages":[{"role":"user","content":"hi"}]}' "$BASE/v1/chat/completions")
@@ -561,5 +574,6 @@ for db in "$SEED_DB" "$TMP/data"/usage-*.db; do
   COUNT=$((COUNT + C))
 done
 # D3 的 retry-model 请求也会落一条（32 + 1）
-[ "$COUNT" = "33" ] || fail "usage_ledger count=$COUNT"
+# D5 的两次 plug-model 调用也落账（33 + 2）
+[ "$COUNT" = "35" ] || fail "usage_ledger count=$COUNT"
 echo "CHAT-ALL-OK status=$CODE count=$COUNT"

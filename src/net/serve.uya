@@ -1617,11 +1617,20 @@ fn srv_chat(c: &SrvConn, stats: &ServeStats) void {
         var rn: usize = 0;
         var retry_after: u32 = 0;
         var failed: bool = false;
-        upstream_post(&g_up_ctx, &cfg, plan.path[0: plan.path_len],
-            plan.payload[0: plan.payload_len], nowu, nowu +% 60000,
-            &resp[0], 8192, &st, &rn, &retry_after) catch {
-            failed = true;
-        };
+        if plan.stdio {
+            // D5：插件供应商（stdio JSONL）——不建 TLS、不走上游配置
+            plug_chat(&plan.upstream_model[0], plan.upstream_len,
+                plan.payload[0: plan.payload_len], plan.timeout_ms, nowu as i64,
+                &resp[0], 8192, &st, &rn) catch {
+                failed = true;
+            };
+        } else {
+            upstream_post(&g_up_ctx, &cfg, plan.path[0: plan.path_len],
+                plan.payload[0: plan.payload_len], nowu, nowu +% 60000,
+                &resp[0], 8192, &st, &rn, &retry_after) catch {
+                failed = true;
+            };
+        }
         if failed {
             lb_report(plan.provider_id, false, store_now());
             // A8：硬失败后先熔断该 provider，重试才会换下一家（否则同 session 亲和会挑回同一家）。
@@ -2437,6 +2446,10 @@ export fn serve_run(lfd: i32, stats: &ServeStats) !i32 {
         batch_tick(srv_now_ms());
         // D2：顺手清理过期的上游空闲连接（每轮 O(8) 比较）。
         _ = htc_pool_prune(&g_up_ctx.pool, srv_now_ms());
+        // D5：插件池的补常驻 / 空闲回收 / 崩溃收尸
+        if plugin_pool_ready() {
+            plugin_pool_tick_at(srv_now_ms() as i64);
+        }
         if srv_stop_requested() != 0 && stopping == 0 {
             stopping = 1;
             stop_at = srv_now_ms() +% SRV_SHUTDOWN_MS;
@@ -3218,11 +3231,19 @@ fn srv_responses(c: &SrvConn, stats: &ServeStats) void {
     while true {
         retry_after = 0;
         failed = false;
-        upstream_post(&g_up_ctx, &cfg, plan.path[0: plan.path_len],
-            plan.payload[0: plan.payload_len], nowu, nowu +% 60000,
-            &resp[0], 8192, &st, &rn, &retry_after) catch {
-            failed = true;
-        };
+        if plan.stdio {
+            plug_chat(&plan.upstream_model[0], plan.upstream_len,
+                plan.payload[0: plan.payload_len], plan.timeout_ms, nowu as i64,
+                &resp[0], 8192, &st, &rn) catch {
+                failed = true;
+            };
+        } else {
+            upstream_post(&g_up_ctx, &cfg, plan.path[0: plan.path_len],
+                plan.payload[0: plan.payload_len], nowu, nowu +% 60000,
+                &resp[0], 8192, &st, &rn, &retry_after) catch {
+                failed = true;
+            };
+        }
         if !failed && st != 200 && httpc_status_retryable(st) && http_tries < SRV_HTTP_RETRY_MAX {
             const wait_ms: u32 = httpc_backoff_ms(http_tries, SRV_BACKOFF_BASE_MS,
                 retry_after);

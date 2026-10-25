@@ -884,6 +884,31 @@ export fn store_provider_set_auth(d: &Db, id: i64, auth_type: i32,
     return;
 }
 
+/// D5：设置供应商 kind（`stdio` 走插件池；其余走内置 HTTPS）。
+export fn store_provider_set_kind(d: &Db, id: i64, kind: &[byte], now: i64) !void {
+    if kind.len == 0 || kind.len > STORE_PROVIDER_KIND_MAX {
+        return error.StoreFailed;
+    }
+    var st: DbStmt = dbx_prepare(d,
+        "update providers set kind = ?, updated_at = ? where id = ?" as &const byte) catch {
+        return error.StoreFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, kind) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_i64(&st, 2, now) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_i64(&st, 3, id) catch {
+        return error.StoreFailed;
+    };
+    if dbx_step(&st) != 0 {
+        return error.StoreFailed;
+    }
+    return;
+}
+
 /// 设置优先级（越小越优先）与权重（0 = 不参与分摊）。
 export fn store_provider_set_priority(d: &Db, id: i64, priority: i32, weight: i32,
     now: i64) !void {

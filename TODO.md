@@ -46,17 +46,11 @@ ingest 幂等 + usage 分片 `hash(user_id)%4`、spool、journal 重放、集群
 
 ---
 
-## Phase D：接线补完（2026-10-26 核对发现）
+## Phase D：接线补完（已完成）
 
-> C 之后核对「模块 + 单测已完成」与「serve 生产请求路径实际调用」，发现以下功能未接线。
-> 按顺序逐项补，每项一次提交。
-
-- D4 代理 CONNECT：`src/net/proxyx.uya` 接入出站（`HTTPS_PROXY` + `no_proxy`）。
-- D5 插件供应商：`providers.kind=stdio` 接 `src/plugins/pool.uya`（与内置 HTTP 二选一）。
-
-（D1 每请求日志、D2 连接池、D3 重试退避、D4 代理 CONNECT 已落地，见 `TODO_DONE.md`。）
-
----
+> C 之后核对「模块 + 单测已完成」与「serve 生产请求路径实际调用」，发现的功能未接线
+> 已全部补完（D1 每请求日志、D2 连接池、D3 重试退避、D4 代理 CONNECT、
+> D5 `kind=stdio` 插件供应商），每项一次提交，明细见 `TODO_DONE.md`。
 
 ## 当前建议顺序
 

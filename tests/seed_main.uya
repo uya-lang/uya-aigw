@@ -87,6 +87,17 @@ export fn main() i32 {
     store_provider_set_priority(&d, p.id, 1, 100, now) catch {
         return 24;
     };
+    // D5：stdio 插件供应商（kind=stdio，走 src/providers/plug.uya）
+    var plugp: StoreProvider = StoreProvider{};
+    store_provider_create(&d, &"plug"[0: 4], &"plugin"[0: 6], 1, now, &plugp) catch {
+        return 34;
+    };
+    store_provider_set_kind(&d, plugp.id, &"stdio"[0: 5], now) catch {
+        return 35;
+    };
+    store_provider_model_put(&d, plugp.id, &"plug-model"[0: 10], &"plug-upstream"[0: 13], now) catch {
+        return 36;
+    };
     store_provider_model_put(&d, p.id, &"failover-model"[0: 14], &"upstream-model"[0: 14], now) catch {
         return 25;
     };
@@ -104,6 +115,9 @@ export fn main() i32 {
     price_entry_put(&d, sell.id, &""[0: 0], &"retry-model"[0: 11], 0, 1000, 2000, 500, 100, &""[0: 0]) catch {
         return 32;
     };
+    price_entry_put(&d, sell.id, &""[0: 0], &"plug-model"[0: 10], 0, 1000, 2000, 500, 100, &""[0: 0]) catch {
+        return 37;
+    };
     var cost: PriceCard = PriceCard{ id: 0, kind: 0, version: 0, effective_from: 0, found: false };
     price_card_create(&d, PRICE_KIND_COST, 1, 0, now, &"v1"[0: 2], &cost) catch {
         return 10;
@@ -113,6 +127,9 @@ export fn main() i32 {
     };
     price_entry_put(&d, cost.id, &"mock"[0: 4], &"retry-model"[0: 11], 0, 600, 1200, 300, 50, &""[0: 0]) catch {
         return 33;
+    };
+    price_entry_put(&d, cost.id, &"plug"[0: 4], &"plug-model"[0: 10], 0, 600, 1200, 300, 50, &""[0: 0]) catch {
+        return 38;
     };
     price_entry_put(&d, sell.id, &""[0: 0], &"failover-model"[0: 14], 0, 1000, 2000, 500, 100, &""[0: 0]) catch {
         return 26;
