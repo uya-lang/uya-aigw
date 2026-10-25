@@ -1,0 +1,135 @@
+// tests/test_pool.uya — A3 插件池：复用、min/max、缩容、崩溃退避、cancel、ping/pong
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+const CMD: &[byte] = &"python3 tests/plugin_echo.py"[0: 28];
+
+fn send_body(idx: i32, body: &[byte]) !void {
+    try plugin_pool_send(idx, body);
+    try plugin_pool_send(idx, &"\n"[0: 1]);
+}
+
+fn test_reuse() !void {
+    plugin_pool_shutdown();
+    try plugin_pool_init_at(CMD, 1, 2, 60000, 500, 1000);
+    try assert_eq_i32(plugin_pool_live(), 1);
+    try assert_eq_bool(plugin_pool_ready(), true);
+    const a: i32 = try plugin_pool_acquire(1000);
+    const pa: i32 = plugin_pool_pid_of(a);
+    try assert_eq_i32(plugin_pool_state_of(a), PLUGIN_POOL_STATE_BUSY);
+    try plugin_pool_ping(a, 5000);
+    plugin_pool_release(a, 1001);
+    try assert_eq_i32(plugin_pool_state_of(a), PLUGIN_POOL_STATE_IDLE);
+    // 归还后再取：还是同一个进程（插件 prompt cache 的前提）
+    const b: i32 = try plugin_pool_acquire(1002);
+    try assert_eq_i32(b, a);
+    try assert_eq_i32(plugin_pool_pid_of(b), pa);
+    try plugin_pool_ping(b, 5000);
+    plugin_pool_release(b, 1003);
+    const c: i32 = try plugin_pool_acquire(1004);
+    try assert_eq_i32(plugin_pool_pid_of(c), pa);
+    plugin_pool_release(c, 1005);
+    plugin_pool_shutdown();
+    try assert_eq_bool(plugin_pool_ready(), false);
+}
+
+fn test_max_and_exhausted() !void {
+    plugin_pool_shutdown();
+    try plugin_pool_init_at(CMD, 0, 1, 60000, 500, 2000);
+    try assert_eq_i32(plugin_pool_live(), 0);
+    const a: i32 = try plugin_pool_acquire(2000);
+    try assert_eq_i32(plugin_pool_live(), 1);
+    var exhausted: bool = false;
+    var dummy: i32 = 0;
+    dummy = plugin_pool_acquire(2000) catch |_| {
+        exhausted = true;
+        0;
+    };
+    _ = dummy;
+    try assert_eq_bool(exhausted, true);
+    plugin_pool_release(a, 2001);
+    const b: i32 = try plugin_pool_acquire(2002);
+    try assert_eq_i32(b, a);
+    plugin_pool_release(b, 2003);
+    plugin_pool_shutdown();
+}
+
+fn test_crash_backoff() !void {
+    plugin_pool_shutdown();
+    try plugin_pool_init_at(CMD, 0, 2, 60000, 1000, 3000);
+    const a: i32 = try plugin_pool_acquire(3000);
+    const pa: i32 = plugin_pool_pid_of(a);
+    try send_body(a, &"{\"id\":1,\"method\":\"crash\"}"[0: 25]);
+    // 插件退出 → 读端 EOF
+    var line: [byte: 128] = [0: 128];
+    var eof: bool = false;
+    var got: usize = 0;
+    got = plugin_pool_read_line(a, &line[0], 128, 5000) catch |_| {
+        eof = true;
+        0 as usize;
+    };
+    _ = got;
+    try assert_eq_bool(eof, true);
+    plugin_pool_mark_dead(a, 3000);
+    try assert_eq_i32(plugin_pool_crashes_of(a), 1);
+    // 退避窗口内拿不到
+    var blocked: bool = false;
+    var dummy2: i32 = 0;
+    dummy2 = plugin_pool_acquire(3000) catch |_| {
+        blocked = true;
+        0;
+    };
+    _ = dummy2;
+    try assert_eq_bool(blocked, true);
+    // 窗口过后扩容出新进程
+    const b: i32 = try plugin_pool_acquire(4001);
+    try assert_eq_bool(plugin_pool_pid_of(b) != pa, true);
+    try plugin_pool_ping(b, 5000);
+    plugin_pool_release(b, 4002);
+    plugin_pool_shutdown();
+}
+
+fn test_idle_eviction() !void {
+    plugin_pool_shutdown();
+    try plugin_pool_init_at(CMD, 1, 2, 1000, 500, 5000);
+    try assert_eq_i32(plugin_pool_live(), 1);
+    const a: i32 = try plugin_pool_acquire(5000); // 预热槽
+    const b: i32 = try plugin_pool_acquire(5000); // 扩容槽
+    try assert_eq_i32(plugin_pool_live(), 2);
+    plugin_pool_release(a, 5000);
+    plugin_pool_release(b, 5000);
+    plugin_pool_tick_at(5001); // 还没到 idle，不缩
+    try assert_eq_i32(plugin_pool_live(), 2);
+    plugin_pool_tick_at(7000); // 都超时 → 缩到 min=1
+    try assert_eq_i32(plugin_pool_live(), 1);
+    plugin_pool_tick_at(7001); // 稳定
+    try assert_eq_i32(plugin_pool_live(), 1);
+    const c: i32 = try plugin_pool_acquire(7002);
+    try plugin_pool_ping(c, 5000);
+    plugin_pool_release(c, 7003);
+    plugin_pool_shutdown();
+}
+
+fn test_cancel() !void {
+    plugin_pool_shutdown();
+    try plugin_pool_init_at(CMD, 0, 2, 60000, 500, 8000);
+    const a: i32 = try plugin_pool_acquire(8000);
+    const pa: i32 = plugin_pool_pid_of(a);
+    try send_body(a, &"{\"id\":9,\"method\":\"slow\"}"[0: 24]);
+    plugin_pool_cancel(a);
+    try assert_eq_i32(plugin_pool_state_of(a), PLUGIN_POOL_STATE_FREE);
+    try assert_eq_i32(plugin_pool_live(), 0);
+    // cancel 不计崩溃、不进退避：立刻能再取
+    const b: i32 = try plugin_pool_acquire(8001);
+    try assert_eq_bool(plugin_pool_pid_of(b) != pa, true);
+    try plugin_pool_ping(b, 5000);
+    plugin_pool_release(b, 8002);
+    plugin_pool_shutdown();
+}
+
+test "reuse" { run_test("reuse", test_reuse); }
+test "max_and_exhausted" { run_test("max_and_exhausted", test_max_and_exhausted); }
+test "crash_backoff" { run_test("crash_backoff", test_crash_backoff); }
+test "idle_eviction" { run_test("idle_eviction", test_idle_eviction); }
+test "cancel" { run_test("cancel", test_cancel); }

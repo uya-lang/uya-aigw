@@ -1,0 +1,219 @@
+// tests/test_price.uya — A2 价目表：版本生效 / 用户覆盖 / 供应商 / 分时 / 金额口径
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_i64;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+const T0: i64 = 1700000000;
+const EMPTY: &[byte] = &"x"[0: 0];
+
+fn open_db(d: &Db) !void {
+    _ = try schema_open(d, &":memory:"[0: 8]);
+}
+
+fn seed_sell(d: &Db) !void {
+    var c1: PriceCard = PriceCard{ id: 0, kind: 0, version: 0, effective_from: 0, found: false };
+    try price_card_create(d, PRICE_KIND_SELL, 1, T0, T0, &"base"[0: 4], &c1);
+    try assert_eq_i32(c1.id as i32, 1);
+    try price_entry_put(d, c1.id, EMPTY, &"gpt-4o"[0: 6], 0,
+        1500000000, 6000000000, 150000000, 0, &"daily 00:00-24:00 200%"[0: 22]);
+    try price_entry_put(d, c1.id, EMPTY, &"gpt-4o"[0: 6], 7,
+        750000000, 3000000000, 75000000, 0, EMPTY);
+}
+
+fn test_card_versions() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    try seed_sell(&d);
+    var c2: PriceCard = PriceCard{ id: 0, kind: 0, version: 0, effective_from: 0, found: false };
+    try price_card_create(&d, PRICE_KIND_SELL, 2, T0 + 1000, T0 + 1000, &"v2"[0: 2], &c2);
+    try price_entry_put(&d, c2.id, EMPTY, &"gpt-4o"[0: 6], 0,
+        2000000000, 8000000000, 200000000, 0, EMPTY);
+
+    // 生效前回落到 v1
+    var r1: PriceRates = PriceRates{
+        input_nano_per_mtok: 0, output_nano_per_mtok: 0, cache_read_nano_per_mtok: 0,
+        per_request_nano: 0, permille: 0, card_id: 0, version: 0, found: false,
+    };
+    try price_lookup(&d, PRICE_KIND_SELL, &"gpt-4o"[0: 6], EMPTY, 0, T0 + 999, 0, &r1);
+    try assert_eq_i64(r1.version, 1);
+    try assert_eq_i64(r1.input_nano_per_mtok, 1500000000);
+
+    // 到点切 v2
+    try price_lookup(&d, PRICE_KIND_SELL, &"gpt-4o"[0: 6], EMPTY, 0, T0 + 1000, 0, &r1);
+    try assert_eq_i64(r1.version, 2);
+    try assert_eq_i64(r1.input_nano_per_mtok, 2000000000);
+
+    // 卡片还不存在的时间点
+    var missing: bool = false;
+    _ = price_lookup(&d, PRICE_KIND_COST, &"gpt-4o"[0: 6], EMPTY, 0, T0, 0, &r1) catch |_| {
+        missing = true;
+    };
+    try assert_eq_bool(missing, true);
+}
+
+fn test_user_override_and_schedule() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    try seed_sell(&d);
+    var usage: PriceUsage = PriceUsage{ input_tokens: 1000, output_tokens: 500, cache_read_tokens: 2000 };
+
+    // 默认价 + 200% 分时
+    var def: PriceRates = PriceRates{
+        input_nano_per_mtok: 0, output_nano_per_mtok: 0, cache_read_nano_per_mtok: 0,
+        per_request_nano: 0, permille: 0, card_id: 0, version: 0, found: false,
+    };
+    try price_lookup(&d, PRICE_KIND_SELL, &"gpt-4o"[0: 6], EMPTY, 0, T0, 0, &def);
+    try assert_eq_i32(def.permille, 2000);
+    try assert_eq_i64(price_amount(&def, &usage), 9600000);
+
+    // 用户 7 的覆盖价：半价，且不带分时
+    var u7: PriceRates = PriceRates{
+        input_nano_per_mtok: 0, output_nano_per_mtok: 0, cache_read_nano_per_mtok: 0,
+        per_request_nano: 0, permille: 0, card_id: 0, version: 0, found: false,
+    };
+    try price_lookup(&d, PRICE_KIND_SELL, &"gpt-4o"[0: 6], EMPTY, 7, T0, 0, &u7);
+    try assert_eq_i32(u7.permille, 1000);
+    try assert_eq_i64(price_amount(&u7, &usage), 2400000);
+
+    // 用户 8 没有覆盖 → 回落默认
+    var u8: PriceRates = PriceRates{
+        input_nano_per_mtok: 0, output_nano_per_mtok: 0, cache_read_nano_per_mtok: 0,
+        per_request_nano: 0, permille: 0, card_id: 0, version: 0, found: false,
+    };
+    try price_lookup(&d, PRICE_KIND_SELL, &"gpt-4o"[0: 6], EMPTY, 8, T0, 0, &u8);
+    try assert_eq_i64(u8.input_nano_per_mtok, 1500000000);
+
+    // 没有定价的模型
+    var missing: bool = false;
+    _ = price_lookup(&d, PRICE_KIND_SELL, &"no-such"[0: 7], EMPTY, 0, T0, 0, &u8) catch |_| {
+        missing = true;
+    };
+    try assert_eq_bool(missing, true);
+}
+
+fn seed_cost(d: &Db) !void {
+    var c: PriceCard = PriceCard{ id: 0, kind: 0, version: 0, effective_from: 0, found: false };
+    try price_card_create(d, PRICE_KIND_COST, 1, T0, T0, &"cost"[0: 4], &c);
+    try price_entry_put(d, c.id, &"upstream-a"[0: 10], &"gpt-4o"[0: 6], 0,
+        1000000000, 4000000000, 100000000, 100, EMPTY);
+}
+
+fn test_cost_provider() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    try seed_cost(&d);
+    var r: PriceRates = PriceRates{
+        input_nano_per_mtok: 0, output_nano_per_mtok: 0, cache_read_nano_per_mtok: 0,
+        per_request_nano: 0, permille: 0, card_id: 0, version: 0, found: false,
+    };
+    try price_lookup(&d, PRICE_KIND_COST, &"gpt-4o"[0: 6], &"upstream-a"[0: 10], 0, T0, 0, &r);
+    var usage: PriceUsage = PriceUsage{ input_tokens: 1000, output_tokens: 500, cache_read_tokens: 2000 };
+    // 1,000,000 + 2,000,000 + 200,000 + 100
+    try assert_eq_i64(price_amount(&r, &usage), 3200100);
+
+    // 另一个供应商没价 → 不串价
+    var missing: bool = false;
+    _ = price_lookup(&d, PRICE_KIND_COST, &"gpt-4o"[0: 6], &"upstream-b"[0: 10], 0, T0, 0, &r) catch |_| {
+        missing = true;
+    };
+    try assert_eq_bool(missing, true);
+}
+
+fn test_amount_rounding() !void {
+    var r: PriceRates = PriceRates{
+        input_nano_per_mtok: 1500000,
+        output_nano_per_mtok: 0,
+        cache_read_nano_per_mtok: 0,
+        per_request_nano: 100,
+        permille: 1000,
+        card_id: 1,
+        version: 1,
+        found: true,
+    };
+    var u: PriceUsage = PriceUsage{ input_tokens: 1, output_tokens: 0, cache_read_tokens: 0 };
+    // 1 token * 1.5 nano → 四舍五入 2，再加 100
+    try assert_eq_i64(price_amount(&r, &u), 102);
+    r.permille = 1500;
+    // 102 * 1.5 = 153
+    try assert_eq_i64(price_amount(&r, &u), 153);
+    // 负 token（异常数据）按 0 计
+    u.input_tokens = 0 - 5;
+    r.permille = 1000;
+    try assert_eq_i64(price_amount(&r, &u), 100);
+}
+
+fn test_quote() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    try seed_sell(&d);
+    try seed_cost(&d);
+    var usage: PriceUsage = PriceUsage{ input_tokens: 1000, output_tokens: 500, cache_read_tokens: 2000 };
+    var cost: i64 = 0;
+    var price: i64 = 0;
+    try price_quote(&d, &"gpt-4o"[0: 6], &"upstream-a"[0: 10], 0, T0, 0, &usage, &cost, &price);
+    try assert_eq_i64(cost, 3200100);
+    try assert_eq_i64(price, 9600000);
+
+    // 缺进价 → 整体失败（由调用方决定是否降级）
+    var missing: bool = false;
+    _ = price_quote(&d, &"gpt-4o"[0: 6], &"upstream-x"[0: 10], 0, T0, 0, &usage, &cost, &price) catch |_| {
+        missing = true;
+    };
+    try assert_eq_bool(missing, true);
+}
+
+fn test_invalid_input() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    var c: PriceCard = PriceCard{ id: 0, kind: 0, version: 0, effective_from: 0, found: false };
+    var bad: bool = false;
+    _ = price_card_create(&d, 9, 1, T0, T0, EMPTY, &c) catch |_| {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+    bad = false;
+    _ = price_card_create(&d, PRICE_KIND_SELL, 0, T0, T0, EMPTY, &c) catch |_| {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+    try price_card_create(&d, PRICE_KIND_SELL, 1, T0, T0, EMPTY, &c);
+
+    // 负费率
+    bad = false;
+    _ = price_entry_put(&d, c.id, EMPTY, &"m"[0: 1], 0, 0 - 1, 0, 0, 0, EMPTY) catch |_| {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+    // 坏的分时规则
+    bad = false;
+    _ = price_entry_put(&d, c.id, EMPTY, &"m"[0: 1], 0, 1, 1, 1, 0, &"nonsense"[0: 8]) catch |_| {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+    // 空模型名
+    bad = false;
+    _ = price_entry_put(&d, c.id, EMPTY, EMPTY, 0, 1, 1, 1, 0, EMPTY) catch |_| {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+    // 超过 8 条规则
+    bad = false;
+    _ = price_entry_put(&d, c.id, EMPTY, &"m"[0: 1], 0, 1, 1, 1, 0,
+        &"daily 00:00-24:00 1x; daily 00:00-24:00 1x; daily 00:00-24:00 1x; daily 00:00-24:00 1x; daily 00:00-24:00 1x; daily 00:00-24:00 1x; daily 00:00-24:00 1x; daily 00:00-24:00 1x; daily 00:00-24:00 1x"[0: 196]) catch |_| {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+}
+
+test "card_versions" { run_test("card_versions", test_card_versions); }
+test "user_override_and_schedule" { run_test("user_override_and_schedule", test_user_override_and_schedule); }
+test "cost_provider" { run_test("cost_provider", test_cost_provider); }
+test "amount_rounding" { run_test("amount_rounding", test_amount_rounding); }
+test "quote" { run_test("quote", test_quote); }
+test "invalid_input" { run_test("invalid_input", test_invalid_input); }

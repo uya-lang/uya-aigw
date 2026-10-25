@@ -1,0 +1,51 @@
+// tests/test_spool.uya — B5 本地 spool 追加/读取/清空
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+const PATH: &[byte] = &"/tmp/aigw_spool_test_1.dat"[0: 27];
+
+fn eq(a: &[byte], b: &[byte]) bool {
+    if a.len != b.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < a.len {
+        if a[i] != b[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn test_spool() !void {
+    spool_clear(PATH);
+    var buf: [byte: 256] = [0: 256];
+    var n: usize = 0;
+    try assert_eq_bool(try spool_read(PATH, &buf[0], 256, &n), false);
+    try spool_append(PATH, &"{\"a\":1}"[0: 7]);
+    try spool_append(PATH, &"{\"b\":2}"[0: 7]);
+    try assert_eq_bool(try spool_read(PATH, &buf[0], 256, &n), true);
+    try assert_eq_i32(n as i32, 16);
+    const want: &[byte] = &"{\"a\":1}\n{\"b\":2}\n"[0: 16];
+    try assert_eq_bool(eq(buf[0: n], want), true);
+    spool_clear(PATH);
+    try assert_eq_bool(try spool_read(PATH, &buf[0], 256, &n), false);
+}
+
+fn test_try_wrappers() !void {
+    spool_clear(PATH);
+    var buf: [byte: 256] = [0: 256];
+    var n: usize = 0;
+    // 文件不存在：不抛错，返回 false
+    try assert_eq_bool(spool_try_read(PATH, &buf[0], 256, &n), false);
+    try assert_eq_bool(spool_try_append(PATH, &"{\"x\":1}"[0: 7]), true);
+    try assert_eq_bool(spool_try_read(PATH, &buf[0], 256, &n), true);
+    try assert_eq_i32(n as i32, 8);
+    spool_clear(PATH);
+    try assert_eq_bool(spool_try_read(PATH, &buf[0], 256, &n), false);
+}
+
+test "spool" { run_test("spool", test_spool); }
+test "try_wrappers" { run_test("try_wrappers", test_try_wrappers); }

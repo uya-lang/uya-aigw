@@ -1,0 +1,112 @@
+// tests/test_responses.uya — A5 responses 存储/chat 转换
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_i64;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+const T0: i64 = 1700000000;
+
+fn open_db(d: &Db) !void {
+    _ = try schema_open(d, &":memory:"[0: 8]);
+}
+
+fn contains(hay: &[byte], needle: &[byte]) bool {
+    if needle.len == 0 || hay.len < needle.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i + needle.len <= hay.len {
+        var j: usize = 0;
+        var same: bool = true;
+        while j < needle.len {
+            if hay[i + j] != needle[j] {
+                same = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if same {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn test_store_roundtrip() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    try resp_store(&d, &"resp_1"[0: 6], 7, T0, &"mock-model"[0: 10], &""[0: 0],
+        &"hello"[0: 5], &"world"[0: 5], &"{}"[0: 2]);
+    var r: RespRow = RespRow{};
+    try resp_get(&d, &"resp_1"[0: 6], &r);
+    try assert_eq_i64(r.user_id, 7);
+    try assert_eq_i64(r.created_at, T0);
+    try assert_eq_bool(r.found, true);
+    try assert_eq_i32(r.model_len as i32, 10);
+    try assert_eq_i32(r.input_len as i32, 5);
+    try assert_eq_i32(r.output_len as i32, 5);
+    var missing: bool = false;
+    _ = resp_get(&d, &"nope"[0: 4], &r) catch |_| {
+        missing = true;
+    };
+    try assert_eq_bool(missing, true);
+}
+
+fn test_build_and_parse() !void {
+    var buf: [byte: 1024] = [0: 1024];
+    // 无历史
+    var n: usize = resp_build_chat(&"m"[0: 1], &""[0: 0], &"hi"[0: 2], false, &buf[0], 1024);
+    try assert_eq_bool(n > 0, true);
+    try assert_eq_bool(contains(buf[0: n], &"\"role\":\"user\""[0: 13]), true);
+    try assert_eq_bool(contains(buf[0: n], &"\"messages\""[0: 10]), true);
+    // 带历史：assistant 在前
+    n = resp_build_chat(&"m"[0: 1], &"prev"[0: 4], &"next"[0: 4], false, &buf[0], 1024);
+    try assert_eq_bool(contains(buf[0: n], &"\"assistant\""[0: 11]), true);
+    try assert_eq_bool(contains(buf[0: n], &"\"prev\""[0: 6]), true);
+    n = resp_build_chat(&"m"[0: 1], &""[0: 0], &"s"[0: 1], true, &buf[0], 1024);
+    try assert_eq_bool(contains(buf[0: n], &"\"stream\":true"[0: 13]), true);
+    // 解析 chat 响应
+    var jd: JsonDoc = JsonDoc{};
+    try json_parse(&jd, &"{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"answer\"}}]}"[0: 65]);
+    var out: [byte: 64] = [0: 64];
+    const on: usize = resp_parse_output(&jd, json_root(&jd), &out[0], 64);
+    try assert_eq_i32(on as i32, 6);
+    try assert_eq_bool(contains(out[0: on], &"answer"[0: 6]), true);
+}
+
+fn test_augment() !void {
+    // 原 payload 末尾 '}' 前插入 tools / reasoning
+    const payload: &[byte] = &"{\"model\":\"m\",\"messages\":[],\"stream\":false}"[0: 42];
+    const src: &[byte] = &"{\"model\":\"m\",\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}}}}],\"reasoning\":{\"effort\":\"high\"},\"input\":\"hi\"}"[0: 190];
+    var out: [byte: 512] = [0: 512];
+    const n: usize = resp_augment_payload(payload, src, &out[0], 512);
+    try assert_eq_bool(n > 0, true);
+    try assert_eq_bool(contains(out[0: n], &"\"tools\":[{\"type\":\"function\""[0: 27]), true);
+    try assert_eq_bool(contains(out[0: n], &"\"get_weather\""[0: 13]), true);
+    try assert_eq_bool(contains(out[0: n], &"\"reasoning\":{\"effort\":\"high\"}"[0: 29]), true);
+    // 原字段保留
+    try assert_eq_bool(contains(out[0: n], &"\"stream\":false"[0: 14]), true);
+    // 没有可透传字段 → 返回 0（调用方保留原 payload）
+    const plain: &[byte] = &"{\"model\":\"m\",\"input\":\"hi\"}"[0: 26];
+    try assert_eq_i32(resp_augment_payload(payload, plain, &out[0], 512) as i32, 0);
+    // 容量不足 → 0
+    try assert_eq_i32(resp_augment_payload(payload, src, &out[0], 16) as i32, 0);
+    // 原始值提取：字符串/数字/嵌套数组
+    var v: [byte: 256] = [0: 256];
+    var vn: usize = resp_raw_value(src, &"input"[0: 5], &v[0], 256);
+    try assert_eq_bool(contains(v[0: vn], &"\"hi\""[0: 4]), true);
+    const src2: &[byte] = &"{\"a\":{\"b\":[1,2,{\"c\":3}]},\"n\":42,\"s\":\"a}b\"}"[0: 42];
+    vn = resp_raw_value(src2, &"a"[0: 1], &v[0], 256);
+    try assert_eq_bool(contains(v[0: vn], &"{\"b\":[1,2,{\"c\":3}]}"[0: 19]), true);
+    vn = resp_raw_value(src2, &"n"[0: 1], &v[0], 256);
+    try assert_eq_bool(contains(v[0: vn], &"42"[0: 2]), true);
+    vn = resp_raw_value(src2, &"s"[0: 1], &v[0], 256);
+    try assert_eq_bool(contains(v[0: vn], &"\"a}b\""[0: 5]), true);
+    try assert_eq_i32(resp_raw_value(src2, &"missing"[0: 7], &v[0], 256) as i32, 0);
+}
+
+test "store_roundtrip" { run_test("store_roundtrip", test_store_roundtrip); }
+test "build_and_parse" { run_test("build_and_parse", test_build_and_parse); }
+test "augment" { run_test("augment", test_augment); }

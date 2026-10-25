@@ -20,13 +20,36 @@ run src/foundation/buf.uya src/net/rsav.uya src/net/x509min.uya src/net/chainx.u
 run src/foundation/buf.uya src/net/ssex.uya tests/test_ssex.uya
 run src/net/httpc_pool.uya tests/test_httpc_pool.uya
 run src/foundation/buf.uya src/providers/http.uya tests/test_provider_http.uya
+run src/foundation/buf.uya src/providers/http.uya src/providers/upstream_cfg.uya tests/test_upstream_cfg.uya
 run src/foundation/buf.uya src/net/proxyx.uya tests/test_proxyx.uya
 run src/core/money.uya tests/test_money.uya
 run src/core/dbx.uya tests/test_dbx.uya
 run src/core/dbx.uya src/core/schema.uya tests/test_schema.uya
 run src/core/dbx.uya src/core/schema.uya src/core/store.uya tests/test_store.uya
+run src/core/dbx.uya src/core/schema.uya src/core/store.uya tests/test_provider_store.uya
+run src/core/dbx.uya src/core/schema.uya src/core/store.uya src/core/lb.uya tests/test_lb.uya
 run src/core/schedule.uya tests/test_schedule.uya
+run src/core/dbx.uya src/core/schema.uya src/core/money.uya src/core/schedule.uya src/core/price.uya tests/test_price.uya
+run src/core/dbx.uya src/core/schema.uya src/core/rollup.uya tests/test_rollup.uya
+run src/core/dbx.uya src/cluster/meta.uya tests/test_meta.uya
+run src/core/dbx.uya src/cluster/meta.uya tests/test_epoch.uya
+run src/core/dbx.uya src/cluster/meta.uya tests/test_rebalance.uya
+run src/core/dbx.uya src/cluster/meta.uya tests/test_rebalance_auto.uya
+run src/core/dbx.uya src/core/schema.uya src/core/json.uya src/core/rollup.uya src/cluster/ingest.uya tests/test_ingest.uya
+run src/core/dbx.uya src/cluster/meta.uya src/cluster/edge.uya tests/test_edge.uya
+run src/cluster/spool.uya tests/test_spool.uya
+run src/core/dbx.uya src/core/schema.uya src/core/store.uya tests/test_keys.uya
+run src/core/dbx.uya src/core/schema.uya src/core/budget.uya tests/test_budget.uya
+run src/core/dbx.uya src/core/schema.uya src/core/store.uya tests/test_admin_list.uya
+run src/core/json.uya src/core/dbx.uya src/core/schema.uya src/core/responses.uya tests/test_responses.uya
+run src/core/dbx.uya src/cluster/meta.uya src/cluster/elect.uya tests/test_elect.uya
 run src/core/dbx.uya src/core/schema.uya src/core/backup.uya tests/test_backup.uya
+run src/core/dbx.uya src/core/schema.uya src/core/backup.uya src/core/journal.uya tests/test_journal.uya
+run src/core/dbx.uya src/core/schema.uya src/core/money.uya src/core/schedule.uya src/core/store.uya src/core/backup.uya src/core/journal.uya src/core/runtime.uya tests/test_runtime.uya
+run src/plugins/pool.uya tests/test_pool.uya
+run src/core/json.uya tests/test_json.uya
+run src/core/dbx.uya src/core/schema.uya src/core/money.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/backup.uya src/core/journal.uya src/core/billing.uya tests/test_billing.uya
+run src/core/dbx.uya src/core/schema.uya src/core/store.uya src/core/money.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/backup.uya src/core/journal.uya src/core/billing.uya src/core/lb.uya src/core/responses.uya src/core/chat.uya tests/test_chat.uya
 run src/foundation/buf.uya src/net/httpsrv.uya tests/test_httpsrv.uya
 run src/foundation/buf.uya src/core/money.uya src/core/reqlog.uya tests/test_reqlog.uya
 
@@ -36,4 +59,8 @@ echo "== cli probe/pin"
 ./tests/tls_cli_spike.sh 2>&1 | grep -a "CLI-ALL-OK"
 echo "== http server (A1)"
 ./tests/serve_smoke.sh 2>&1 | grep -a "SERVE-ALL-OK"
+echo "== chat e2e (auth/route/upstream/ledger)"
+./tests/chat_e2e.sh 2>&1 | grep -a "CHAT-ALL-OK"
+./tests/cluster_e2e.sh 2>&1 | grep -a "CLUSTER-ALL-OK"
+./tests/sse_load.sh 1000 20 2>&1 | grep -a "LOAD-OK"
 echo "ALL GREEN"

@@ -102,7 +102,41 @@ fn test_chunks() !void {
     try assert_eq_bool(hsrv_body_ok(999999, 0), true);
 }
 
+fn test_authorization() !void {
+    var r: HsrvReq = HsrvReq{};
+    const raw: &[byte] = &"POST /v1/chat/completions HTTP/1.1\r\nAuthorization: Bearer sk-abc\r\nContent-Length: 2\r\n\r\n"[0: 87];
+    try assert_eq_i32(hsrv_parse_head(raw.ptr, raw.len, HSRV_HEAD_MAX, &r), 1);
+    try assert_eq_i32(r.auth_len as i32, 13);
+    try assert_eq_i32(r.auth[0] as i32, 'B' as i32);
+    try assert_eq_i32(r.auth[12] as i32, 'c' as i32);
+    // 头名大小写不敏感
+    var r2: HsrvReq = HsrvReq{};
+    const raw2: &[byte] = &"GET /x HTTP/1.1\r\nauthorization: bearer tok\r\n\r\n"[0: 46];
+    try assert_eq_i32(hsrv_parse_head(raw2.ptr, raw2.len, HSRV_HEAD_MAX, &r2), 1);
+    try assert_eq_i32(r2.auth_len as i32, 10);
+    try assert_eq_i32(r2.auth[0] as i32, 'b' as i32);
+    // 超长 Authorization 直接拒（合法的头结构，只是值 300 > 256）
+    var big: [byte: 400] = [0: 400];
+    const pre: &[byte] = &"GET /x HTTP/1.1\r\nAuthorization: "[0: 32];
+    var i: usize = 0;
+    while i < 32 {
+        big[i] = pre[i];
+        i = i + 1;
+    }
+    while i < 332 {
+        big[i] = 'a';
+        i = i + 1;
+    }
+    big[332] = 13 as byte;
+    big[333] = 10 as byte;
+    big[334] = 13 as byte;
+    big[335] = 10 as byte;
+    var r3: HsrvReq = HsrvReq{};
+    try assert_eq_i32(hsrv_parse_head(&big[0], 336, HSRV_HEAD_MAX, &r3), -1);
+}
+
 test "simple_get" { run_test("simple_get", test_simple_get); }
+test "authorization" { run_test("authorization", test_authorization); }
 test "incomplete" { run_test("incomplete", test_incomplete_then_complete); }
 test "post_cl" { run_test("post_cl", test_post_content_length); }
 test "chunked_expect" { run_test("chunked_expect", test_chunked_and_expect); }

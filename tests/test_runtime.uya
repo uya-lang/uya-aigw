@@ -1,0 +1,121 @@
+// tests/test_runtime.uya — A2 接线：启动迁移、journal 重放、每日备份时点、journal 清理
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_i64;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+const T0: i64 = 1704067200; // 2024-01-01T00:00:00Z
+const HOUR: i64 = 3600;
+const DAY: i64 = 86400;
+const DIR: &const byte = "/tmp/aigw_runtime_test" as &const byte;
+
+fn unlink_if_exists(c: &const byte) void {
+    _ = sys_unlink(c as *const byte) catch {};
+}
+
+fn prep() void {
+    _ = sys_mkdir(DIR as *const byte, 493 as i32) catch {};
+    unlink_if_exists("/tmp/aigw_runtime_test/aigw.db" as &const byte);
+    unlink_if_exists("/tmp/aigw_runtime_test/aigw.db-wal" as &const byte);
+    unlink_if_exists("/tmp/aigw_runtime_test/aigw.db-shm" as &const byte);
+    unlink_if_exists("/tmp/aigw_runtime_test/aigw-20240101.db" as &const byte);
+    unlink_if_exists("/tmp/aigw_runtime_test/aigw-20240102.db" as &const byte);
+    unlink_if_exists("/tmp/aigw_runtime_test/aigw-journal-20240101.log" as &const byte);
+    unlink_if_exists("/tmp/aigw_runtime_test/aigw-journal-20231231.log" as &const byte);
+    unlink_if_exists("/tmp/aigw_runtime_test/aigw-journal-20231223.log" as &const byte);
+    runtime_shutdown();
+}
+
+fn file_exists(c: &const byte) bool {
+    const r: !i32 = sys_open(c as *const byte, 0 as i32, 0);
+    const fd: i32 = r catch {
+        return false;
+    };
+    _ = sys_close(fd) catch {};
+    return true;
+}
+
+fn count(d: &Db) i64 {
+    var st: DbStmt = dbx_prepare(d, "select count(*) from usage_ledger" as &const byte) catch {
+        return 0 - 1;
+    };
+    defer { dbx_finalize(&st); }
+    if dbx_step(&st) != 1 {
+        return 0 - 1;
+    }
+    return dbx_col_i64(&st, 0);
+}
+
+fn test_setup_migrates_and_backs_up() !void {
+    prep();
+    try runtime_setup_at(&"/tmp/aigw_runtime_test/aigw.db"[0: 30], &"/tmp/aigw_runtime_test"[0: 22], T0 + 4 * HOUR);
+    try assert_eq_bool(runtime_ready(), true);
+    try assert_eq_i32(schema_current(runtime_db()), SCHEMA_VERSION);
+    // 04:00 已过 03:00 → 启动即做当天备份
+    try assert_eq_bool(file_exists("/tmp/aigw_runtime_test/aigw-20240101.db" as &const byte), true);
+    // 重复初始化报错（避免第二次 open 泄漏）
+    var dup: bool = false;
+    _ = runtime_setup_at(&"/tmp/aigw_runtime_test/aigw.db"[0: 30], &"/tmp/aigw_runtime_test"[0: 22], T0) catch |_| {
+        dup = true;
+    };
+    try assert_eq_bool(dup, true);
+    runtime_shutdown();
+    try assert_eq_bool(runtime_ready(), false);
+}
+
+fn test_setup_replays_journal() !void {
+    prep();
+    var p: [byte: 512] = [0: 512];
+    const pn: usize = journal_path(&"/tmp/aigw_runtime_test"[0: 22], T0, &p[0], 512);
+    try journal_append(p[0: pn], &"boot-1"[0: 6], 1, &"gpt-4o"[0: 6], &"up"[0: 2],
+        T0, 10, 5, 2, 100, 200, &"default"[0: 7], 3);
+    try runtime_setup_at(&"/tmp/aigw_runtime_test/aigw.db"[0: 30], &"/tmp/aigw_runtime_test"[0: 22], T0 + 4 * HOUR);
+    try assert_eq_i64(count(runtime_db()), 1);
+    // 再启动一次（模拟重启）重放仍然幂等
+    runtime_shutdown();
+    try runtime_setup_at(&"/tmp/aigw_runtime_test/aigw.db"[0: 30], &"/tmp/aigw_runtime_test"[0: 22], T0 + 4 * HOUR);
+    try assert_eq_i64(count(runtime_db()), 1);
+    runtime_shutdown();
+}
+
+fn test_backup_timing() !void {
+    prep();
+    const day1: &const byte = "/tmp/aigw_runtime_test/aigw-20240101.db" as &const byte;
+    // 02:00：还没到备份时点
+    try runtime_setup_at(&"/tmp/aigw_runtime_test/aigw.db"[0: 30], &"/tmp/aigw_runtime_test"[0: 22], T0 + 2 * HOUR);
+    try assert_eq_bool(file_exists(day1), false);
+    // 03:01：到点，补一次
+    runtime_tick_at(T0 + 3 * HOUR + 60);
+    try assert_eq_bool(file_exists(day1), true);
+    // 同一天再 tick：不重复备份（删掉文件也不会重建）
+    unlink_if_exists(day1);
+    runtime_tick_at(T0 + 5 * HOUR);
+    try assert_eq_bool(file_exists(day1), false);
+    // 次日 04:00：新的一份
+    runtime_tick_at(T0 + DAY + 4 * HOUR);
+    try assert_eq_bool(file_exists("/tmp/aigw_runtime_test/aigw-20240102.db" as &const byte), true);
+    runtime_shutdown();
+}
+
+fn test_journal_prune_on_setup() !void {
+    prep();
+    var p: [byte: 512] = [0: 512];
+    var pn: usize = journal_path(&"/tmp/aigw_runtime_test"[0: 22], T0 - 9 * DAY, &p[0], 512);
+    try journal_append(p[0: pn], &"old"[0: 3], 1, &"m"[0: 1], &"up"[0: 2],
+        T0 - 9 * DAY, 1, 1, 0, 0, 0, &""[0: 0], 1);
+    pn = journal_path(&"/tmp/aigw_runtime_test"[0: 22], T0, &p[0], 512);
+    try journal_append(p[0: pn], &"new"[0: 3], 1, &"m"[0: 1], &"up"[0: 2],
+        T0, 1, 1, 0, 0, 0, &""[0: 0], 1);
+    try runtime_setup_at(&"/tmp/aigw_runtime_test/aigw.db"[0: 30], &"/tmp/aigw_runtime_test"[0: 22], T0 + 4 * HOUR);
+    // 当天的留下，9 天前的被清理
+    try assert_eq_bool(file_exists("/tmp/aigw_runtime_test/aigw-journal-20240101.log" as &const byte), true);
+    try assert_eq_bool(file_exists("/tmp/aigw_runtime_test/aigw-journal-20231223.log" as &const byte), false);
+    // 只重放了 8 天窗口内的一条
+    try assert_eq_i64(count(runtime_db()), 1);
+    runtime_shutdown();
+}
+
+test "setup_migrates_and_backs_up" { run_test("setup_migrates_and_backs_up", test_setup_migrates_and_backs_up); }
+test "setup_replays_journal" { run_test("setup_replays_journal", test_setup_replays_journal); }
+test "backup_timing" { run_test("backup_timing", test_backup_timing); }
+test "journal_prune_on_setup" { run_test("journal_prune_on_setup", test_journal_prune_on_setup); }

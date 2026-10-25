@@ -1,0 +1,49 @@
+// tests/test_elect.uya — B1 A/S 选主与 standby 不备份
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+const T0: i64 = 1700000000;
+
+fn open_meta(d: &Db) !void {
+    try meta_open(d, &":memory:"[0: 8]);
+}
+
+fn eq(a: &[byte], b: &[byte]) bool {
+    if a.len != b.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < a.len {
+        if a[i] != b[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn test_failover() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_meta(&d);
+    try assert_eq_i32(try elect_tick(&d, &"node-a"[0: 6], T0, 30), ELECT_LEADER);
+    try assert_eq_i32(try elect_tick(&d, &"node-b"[0: 6], T0, 30), ELECT_STANDBY);
+    var lb: [byte: 64] = [0: 64];
+    var ln: usize = try elect_leader(&d, T0, &lb[0], 64);
+    try assert_eq_bool(eq(lb[0: ln], &"node-a"[0: 6]), true);
+    // a 续租仍是 leader
+    try assert_eq_i32(try elect_tick(&d, &"node-a"[0: 6], T0 +% 10, 30), ELECT_LEADER);
+    // 租约过期后 b 接管
+    try assert_eq_i32(try elect_tick(&d, &"node-b"[0: 6], T0 +% 100, 30), ELECT_LEADER);
+    ln = try elect_leader(&d, T0 +% 100, &lb[0], 64);
+    try assert_eq_bool(eq(lb[0: ln], &"node-b"[0: 6]), true);
+}
+
+fn test_backup_gate() !void {
+    try assert_eq_bool(elect_may_backup(ELECT_LEADER), true);
+    try assert_eq_bool(elect_may_backup(ELECT_STANDBY), false);
+}
+
+test "failover" { run_test("failover", test_failover); }
+test "backup_gate" { run_test("backup_gate", test_backup_gate); }

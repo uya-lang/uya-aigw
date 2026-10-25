@@ -160,6 +160,26 @@ fn step_stream(ctx: &HtcCtx, cfg: &const HttppConfig, now: u64) i32 {
 }
 
 
+/// A4：upstream_post 与 serve 共用（非流式 POST，状态码 + 响应体）。
+fn step_upstream(ctx: &HtcCtx, cfg: &const HttppConfig, now: u64) i32 {
+    var out: [byte: 4096] = [0: 4096];
+    var st: i32 = 0;
+    var got: usize = 0;
+    const payload: &[byte] = &"{\"model\":\"x\"}"[0: 14];
+    const r: !void = upstream_post(ctx, cfg, &"/v1/chat/completions"[0: 20], payload,
+        now, now +% (5000 as u64), &out[0], 4096, &st, &got);
+    _ = r catch |_| {
+        printf("UPSTREAM-FAIL post\n" as *byte);
+        return 12;
+    };
+    if st != 200 || got == 0 || out[0] != ('{' as byte) {
+        printf("UPSTREAM-FAIL status=%d got=%d\n" as *byte, st, got as i32);
+        return 13;
+    }
+    printf("UPSTREAM-OK status=%d got=%d\n" as *byte, st, got as i32);
+    return 0;
+}
+
 /// TLS-09E：上游发一条事件后**不再发**（半开）。空闲超时必须让它返回 0 而不是挂住。
 fn step_stall(ctx: &HtcCtx, cfg: &const HttppConfig, now: u64) i32 {
     var call: HtcCall = HtcCall{};
@@ -233,6 +253,10 @@ export fn main() i32 {
         return rc;
     }
     rc = step_stream(&ctx, &cfg, now);
+    if rc != 0 {
+        return rc;
+    }
+    rc = step_upstream(&ctx, &cfg, now);
     if rc != 0 {
         return rc;
     }

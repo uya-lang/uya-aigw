@@ -1,0 +1,81 @@
+// tests/test_keys.uya — A2/B5 Key 列表与撤销（含越权保护）
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+const T0: i64 = 1700000000;
+
+fn open_db(d: &Db) !void {
+    _ = try schema_open(d, &":memory:"[0: 8]);
+}
+
+fn eq(a: &[byte], b: &[byte]) bool {
+    if a.len != b.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < a.len {
+        if a[i] != b[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn test_list_and_revoke() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    var u: StoreUser = StoreUser{ id: 0, status: 0, found: false };
+    try store_create_user(&d, &"k@example.com"[0: 13], &"u0000000001"[0: 11], T0, &u);
+    var t1: [byte: 64] = [0: 64];
+    const n1: usize = try store_create_key(&d, u.id, &"first"[0: 5], T0, &t1[0], 64);
+    var t2: [byte: 64] = [0: 64];
+    _ = try store_create_key(&d, u.id, &"second"[0: 6], T0 +% 1, &t2[0], 64);
+    var rows: [StoreKeyRow: 8] = [];
+    var n: usize = try store_list_keys(&d, u.id, &rows[0], 8);
+    try assert_eq_i32(n as i32, 2);
+    try assert_eq_bool(eq(rows[0].name[0: rows[0].name_len], &"first"[0: 5]), true);
+    try assert_eq_i32(rows[0].revoked_at as i32, 0);
+    try assert_eq_bool(eq(rows[1].name[0: rows[1].name_len], &"second"[0: 6]), true);
+    // 撤销第二把
+    try assert_eq_bool(try store_revoke_key_owned(&d, rows[1].key_id, u.id, T0 +% 10), true);
+    n = try store_list_keys(&d, u.id, &rows[0], 8);
+    try assert_eq_i32(n as i32, 2);
+    try assert_eq_i32(rows[1].revoked_at as i32, (T0 +% 10) as i32);
+    // 撤销后校验失败
+    var k: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
+    var bad: bool = false;
+    store_verify_key(&d, t2[0: n1], &k) catch |_| {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+    // 第一把仍可用
+    try store_verify_key(&d, t1[0: n1], &k);
+    try assert_eq_i32(k.user_id as i32, u.id as i32);
+    // 重复撤销返回 false
+    try assert_eq_bool(try store_revoke_key_owned(&d, rows[1].key_id, u.id, T0 +% 11), false);
+}
+
+fn test_revoke_ownership() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    var a: StoreUser = StoreUser{ id: 0, status: 0, found: false };
+    try store_create_user(&d, &"a@example.com"[0: 13], &"u0000000001"[0: 11], T0, &a);
+    var b: StoreUser = StoreUser{ id: 0, status: 0, found: false };
+    try store_create_user(&d, &"b@example.com"[0: 13], &"u0000000002"[0: 11], T0, &b);
+    var t: [byte: 64] = [0: 64];
+    _ = try store_create_key(&d, a.id, &"a-key"[0: 5], T0, &t[0], 64);
+    var rows: [StoreKeyRow: 4] = [];
+    const n: usize = try store_list_keys(&d, a.id, &rows[0], 4);
+    try assert_eq_i32(n as i32, 1);
+    // b 不能撤销 a 的 Key
+    try assert_eq_bool(try store_revoke_key_owned(&d, rows[0].key_id, b.id, T0), false);
+    // a 可以
+    try assert_eq_bool(try store_revoke_key_owned(&d, rows[0].key_id, a.id, T0), true);
+}
+
+test "list_and_revoke" { run_test("list_and_revoke", test_list_and_revoke); }
+test "revoke_ownership" { run_test("revoke_ownership", test_revoke_ownership); }

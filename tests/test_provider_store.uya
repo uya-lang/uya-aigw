@@ -1,0 +1,160 @@
+// tests/test_provider_store.uya — A4 schema v4：供应商与模型路由
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_i64;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+const T0: i64 = 1700000000;
+
+fn open_db(d: &Db) !void {
+    _ = try schema_open(d, &":memory:"[0: 8]);
+}
+
+fn eq(a: &[byte], lit: &[byte]) bool {
+    if a.len != lit.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < a.len {
+        if a[i] != lit[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn table_exists(d: &Db, name: &[byte]) bool {
+    var st: DbStmt = dbx_prepare(d,
+        "select count(*) from sqlite_master where type = 'table' and name = ?" as &const byte) catch {
+        return false;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, name) catch {
+        return false;
+    };
+    if dbx_step(&st) != 1 {
+        return false;
+    }
+    return dbx_col_i64(&st, 0) == 1;
+}
+
+fn test_schema_v4() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    try assert_eq_i32(schema_current(&d), SCHEMA_VERSION);
+    try assert_eq_bool(table_exists(&d, &"providers"[0: 9]), true);
+    try assert_eq_bool(table_exists(&d, &"provider_models"[0: 15]), true);
+}
+
+fn test_create_and_find() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    var p: StoreProvider = StoreProvider{};
+    try store_provider_create(&d, &"mock"[0: 4], &"127.0.0.1"[0: 9], 18080, T0, &p);
+    try assert_eq_i64(p.id, 1);
+    try assert_eq_bool(p.found, true);
+    try assert_eq_bool(p.enabled, true);
+    try assert_eq_i32(p.port, 18080);
+    try assert_eq_i32(p.auth_type, 1);
+    try assert_eq_i32(p.timeout_ms, 60000);
+    try assert_eq_i32(p.priority, 100);
+    try assert_eq_i32(p.weight, 1);
+    try assert_eq_bool(eq(p.name[0: p.name_len], &"mock"[0: 4]), true);
+    try assert_eq_bool(eq(p.kind[0: p.kind_len], &"openai"[0: 6]), true);
+    try assert_eq_bool(eq(p.scheme[0: p.scheme_len], &"https"[0: 5]), true);
+    try assert_eq_bool(eq(p.auth_name[0: p.auth_name_len], &"Authorization"[0: 13]), true);
+
+    var f: StoreProvider = StoreProvider{};
+    try store_provider_find(&d, &"mock"[0: 4], &f);
+    try assert_eq_i64(f.id, 1);
+    try assert_eq_i32(f.port, 18080);
+
+    var missing: bool = false;
+    _ = store_provider_find(&d, &"nope"[0: 4], &f) catch |_| {
+        missing = true;
+    };
+    try assert_eq_bool(missing, true);
+
+    var dup: bool = false;
+    _ = store_provider_create(&d, &"mock"[0: 4], &"127.0.0.2"[0: 9], 18080, T0, &p) catch |_| {
+        dup = true;
+    };
+    try assert_eq_bool(dup, true);
+}
+
+fn test_auth_and_disable() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    var p: StoreProvider = StoreProvider{};
+    try store_provider_create(&d, &"mock"[0: 4], &"127.0.0.1"[0: 9], 18080, T0, &p);
+    try store_provider_set_auth(&d, p.id, 2, &"x-api-key"[0: 9], &"literal:sk-test"[0: 15], T0 + 1);
+    var g: StoreProvider = StoreProvider{};
+    try store_provider_get(&d, p.id, &g);
+    try assert_eq_i32(g.auth_type, 2);
+    try assert_eq_bool(eq(g.auth_name[0: g.auth_name_len], &"x-api-key"[0: 9]), true);
+    try assert_eq_bool(eq(g.secret[0: g.secret_len], &"literal:sk-test"[0: 15]), true);
+
+    try store_provider_set_enabled(&d, p.id, false, T0 + 2);
+    try store_provider_get(&d, p.id, &g);
+    try assert_eq_bool(g.enabled, false);
+    try store_provider_set_priority(&d, p.id, 10, 3, T0 + 2);
+    try store_provider_get(&d, p.id, &g);
+    try assert_eq_i32(g.priority, 10);
+    try assert_eq_i32(g.weight, 3);
+
+    var missing: bool = false;
+    _ = store_provider_set_enabled(&d, 999, false, T0 + 3) catch |_| {
+        missing = true;
+    };
+    try assert_eq_bool(missing, true);
+}
+
+fn test_route() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    var p1: StoreProvider = StoreProvider{};
+    var p2: StoreProvider = StoreProvider{};
+    try store_provider_create(&d, &"alpha"[0: 5], &"127.0.0.1"[0: 9], 18081, T0, &p1);
+    try store_provider_create(&d, &"beta"[0: 4], &"127.0.0.1"[0: 9], 18082, T0, &p2);
+    try store_provider_model_put(&d, p1.id, &"gpt-4o"[0: 6], &"gpt-4o-2024"[0: 11], T0);
+    try store_provider_model_put(&d, p2.id, &"gpt-4o"[0: 6], &"gpt-4o-mini"[0: 11], T0);
+
+    var r: StoreProvider = StoreProvider{};
+    var up: [byte: 128] = [0: 128];
+    var upn: usize = 0;
+    var ok: bool = try store_provider_route(&d, &"gpt-4o"[0: 6], &r, &up[0], 128, &upn);
+    try assert_eq_bool(ok, true);
+    try assert_eq_i64(r.id, p1.id);
+    try assert_eq_bool(eq(up[0: upn], &"gpt-4o-2024"[0: 11]), true);
+
+    // 同一 (provider, model) 覆盖
+    try store_provider_model_put(&d, p1.id, &"gpt-4o"[0: 6], &"gpt-4o-new"[0: 10], T0 + 1);
+    ok = try store_provider_route(&d, &"gpt-4o"[0: 6], &r, &up[0], 128, &upn);
+    try assert_eq_bool(ok, true);
+    try assert_eq_bool(eq(up[0: upn], &"gpt-4o-new"[0: 10]), true);
+
+    ok = try store_provider_route(&d, &"unknown"[0: 7], &r, &up[0], 128, &upn);
+    try assert_eq_bool(ok, false);
+
+    // 停用 p1 后路由到 p2
+    try store_provider_set_enabled(&d, p1.id, false, T0 + 2);
+    ok = try store_provider_route(&d, &"gpt-4o"[0: 6], &r, &up[0], 128, &upn);
+    try assert_eq_bool(ok, true);
+    try assert_eq_i64(r.id, p2.id);
+    try assert_eq_bool(eq(up[0: upn], &"gpt-4o-mini"[0: 11]), true);
+
+    // 全停用 → 无路由
+    try store_provider_set_enabled(&d, p2.id, false, T0 + 3);
+    ok = try store_provider_route(&d, &"gpt-4o"[0: 6], &r, &up[0], 128, &upn);
+    try assert_eq_bool(ok, false);
+}
+
+test "schema_version" { run_test("schema_version", test_schema_v4); }
+test "create_and_find" { run_test("create_and_find", test_create_and_find); }
+test "auth_and_disable" { run_test("auth_and_disable", test_auth_and_disable); }
+test "route" { run_test("route", test_route); }

@@ -35,20 +35,33 @@ fail() {
 mkdir -p build
 rm -f build/aigw
 # 构建失败不能静默复用旧二进制（曾经因此把「旧行为」当成新代码来诊断）。
-if ! UYA_ROOT="$UYA_ROOT" "$UYA" build \
-  src/foundation/buf.uya src/net/httpsrv.uya src/net/tcpx.uya src/net/serve.uya \
-  src/core/money.uya src/core/reqlog.uya src/core/dbx.uya src/net/rsav.uya \
-  src/net/x509min.uya src/net/chainx.uya src/net/urlx.uya src/net/dnsx.uya \
-  src/net/tlsx.uya src/net/tlsx_conn.uya src/net/httpc.uya src/net/ssex.uya \
-  src/net/httpc_pool.uya src/net/proxyx.uya src/providers/http.uya \
-  src/providers/httpcall.uya src/cli/tls_cmd.uya src/app.uya \
-  -o build/aigw >"$TMP/build.log" 2>&1; then
-  cat "$TMP/build.log" >&2
-  fail "build"
+build_aigw() {
+  UYA_ROOT="$UYA_ROOT" "$UYA" build \
+    src/foundation/buf.uya src/net/httpsrv.uya src/net/tcpx.uya src/net/serve.uya \
+    src/core/money.uya src/core/reqlog.uya src/core/dbx.uya src/cluster/meta.uya src/cluster/elect.uya src/cluster/uplink.uya src/cluster/edge.uya src/cluster/spool.uya src/cluster/ingest.uya src/net/ui.uya src/net/rsav.uya \
+    src/core/schema.uya src/core/store.uya src/core/budget.uya src/core/backup.uya src/core/journal.uya \
+    src/core/runtime.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/rollup.uya \
+  src/core/billing.uya src/core/lb.uya src/core/responses.uya src/core/chat.uya src/providers/upstream.uya \
+  src/providers/upstream_cfg.uya \
+    src/net/x509min.uya src/net/chainx.uya src/net/urlx.uya src/net/dnsx.uya \
+    src/net/tlsx.uya src/net/tlsx_conn.uya src/net/httpc.uya src/net/ssex.uya \
+    src/net/httpc_pool.uya src/net/proxyx.uya src/providers/http.uya \
+    src/providers/httpcall.uya src/cli/tls_cmd.uya src/app.uya \
+    -o build/aigw
+}
+if ! build_aigw >"$TMP/build.log" 2>&1; then
+  # Uya 0.11 的 .uyacache 按 `uya_cimport_N.o` 位置命名：新增 @c_import 后
+  # 旧对象可能错配（make 按 mtime 认为不用重编）。清一次缓存重试。
+  rm -rf .uyacache
+  if ! build_aigw >"$TMP/build.log" 2>&1; then
+    cat "$TMP/build.log" >&2
+    fail "build"
+  fi
 fi
 [ -x build/aigw ] || fail "build produced no binary"
 
-./build/aigw serve --host 127.0.0.1 --port 0 >"$TMP/serve.log" 2>&1 &
+./build/aigw serve --host 127.0.0.1 --port 0 \
+  --db "$TMP/data/aigw.db" --data-dir "$TMP/data" >"$TMP/serve.log" 2>&1 &
 PID=$!
 
 # 等服务端打印真实端口（最多 10 s）
@@ -61,6 +74,8 @@ for _ in $(seq 1 200); do
 done
 [ -n "$PORT" ] || fail "no listen port reported"
 [ "$PORT" != "0" ] || fail "port 0 not resolved"
+# A2 接线：启动流程必须真的打开/迁移了数据库
+[ -f "$TMP/data/aigw.db" ] || fail "database not created by serve startup"
 
 BASE="http://127.0.0.1:$PORT"
 
@@ -75,7 +90,16 @@ case "$MODELS" in
   *) fail "models body=[$MODELS]" ;;
 esac
 
-# 3) 未知路径 404
+# 3) chat 路由：body 采集 + Bearer 鉴权（假 Key → 401）
+CODE=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' -X POST \
+  -H 'Authorization: Bearer sk-test' --data '{"model":"gpt-4o","stream":true}' \
+  "$BASE/v1/chat/completions")
+[ "$CODE" = "401" ] || fail "chat route expected 401, got $CODE"
+CODE=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' -X POST \
+  --data '{"model":"gpt-4o"}' "$BASE/v1/chat/completions")
+[ "$CODE" = "401" ] || fail "chat route without auth expected 401, got $CODE"
+
+# 4) 未知路径 404
 CODE=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$BASE/nope")
 [ "$CODE" = "404" ] || fail "404 expected, got $CODE"
 

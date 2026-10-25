@@ -1,0 +1,152 @@
+// tests/test_chat.uya — A4 chat 编排：路由、上游请求重写、usage 结算
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_i64;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+use libc.syscall;
+
+const T0: i64 = 1700000000;
+const DIR: &[byte] = &"/tmp/aigw_chat_test"[0: 19];
+
+fn open_db(d: &Db) !void {
+    _ = try schema_open(d, &":memory:"[0: 8]);
+}
+
+fn prep() void {
+    _ = sys_mkdir("/tmp/aigw_chat_test" as *const byte, 493) catch {};
+    var p: [byte: 512] = [0: 512];
+    const pn: usize = journal_path(DIR, T0, &p[0], 512);
+    _ = pn;
+    _ = sys_unlink(&p[0] as *const byte) catch {};
+}
+
+fn setup(d: &Db) !void {
+    var p: StoreProvider = StoreProvider{};
+    try store_provider_create(d, &"mock"[0: 4], &"127.0.0.1"[0: 9], 18080, T0, &p);
+    try store_provider_model_put(d, p.id, &"gpt-4o"[0: 6], &"gpt-4o-2024"[0: 11], T0);
+    var sell: PriceCard = PriceCard{ id: 0, kind: 0, version: 0, effective_from: 0, found: false };
+    try price_card_create(d, PRICE_KIND_SELL, 1, 0, T0, &"v1"[0: 2], &sell);
+    try price_entry_put(d, sell.id, &""[0: 0], &"gpt-4o"[0: 6], 0, 1000, 2000, 500, 100, &""[0: 0]);
+    var cost: PriceCard = PriceCard{ id: 0, kind: 0, version: 0, effective_from: 0, found: false };
+    try price_card_create(d, PRICE_KIND_COST, 1, 0, T0, &"v1"[0: 2], &cost);
+    try price_entry_put(d, cost.id, &"mock"[0: 4], &"gpt-4o"[0: 6], 0, 600, 1200, 300, 50, &""[0: 0]);
+}
+
+fn contains(hay: &[byte], needle: &[byte]) bool {
+    if needle.len == 0 || hay.len < needle.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i + needle.len <= hay.len {
+        var j: usize = 0;
+        var same: bool = true;
+        while j < needle.len {
+            if hay[i + j] != needle[j] {
+                same = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if same {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn test_prepare() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    try setup(&d);
+    var plan: ChatPlan = ChatPlan{};
+    try chat_prepare(&d, &"{\"model\":\"gpt-4o\",\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"[0: 76], T0, &plan);
+    try assert_eq_i32(plan.model_len as i32, 6);
+    try assert_eq_i32(plan.upstream_len as i32, 11);
+    try assert_eq_bool(contains(plan.upstream_model[0: plan.upstream_len], &"gpt-4o-2024"[0: 11]), true);
+    try assert_eq_bool(contains(plan.host[0: plan.host_len], &"127.0.0.1"[0: 9]), true);
+    try assert_eq_i32(plan.port, 18080);
+    try assert_eq_bool(plan.stream, true);
+    try assert_eq_i32(plan.path_len as i32, 20);
+    try assert_eq_bool(contains(plan.path[0: plan.path_len], &"/v1/chat/completions"[0: 20]), true);
+    // 上游请求体：model 已换成上游名，messages 原样保留
+    try assert_eq_bool(contains(plan.payload[0: plan.payload_len], &"\"model\":\"gpt-4o-2024\""[0: 21]), true);
+    try assert_eq_bool(contains(plan.payload[0: plan.payload_len], &"\"messages\""[0: 10]), true);
+
+    // 非流式
+    var plan2: ChatPlan = ChatPlan{};
+    try chat_prepare(&d, &"{\"model\":\"gpt-4o\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"[0: 62], T0, &plan2);
+    try assert_eq_bool(plan2.stream, false);
+    try assert_eq_bool(contains(plan2.payload[0: plan2.payload_len], &"\"model\":\"gpt-4o-2024\""[0: 21]), true);
+}
+
+fn test_prepare_errors() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    try setup(&d);
+    var plan: ChatPlan = ChatPlan{};
+    var bad: bool = false;
+    _ = chat_prepare(&d, &"{"[0: 1], T0, &plan) catch |_| {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+    bad = false;
+    _ = chat_prepare(&d, &"{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"[0: 45], T0, &plan) catch |_| {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+    bad = false;
+    _ = chat_prepare(&d, &"{\"model\":\"unknown\",\"messages\":[]}"[0: 33], T0, &plan) catch |_| {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+}
+
+fn test_settle() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    try setup(&d);
+    prep();
+    var plan: ChatPlan = ChatPlan{};
+    try chat_prepare(&d, &"{\"model\":\"gpt-4o\",\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"[0: 76], T0, &plan);
+    var r: BillingResult = BillingResult{ cost_nano: 0, price_nano: 0, rate_version: 0, duplicate: false, found: false };
+    try chat_settle(&d, DIR, &"chat-1"[0: 6], 7, T0, 0, &plan,
+        &"{\"id\":\"chatcmpl-1\",\"usage\":{\"prompt_tokens\":100000,\"completion_tokens\":50000,\"prompt_tokens_details\":{\"cached_tokens\":10000}}}"[0: 126], &r);
+    try assert_eq_bool(r.found, true);
+    try assert_eq_bool(r.duplicate, false);
+    try assert_eq_i64(r.cost_nano, 173);
+    try assert_eq_i64(r.price_nano, 305);
+    var n: i64 = 0;
+    try assert_eq_i32(dbx_scalar_i64(&d, &"select count(*) from usage_ledger"[0: 33], &n), 0);
+    try assert_eq_i64(n, 1);
+
+    // 重复请求幂等
+    try chat_settle(&d, DIR, &"chat-1"[0: 6], 7, T0, 0, &plan,
+        &"{\"id\":\"chatcmpl-1\",\"usage\":{\"prompt_tokens\":100000,\"completion_tokens\":50000,\"prompt_tokens_details\":{\"cached_tokens\":10000}}}"[0: 126], &r);
+    try assert_eq_bool(r.duplicate, true);
+
+    // 没有 usage → ChatNoUsage
+    var bad: bool = false;
+    _ = chat_settle(&d, DIR, &"chat-2"[0: 6], 7, T0, 0, &plan, &"{\"id\":\"x\"}"[0: 10], &r) catch |_| {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+}
+
+fn test_bearer() !void {
+    var tok: [byte: 64] = [0: 64];
+    try assert_eq_i32(chat_bearer(&"Bearer sk-abc"[0: 13], &tok[0], 64) as i32, 6);
+    try assert_eq_i32(tok[0] as i32, 's' as i32);
+    try assert_eq_i32(tok[5] as i32, 'c' as i32);
+    try assert_eq_i32(chat_bearer(&"bearer   tok"[0: 12], &tok[0], 64) as i32, 3);
+    try assert_eq_i32(chat_bearer(&"Basic sk"[0: 8], &tok[0], 64) as i32, 0);
+    try assert_eq_i32(chat_bearer(&"Bearer"[0: 6], &tok[0], 64) as i32, 0);
+}
+
+test "prepare" { run_test("prepare", test_prepare); }
+test "bearer" { run_test("bearer", test_bearer); }
+test "prepare_errors" { run_test("prepare_errors", test_prepare_errors); }
+test "settle" { run_test("settle", test_settle); }

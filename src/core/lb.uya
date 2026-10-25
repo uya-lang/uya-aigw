@@ -1,0 +1,179 @@
+// src/core/lb.uya — A8 供应商选择：优先级 + 会话亲和 + 加权 + 熔断
+//
+// 选择规则：
+//   1. 只看 enabled 且有该模型映射的 provider；
+//   2. 跳过熔断中的 provider（失败 LB_MAX_FAILS 次 → 禁用 LB_COOLDOWN_SEC 秒）；
+//   3. 取 priority 最小的那组（数值越小越优先）；
+//   4. 组内按 weight 加权，用 session 的稳定哈希选一个 —— 同一 session 永远落同一
+//      provider（亲和），不同 session 按权重分摊。
+//
+// 熔断状态是进程内内存（重启清零）；健康检查/重建由调用方 report。
+
+export const LB_MAX_PROVIDERS: usize = 64;
+export const LB_MAX_FAILS: i32 = 2;
+export const LB_COOLDOWN_SEC: i64 = 30;
+
+export error LbFailed;
+
+struct LbState {
+    id: i64,
+    fails: i32,
+    open_until: i64,
+    used: bool,
+}
+
+struct LbCand {
+    id: i64,
+    weight: i32,
+}
+
+var g_lb: [LbState: LB_MAX_PROVIDERS] = [];
+
+export fn lb_reset() void {
+    var i: usize = 0;
+    while i < LB_MAX_PROVIDERS {
+        g_lb[i].used = false;
+        g_lb[i].id = 0;
+        g_lb[i].fails = 0;
+        g_lb[i].open_until = 0;
+        i = i + 1;
+    }
+}
+
+fn lb_slot(id: i64) &LbState {
+    var i: usize = 0;
+    while i < LB_MAX_PROVIDERS {
+        if g_lb[i].used && g_lb[i].id == id {
+            return &g_lb[i];
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < LB_MAX_PROVIDERS {
+        if !g_lb[i].used {
+            g_lb[i].used = true;
+            g_lb[i].id = id;
+            g_lb[i].fails = 0;
+            g_lb[i].open_until = 0;
+            return &g_lb[i];
+        }
+        i = i + 1;
+    }
+    return &g_lb[0];
+}
+
+/// 上报一次调用结果：成功清零，失败累计到阈值后熔断。
+export fn lb_report(id: i64, ok: bool, now: i64) void {
+    const s: &LbState = lb_slot(id);
+    if ok {
+        s.fails = 0;
+        s.open_until = 0;
+        return;
+    }
+    s.fails = s.fails +% 1;
+    if s.fails >= LB_MAX_FAILS {
+        s.open_until = now +% LB_COOLDOWN_SEC;
+    }
+}
+
+/// 强制熔断（一次硬失败后重试换 provider 用）。
+export fn lb_block_for(id: i64, now: i64, secs: i64) void {
+    const s: &LbState = lb_slot(id);
+    s.fails = LB_MAX_FAILS;
+    s.open_until = now +% secs;
+}
+
+export fn lb_fails(id: i64) i32 {
+    const s: &LbState = lb_slot(id);
+    return s.fails;
+}
+
+fn lb_blocked(id: i64, now: i64) bool {
+    const s: &LbState = lb_slot(id);
+    return s.open_until > now;
+}
+
+fn lb_hash(s: &[byte]) u64 {
+    var h: u64 = 1469598103934665603;
+    var i: usize = 0;
+    while i < s.len {
+        h = (h ^ (s[i] as u64)) *% 1099511628211;
+        i = i + 1;
+    }
+    return h;
+}
+
+/// 按模型选 provider（含上游模型名）。没有可用 provider 返回 false。
+export fn lb_pick(d: &Db, model: &[byte], session: &[byte], now: i64,
+    out: &StoreProvider, upstream_out: &byte, cap: usize, upstream_len: &usize) !bool {
+    upstream_len[0] = 0;
+    store_provider_zero(out);
+    var st: DbStmt = dbx_prepare(d,
+        "select p.id, p.priority, p.weight from provider_models m join providers p on p.id = m.provider_id where m.model = ? and p.enabled = 1 order by p.priority, p.id" as &const byte) catch {
+        return error.LbFailed;
+    };
+    var mbuf: [byte: 256] = [0: 256];
+    var ml: usize = 0;
+    while ml < model.len && ml < 256 {
+        mbuf[ml] = model[ml];
+        ml = ml + 1;
+    }
+    dbx_bind_text(&st, 1, mbuf[0: ml]) catch {
+        return error.LbFailed;
+    };
+    var cands: [LbCand: LB_MAX_PROVIDERS] = [];
+    var n: usize = 0;
+    var best_prio: i32 = 0 - 1;
+    while true {
+        if dbx_step(&st) != 1 {
+            break;
+        }
+        const id: i64 = dbx_col_i64(&st, 0);
+        const prio: i32 = dbx_col_i64(&st, 1) as i32;
+        const weight: i32 = dbx_col_i64(&st, 2) as i32;
+        if lb_blocked(id, now) {
+            continue;
+        }
+        if best_prio < 0 {
+            best_prio = prio;
+        }
+        if prio != best_prio {
+            break;
+        }
+        if weight <= 0 || n >= LB_MAX_PROVIDERS {
+            continue;
+        }
+        cands[n].id = id;
+        cands[n].weight = weight;
+        n = n + 1;
+    }
+    dbx_finalize(&st);
+    if n == 0 {
+        return false;
+    }
+    var total: u64 = 0;
+    var i: usize = 0;
+    while i < n {
+        total = total +% (cands[i].weight as u64);
+        i = i + 1;
+    }
+    if total == 0 {
+        return false;
+    }
+    const h: u64 = lb_hash(session);
+    var pick: u64 = h % total;
+    var chosen: i64 = cands[0].id;
+    i = 0;
+    while i < n {
+        const w: u64 = cands[i].weight as u64;
+        if pick < w {
+            chosen = cands[i].id;
+            break;
+        }
+        pick = pick -% w;
+        i = i + 1;
+    }
+    try store_provider_get(d, chosen, out);
+    try store_provider_upstream(d, chosen, model, upstream_out, cap, upstream_len);
+    return true;
+}

@@ -1,0 +1,121 @@
+// src/cluster/ingest.uya — B5 幂等 ingest：批量 usage 行落账本 + 实时汇总
+//
+// 输入是 JSON `{"rows":[{request_id,user_id,ts,model,provider,input_tokens,
+// output_tokens,cache_read_tokens,cost_nano,price_nano,period,rate_version}]}`。
+// 以 request_id 为主键 `insert or ignore` 幂等；重复行计入 duplicate，缺字段计 bad。
+
+export const INGEST_MODEL_MAX: usize = 128;
+export const INGEST_PROVIDER_MAX: usize = 128;
+export const INGEST_PERIOD_MAX: usize = 32;
+export const INGEST_RID_MAX: usize = 128;
+
+export error IngestFailed;
+
+export struct IngestStats {
+    applied: i64,
+    duplicate: i64,
+    bad: i64,
+}
+
+fn ingest_daily(d: &Db, row_uid: i64, row_ts: i64, model: &[byte], provider: &[byte],
+    in_tokens: i64, out_tokens: i64, cache: i64, cost: i64, price: i64) void {
+    if row_ts < 0 {
+        return;
+    }
+    const day: i64 = row_ts / (86400 as i64);
+    var st: DbStmt = dbx_prepare(d,
+        "insert into usage_daily(day, user_id, model, provider, period, requests, input_tokens, output_tokens, cache_read_tokens, cost_nano, price_nano) values(?, ?, ?, ?, '', 1, ?, ?, ?, ?, ?) on conflict(day, user_id, model, provider, period) do update set requests = requests + 1, input_tokens = input_tokens + excluded.input_tokens, output_tokens = output_tokens + excluded.output_tokens, cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens, cost_nano = cost_nano + excluded.cost_nano, price_nano = price_nano + excluded.price_nano" as &const byte) catch {
+        return;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_i64(&st, 1, day) catch { return; };
+    dbx_bind_i64(&st, 2, row_uid) catch { return; };
+    dbx_bind_text(&st, 3, model) catch { return; };
+    dbx_bind_text(&st, 4, provider) catch { return; };
+    dbx_bind_i64(&st, 5, in_tokens) catch { return; };
+    dbx_bind_i64(&st, 6, out_tokens) catch { return; };
+    dbx_bind_i64(&st, 7, cache) catch { return; };
+    dbx_bind_i64(&st, 8, cost) catch { return; };
+    dbx_bind_i64(&st, 9, price) catch { return; };
+    _ = dbx_step(&st);
+}
+
+/// 应用一个 batch；返回 applied/duplicate/bad。
+export fn ingest_apply(d: &Db, body: &[byte], now: i64) !IngestStats {
+    var out: IngestStats = IngestStats{ applied: 0, duplicate: 0, bad: 0 };
+    var doc: JsonDoc = JsonDoc{};
+    json_parse(&doc, body) catch {
+        return error.IngestFailed;
+    };
+    const root: i32 = json_root(&doc);
+    const rows: i32 = json_get(&doc, root, &"rows"[0: 4]);
+    const n: i32 = json_arr_len(&doc, rows);
+    var i: i32 = 0;
+    while i < n {
+        const row: i32 = json_arr_at(&doc, rows, i);
+        i = i + 1;
+        var rid: [byte: INGEST_RID_MAX] = [0: INGEST_RID_MAX];
+        const ridn: usize = json_str(&doc, json_get(&doc, row, &"request_id"[0: 10]),
+            &rid[0], INGEST_RID_MAX);
+        if ridn == 0 {
+            out.bad = out.bad +% 1;
+            continue;
+        }
+        const uid: i64 = json_i64(&doc, json_get(&doc, row, &"user_id"[0: 7]));
+        const ts: i64 = json_i64(&doc, json_get(&doc, row, &"ts"[0: 2]));
+        var model: [byte: INGEST_MODEL_MAX] = [0: INGEST_MODEL_MAX];
+        const mn: usize = json_str(&doc, json_get(&doc, row, &"model"[0: 5]),
+            &model[0], INGEST_MODEL_MAX);
+        var prov: [byte: INGEST_PROVIDER_MAX] = [0: INGEST_PROVIDER_MAX];
+        const pn: usize = json_str(&doc, json_get(&doc, row, &"provider"[0: 8]),
+            &prov[0], INGEST_PROVIDER_MAX);
+        var period: [byte: INGEST_PERIOD_MAX] = [0: INGEST_PERIOD_MAX];
+        const pdn: usize = json_str(&doc, json_get(&doc, row, &"period"[0: 6]),
+            &period[0], INGEST_PERIOD_MAX);
+        const in_tokens: i64 = json_i64(&doc, json_get(&doc, row, &"input_tokens"[0: 12]));
+        const out_tokens: i64 = json_i64(&doc, json_get(&doc, row, &"output_tokens"[0: 13]));
+        const cache: i64 = json_i64(&doc, json_get(&doc, row, &"cache_read_tokens"[0: 17]));
+        const cost: i64 = json_i64(&doc, json_get(&doc, row, &"cost_nano"[0: 9]));
+        const price: i64 = json_i64(&doc, json_get(&doc, row, &"price_nano"[0: 10]));
+        const ver: i64 = json_i64(&doc, json_get(&doc, row, &"rate_version"[0: 12]));
+        var st: DbStmt = dbx_prepare(d,
+            "insert or ignore into usage_ledger(request_id, user_id, ts, model, provider, input_tokens, output_tokens, cache_read_tokens, cost_nano, price_nano, period, rate_version) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)" as &const byte) catch {
+            return error.IngestFailed;
+        };
+        dbx_bind_text(&st, 1, rid[0: ridn]) catch {
+            dbx_finalize(&st);
+            out.bad = out.bad +% 1;
+            continue;
+        };
+        dbx_bind_i64(&st, 2, uid) catch {};
+        dbx_bind_i64(&st, 3, ts) catch {};
+        dbx_bind_text(&st, 4, model[0: mn]) catch {};
+        dbx_bind_text(&st, 5, prov[0: pn]) catch {};
+        dbx_bind_i64(&st, 6, in_tokens) catch {};
+        dbx_bind_i64(&st, 7, out_tokens) catch {};
+        dbx_bind_i64(&st, 8, cache) catch {};
+        dbx_bind_i64(&st, 9, cost) catch {};
+        dbx_bind_i64(&st, 10, price) catch {};
+        dbx_bind_text(&st, 11, period[0: pdn]) catch {};
+        dbx_bind_i64(&st, 12, ver) catch {};
+        if dbx_step(&st) != 0 {
+            dbx_finalize(&st);
+            return error.IngestFailed;
+        }
+        dbx_finalize(&st);
+        if dbx_changes(d) == 1 {
+            out.applied = out.applied +% 1;
+            ingest_daily(d, uid, ts, model[0: mn], prov[0: pn],
+                in_tokens, out_tokens, cache, cost, price);
+        } else {
+            out.duplicate = out.duplicate +% 1;
+        }
+    }
+    _ = now;
+    return out;
+}
+
+/// 从账本重算某区间的 usage_daily（金额/时段按已落账数据重建，幂等）。
+export fn ingest_recompute(d: &Db, from_day: i64, to_day: i64) !void {
+    return rollup_rebuild_range(d, from_day, to_day);
+}

@@ -1,0 +1,877 @@
+// src/core/json.uya — 有界 JSON DOM 解析 + 转义/构造（A4 请求/响应与 A7 管理接口共用）
+//
+// 为什么自己写：网关只需要「解析请求字段 + 取 usage + 拼错误体」，不需要完整 JSON
+// 标准库；自己写可以把内存全部做成固定容量（无分配、无 GC），失败模式可预期。
+//
+// 解析（JsonDoc）：
+//   * 先把输入拷进 `src[65536]`，字符串反转义后放进 `strs[65536]`（原地写，不重叠）。
+//   * 节点表 `nodes[4096]`，对象成员链：key 节点 -> value 节点 -> 下一个 key 节点；
+//     数组用 value 链。深度上限 32。
+//   * 数字保留原始 span，`json_i64` 取整数部分（usage 的 token 数都是整数）；
+//     不提供 f64，避免二进制浮点在计费路径上出现。
+//
+// 构造（JsonW）：固定 16 KiB 输出缓冲 + 自动逗号/冒号/转义。
+
+export const JSON_MAX_NODES: usize = 4096;
+export const JSON_MAX_SRC: usize = 65536;
+export const JSON_MAX_STRS: usize = 65536;
+export const JSON_MAX_DEPTH: i32 = 32;
+
+export const JSON_NULL: i32 = 0;
+export const JSON_BOOL: i32 = 1;
+export const JSON_NUM: i32 = 2;
+export const JSON_STR: i32 = 3;
+export const JSON_ARR: i32 = 4;
+export const JSON_OBJ: i32 = 5;
+
+export error JsonBadInput;
+export error JsonBadString;
+export error JsonTooDeep;
+export error JsonTooLarge;
+
+export struct JsonNode {
+    kind: i32,
+    /// 字符串在 `strs` 里的 [start, end)；或数字在 `src` 里的原始 span。
+    start: usize,
+    end: usize,
+    ival: i64,
+    bval: bool,
+    /// arr/obj 的第一个孩子；-1 无。
+    child: i32,
+    /// 兄弟链；-1 无。
+    next: i32,
+}
+
+export struct JsonDoc {
+    src: [byte: JSON_MAX_SRC],
+    src_len: usize,
+    strs: [byte: JSON_MAX_STRS],
+    strs_len: usize,
+    nodes: [JsonNode: JSON_MAX_NODES],
+    node_count: i32,
+    root: i32,
+}
+
+// ---------------------------------------------------------------
+// 底层读写（全部带常量边界，保证编译器能证明索引安全）
+// ---------------------------------------------------------------
+
+fn js_byte(d: &JsonDoc, i: usize) byte {
+    if i < JSON_MAX_SRC {
+        return d.src[i];
+    }
+    return 0 as byte;
+}
+
+fn js_str_byte(d: &JsonDoc, i: usize) byte {
+    if i < JSON_MAX_STRS {
+        return d.strs[i];
+    }
+    return 0 as byte;
+}
+
+fn js_node(d: &JsonDoc, idx: i32) &JsonNode {
+    if idx >= 0 && (idx as usize) < JSON_MAX_NODES {
+        return &d.nodes[idx as usize];
+    }
+    return &d.nodes[0];
+}
+
+fn js_new(d: &JsonDoc, kind: i32) !i32 {
+    if d.node_count >= 0 && (d.node_count as usize) < JSON_MAX_NODES {
+        const i: usize = d.node_count as usize;
+        d.nodes[i].kind = kind;
+        d.nodes[i].start = 0;
+        d.nodes[i].end = 0;
+        d.nodes[i].ival = 0;
+        d.nodes[i].bval = false;
+        d.nodes[i].child = 0 - 1;
+        d.nodes[i].next = 0 - 1;
+        d.node_count = d.node_count + 1;
+        return i as i32;
+    }
+    return error.JsonTooLarge;
+}
+
+fn js_put(d: &JsonDoc, b: byte) !void {
+    if d.strs_len < JSON_MAX_STRS {
+        d.strs[d.strs_len] = b;
+        d.strs_len = d.strs_len + 1;
+        return;
+    }
+    return error.JsonTooLarge;
+}
+
+fn js_is_ws(c: byte) bool {
+    return c == (32 as byte) || c == (9 as byte) || c == (10 as byte) || c == (13 as byte);
+}
+
+fn js_skip(d: &JsonDoc, p: &usize) void {
+    while p[0] < d.src_len && p[0] < JSON_MAX_SRC && js_is_ws(js_byte(d, p[0])) {
+        p[0] = p[0] + 1;
+    }
+}
+
+fn js_hex(c: byte) i32 {
+    if c >= ('0' as byte) && c <= ('9' as byte) {
+        return (c as i32) - 48;
+    }
+    if c >= ('a' as byte) && c <= ('f' as byte) {
+        return (c as i32) - 87;
+    }
+    if c >= ('A' as byte) && c <= ('F' as byte) {
+        return (c as i32) - 55;
+    }
+    return 0 - 1;
+}
+
+/// 读 4 位十六进制（`\uXXXX` 的 XXXX）。
+fn js_hex4(d: &JsonDoc, p: &usize, out: &i32) !void {
+    if p[0] +% 4 > d.src_len || p[0] +% 4 > JSON_MAX_SRC {
+        return error.JsonBadString;
+    }
+    var v: i32 = 0;
+    var i: usize = 0;
+    while i < 4 {
+        const h: i32 = js_hex(js_byte(d, p[0] + i));
+        if h < 0 {
+            return error.JsonBadString;
+        }
+        v = (v *% 16) +% h;
+        i = i + 1;
+    }
+    p[0] = p[0] + 4;
+    out[0] = v;
+    return;
+}
+
+/// 把一个 code point 写成 UTF-8。
+fn js_put_cp(d: &JsonDoc, cp: i32) !void {
+    if cp < 0 {
+        return error.JsonBadString;
+    }
+    if cp < 128 {
+        try js_put(d, cp as byte);
+    } else if cp < 2048 {
+        try js_put(d, (192 +% (cp / 64)) as byte);
+        try js_put(d, (128 +% (cp % 64)) as byte);
+    } else if cp < 65536 {
+        try js_put(d, (224 +% (cp / 4096)) as byte);
+        try js_put(d, (128 +% ((cp / 64) % 64)) as byte);
+        try js_put(d, (128 +% (cp % 64)) as byte);
+    } else if cp <= 1114111 {
+        try js_put(d, (240 +% (cp / 262144)) as byte);
+        try js_put(d, (128 +% ((cp / 4096) % 64)) as byte);
+        try js_put(d, (128 +% ((cp / 64) % 64)) as byte);
+        try js_put(d, (128 +% (cp % 64)) as byte);
+    } else {
+        return error.JsonBadString;
+    }
+    return;
+}
+
+fn js_escape(d: &JsonDoc, p: &usize) !void {
+    const e: byte = js_byte(d, p[0]);
+    p[0] = p[0] + 1;
+    if e == (110 as byte) { // n
+        try js_put(d, 10 as byte);
+        return;
+    }
+    if e == (116 as byte) { // t
+        try js_put(d, 9 as byte);
+        return;
+    }
+    if e == (114 as byte) { // r
+        try js_put(d, 13 as byte);
+        return;
+    }
+    if e == (98 as byte) { // b
+        try js_put(d, 8 as byte);
+        return;
+    }
+    if e == (102 as byte) { // f
+        try js_put(d, 12 as byte);
+        return;
+    }
+    if e == (34 as byte) || e == (92 as byte) || e == (47 as byte) {
+        try js_put(d, e);
+        return;
+    }
+    if e == (117 as byte) { // u
+        var cp: i32 = 0;
+        try js_hex4(d, p, &cp);
+        if cp >= 55296 && cp <= 56319 {
+            // 高代理项：后面必须跟 \uDC00-\uDFFF 的低代理项
+            if js_byte(d, p[0]) == (92 as byte) && js_byte(d, p[0] +% 1) == (117 as byte) {
+                const save: usize = p[0];
+                p[0] = p[0] + 2;
+                var lo: i32 = 0;
+                js_hex4(d, p, &lo) catch {
+                    p[0] = save;
+                    lo = 0 - 1;
+                };
+                if lo >= 56320 && lo <= 57343 {
+                    cp = 65536 +% (cp -% 55296) *% 1024 +% (lo -% 56320);
+                } else {
+                    cp = 65533; // U+FFFD
+                    p[0] = save;
+                }
+            } else {
+                cp = 65533;
+            }
+        } else if cp >= 56320 && cp <= 57343 {
+            cp = 65533;
+        }
+        try js_put_cp(d, cp);
+        return;
+    }
+    return error.JsonBadString;
+}
+
+// ---------------------------------------------------------------
+// 解析
+// ---------------------------------------------------------------
+
+fn js_parse_string(d: &JsonDoc, p: &usize) !i32 {
+    if js_byte(d, p[0]) != (34 as byte) {
+        return error.JsonBadInput;
+    }
+    p[0] = p[0] + 1;
+    const start: usize = d.strs_len;
+    while true {
+        if p[0] >= d.src_len || p[0] >= JSON_MAX_SRC {
+            return error.JsonBadInput;
+        }
+        const c: byte = js_byte(d, p[0]);
+        p[0] = p[0] + 1;
+        if c == (34 as byte) {
+            break;
+        }
+        if c == (92 as byte) {
+            if p[0] >= d.src_len || p[0] >= JSON_MAX_SRC {
+                return error.JsonBadString;
+            }
+            try js_escape(d, p);
+            continue;
+        }
+        if c < (32 as byte) {
+            return error.JsonBadString;
+        }
+        try js_put(d, c);
+    }
+    const node: i32 = try js_new(d, JSON_STR);
+    js_node(d, node).start = start;
+    js_node(d, node).end = d.strs_len;
+    return node;
+}
+
+fn js_digit(c: byte) bool {
+    return c >= ('0' as byte) && c <= ('9' as byte);
+}
+
+fn js_parse_number(d: &JsonDoc, p: &usize) !i32 {
+    const start: usize = p[0];
+    if js_byte(d, p[0]) == (45 as byte) { // -
+        p[0] = p[0] + 1;
+    }
+    var digits: usize = 0;
+    while p[0] < d.src_len && p[0] < JSON_MAX_SRC && js_digit(js_byte(d, p[0])) {
+        p[0] = p[0] + 1;
+        digits = digits + 1;
+    }
+    if digits == 0 {
+        return error.JsonBadInput;
+    }
+    if js_byte(d, p[0]) == (46 as byte) { // .
+        p[0] = p[0] + 1;
+        var frac: usize = 0;
+        while p[0] < d.src_len && p[0] < JSON_MAX_SRC && js_digit(js_byte(d, p[0])) {
+            p[0] = p[0] + 1;
+            frac = frac + 1;
+        }
+        if frac == 0 {
+            return error.JsonBadInput;
+        }
+    }
+    if js_byte(d, p[0]) == (101 as byte) || js_byte(d, p[0]) == (69 as byte) { // e/E
+        p[0] = p[0] + 1;
+        if js_byte(d, p[0]) == (43 as byte) || js_byte(d, p[0]) == (45 as byte) {
+            p[0] = p[0] + 1;
+        }
+        var exp: usize = 0;
+        while p[0] < d.src_len && p[0] < JSON_MAX_SRC && js_digit(js_byte(d, p[0])) {
+            p[0] = p[0] + 1;
+            exp = exp + 1;
+        }
+        if exp == 0 {
+            return error.JsonBadInput;
+        }
+    }
+    const node: i32 = try js_new(d, JSON_NUM);
+    js_node(d, node).start = start;
+    js_node(d, node).end = p[0];
+    return node;
+}
+
+fn js_expect(d: &JsonDoc, p: &usize, lit: &[byte]) !void {
+    var i: usize = 0;
+    while i < lit.len {
+        if js_byte(d, p[0] + i) != lit[i] {
+            return error.JsonBadInput;
+        }
+        i = i + 1;
+    }
+    p[0] = p[0] + lit.len;
+    return;
+}
+
+fn js_parse_value(d: &JsonDoc, p: &usize, depth: i32) !i32 {
+    js_skip(d, p);
+    const c: byte = js_byte(d, p[0]);
+    if c == (123 as byte) { // {
+        return js_parse_obj(d, p, depth + 1);
+    }
+    if c == (91 as byte) { // [
+        return js_parse_arr(d, p, depth + 1);
+    }
+    if c == (34 as byte) {
+        return js_parse_string(d, p);
+    }
+    if c == (116 as byte) { // t
+        try js_expect(d, p, &"true"[0: 4]);
+        const node: i32 = try js_new(d, JSON_BOOL);
+        js_node(d, node).bval = true;
+        return node;
+    }
+    if c == (102 as byte) { // f
+        try js_expect(d, p, &"false"[0: 5]);
+        const node: i32 = try js_new(d, JSON_BOOL);
+        js_node(d, node).bval = false;
+        return node;
+    }
+    if c == (110 as byte) { // n
+        try js_expect(d, p, &"null"[0: 4]);
+        return js_new(d, JSON_NULL);
+    }
+    if c == (45 as byte) || js_digit(c) {
+        return js_parse_number(d, p);
+    }
+    return error.JsonBadInput;
+}
+
+fn js_parse_obj(d: &JsonDoc, p: &usize, depth: i32) !i32 {
+    if depth > JSON_MAX_DEPTH {
+        return error.JsonTooDeep;
+    }
+    const node: i32 = try js_new(d, JSON_OBJ);
+    p[0] = p[0] + 1; // {
+    js_skip(d, p);
+    if js_byte(d, p[0]) == (125 as byte) { // }
+        p[0] = p[0] + 1;
+        return node;
+    }
+    var first: i32 = 0 - 1;
+    var last: i32 = 0 - 1;
+    while true {
+        js_skip(d, p);
+        const key: i32 = try js_parse_string(d, p);
+        js_skip(d, p);
+        if js_byte(d, p[0]) != (58 as byte) { // :
+            return error.JsonBadInput;
+        }
+        p[0] = p[0] + 1;
+        const val: i32 = try js_parse_value(d, p, depth);
+        js_node(d, key).next = val;
+        if first < 0 {
+            first = key;
+        } else {
+            js_node(d, last).next = key;
+        }
+        last = val;
+        js_skip(d, p);
+        const c: byte = js_byte(d, p[0]);
+        if c == (44 as byte) { // ,
+            p[0] = p[0] + 1;
+            continue;
+        }
+        if c == (125 as byte) { // }
+            p[0] = p[0] + 1;
+            break;
+        }
+        return error.JsonBadInput;
+    }
+    js_node(d, node).child = first;
+    return node;
+}
+
+fn js_parse_arr(d: &JsonDoc, p: &usize, depth: i32) !i32 {
+    if depth > JSON_MAX_DEPTH {
+        return error.JsonTooDeep;
+    }
+    const node: i32 = try js_new(d, JSON_ARR);
+    p[0] = p[0] + 1; // [
+    js_skip(d, p);
+    if js_byte(d, p[0]) == (93 as byte) { // ]
+        p[0] = p[0] + 1;
+        return node;
+    }
+    var first: i32 = 0 - 1;
+    var last: i32 = 0 - 1;
+    while true {
+        const val: i32 = try js_parse_value(d, p, depth);
+        if first < 0 {
+            first = val;
+        } else {
+            js_node(d, last).next = val;
+        }
+        last = val;
+        js_skip(d, p);
+        const c: byte = js_byte(d, p[0]);
+        if c == (44 as byte) {
+            p[0] = p[0] + 1;
+            continue;
+        }
+        if c == (93 as byte) {
+            p[0] = p[0] + 1;
+            break;
+        }
+        return error.JsonBadInput;
+    }
+    js_node(d, node).child = first;
+    return node;
+}
+
+/// 解析一段 JSON；失败时 `doc.root == -1`。可重复使用同一个 doc。
+export fn json_parse(doc: &JsonDoc, text: &[byte]) !void {
+    doc.src_len = 0;
+    doc.strs_len = 0;
+    doc.node_count = 0;
+    doc.root = 0 - 1;
+    if text.len > JSON_MAX_SRC {
+        return error.JsonTooLarge;
+    }
+    var i: usize = 0;
+    while i < text.len {
+        doc.src[i] = text[i];
+        i = i + 1;
+    }
+    doc.src_len = text.len;
+    var p: usize = 0;
+    const r: i32 = try js_parse_value(doc, &p, 0);
+    js_skip(doc, &p);
+    if p != doc.src_len {
+        return error.JsonBadInput;
+    }
+    doc.root = r;
+    return;
+}
+
+export fn json_root(d: &JsonDoc) i32 {
+    return d.root;
+}
+
+export fn json_kind(d: &JsonDoc, node: i32) i32 {
+    if node >= 0 && (node as usize) < JSON_MAX_NODES {
+        return d.nodes[node as usize].kind;
+    }
+    return 0 - 1;
+}
+
+export fn json_is_null(d: &JsonDoc, node: i32) bool {
+    return json_kind(d, node) == JSON_NULL;
+}
+
+export fn json_i64(d: &JsonDoc, node: i32) i64 {
+    if json_kind(d, node) != JSON_NUM {
+        return 0;
+    }
+    const n: &JsonNode = js_node(d, node);
+    const end: usize = n.end;
+    var i: usize = n.start;
+    var neg: bool = false;
+    if i < end && js_byte(d, i) == (45 as byte) {
+        neg = true;
+        i = i + 1;
+    }
+    var v: i64 = 0;
+    var digits: usize = 0;
+    while i < end && i < JSON_MAX_SRC && js_digit(js_byte(d, i)) {
+        const dg: i64 = (js_byte(d, i) as i64) -% 48;
+        v = v *% (10 as i64) +% dg;
+        i = i + 1;
+        digits = digits + 1;
+    }
+    if digits == 0 {
+        return 0;
+    }
+    if neg {
+        v = 0 -% v;
+    }
+    return v;
+}
+
+export fn json_bool(d: &JsonDoc, node: i32) bool {
+    if json_kind(d, node) != JSON_BOOL {
+        return false;
+    }
+    return js_node(d, node).bval;
+}
+
+/// 字符串内容长度；非字符串返回 0。
+export fn json_str_len(d: &JsonDoc, node: i32) usize {
+    if json_kind(d, node) != JSON_STR {
+        return 0;
+    }
+    const n: &JsonNode = js_node(d, node);
+    if n.end < n.start || n.end > JSON_MAX_STRS {
+        return 0;
+    }
+    return n.end - n.start;
+}
+
+/// 把字符串内容拷到 `out`（不写 NUL），返回写入字节数。
+export fn json_str(d: &JsonDoc, node: i32, out: &byte, cap: usize) usize {
+    const n: &JsonNode = js_node(d, node);
+    if json_kind(d, node) != JSON_STR || n.end < n.start || n.end > JSON_MAX_STRS {
+        return 0;
+    }
+    var i: usize = n.start;
+    var w: usize = 0;
+    while i < n.end && w < cap {
+        out[w] = js_str_byte(d, i);
+        i = i + 1;
+        w = w + 1;
+    }
+    return w;
+}
+
+fn js_key_eq(d: &JsonDoc, node: i32, key: &[byte]) bool {
+    const n: &JsonNode = js_node(d, node);
+    if json_kind(d, node) != JSON_STR || n.end < n.start || n.end > JSON_MAX_STRS {
+        return false;
+    }
+    if n.end - n.start != key.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < key.len {
+        if js_str_byte(d, n.start + i) != key[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// 对象取字段；不存在/类型不对返回 -1。
+export fn json_get(d: &JsonDoc, obj: i32, key: &[byte]) i32 {
+    if json_kind(d, obj) != JSON_OBJ {
+        return 0 - 1;
+    }
+    var k: i32 = js_node(d, obj).child;
+    var guard: i32 = 0;
+    while k >= 0 && guard < (JSON_MAX_NODES as i32) {
+        if js_key_eq(d, k, key) {
+            return js_node(d, k).next;
+        }
+        const v: i32 = js_node(d, k).next;
+        if v < 0 {
+            break;
+        }
+        k = js_node(d, v).next;
+        guard = guard + 1;
+    }
+    return 0 - 1;
+}
+
+/// 数组长度；非数组返回 0。
+export fn json_arr_len(d: &JsonDoc, arr: i32) usize {
+    if json_kind(d, arr) != JSON_ARR {
+        return 0;
+    }
+    var n: usize = 0;
+    var it: i32 = js_node(d, arr).child;
+    var guard: i32 = 0;
+    while it >= 0 && guard < (JSON_MAX_NODES as i32) {
+        n = n + 1;
+        it = js_node(d, it).next;
+        guard = guard + 1;
+    }
+    return n;
+}
+
+/// 数组第 i 个元素；越界返回 -1。
+export fn json_arr_at(d: &JsonDoc, arr: i32, idx: usize) i32 {
+    if json_kind(d, arr) != JSON_ARR {
+        return 0 - 1;
+    }
+    var i: usize = 0;
+    var it: i32 = js_node(d, arr).child;
+    var guard: i32 = 0;
+    while it >= 0 && guard < (JSON_MAX_NODES as i32) {
+        if i == idx {
+            return it;
+        }
+        it = js_node(d, it).next;
+        i = i + 1;
+        guard = guard + 1;
+    }
+    return 0 - 1;
+}
+
+/// 便捷判断：字段存在且是给定字面量字符串。
+export fn json_get_str_eq(d: &JsonDoc, obj: i32, key: &[byte], lit: &[byte]) bool {
+    const v: i32 = json_get(d, obj, key);
+    if json_kind(d, v) != JSON_STR {
+        return false;
+    }
+    const n: &JsonNode = js_node(d, v);
+    if n.end - n.start != lit.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < lit.len {
+        if js_str_byte(d, n.start + i) != lit[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------
+// 构造
+// ---------------------------------------------------------------
+
+export const JSONW_CAP: usize = 16384;
+export const JSONW_MAX_DEPTH: i32 = 16;
+
+export struct JsonW {
+    out: [byte: JSONW_CAP],
+    len: usize,
+    depth: i32,
+    first: [bool: JSONW_MAX_DEPTH],
+    pending_key: bool,
+    bad: bool,
+}
+
+export fn jsonw_init(w: &JsonW) void {
+    w.len = 0;
+    w.depth = 0;
+    w.pending_key = false;
+    w.bad = false;
+    var i: usize = 0;
+    while i < JSONW_MAX_DEPTH {
+        w.first[i] = true;
+        i = i + 1;
+    }
+}
+
+fn jsonw_put(w: &JsonW, b: byte) void {
+    if w.len < JSONW_CAP {
+        w.out[w.len] = b;
+        w.len = w.len + 1;
+        return;
+    }
+    w.bad = true;
+}
+
+fn jsonw_raw(w: &JsonW, s: &[byte]) void {
+    var i: usize = 0;
+    while i < s.len {
+        jsonw_put(w, s[i]);
+        i = i + 1;
+    }
+}
+
+fn jsonw_hex_digit(v: i32) byte {
+    if v < 10 {
+        return (48 +% v) as byte;
+    }
+    return (87 +% v) as byte;
+}
+
+fn jsonw_escaped(w: &JsonW, s: &[byte]) void {
+    jsonw_put(w, 34 as byte);
+    var i: usize = 0;
+    while i < s.len {
+        const c: byte = s[i];
+        if c == (34 as byte) {
+            jsonw_put(w, 92 as byte);
+            jsonw_put(w, 34 as byte);
+        } else if c == (92 as byte) {
+            jsonw_put(w, 92 as byte);
+            jsonw_put(w, 92 as byte);
+        } else if c == (10 as byte) {
+            jsonw_put(w, 92 as byte);
+            jsonw_put(w, 110 as byte);
+        } else if c == (13 as byte) {
+            jsonw_put(w, 92 as byte);
+            jsonw_put(w, 114 as byte);
+        } else if c == (9 as byte) {
+            jsonw_put(w, 92 as byte);
+            jsonw_put(w, 116 as byte);
+        } else if c == (8 as byte) {
+            jsonw_put(w, 92 as byte);
+            jsonw_put(w, 98 as byte);
+        } else if c == (12 as byte) {
+            jsonw_put(w, 92 as byte);
+            jsonw_put(w, 102 as byte);
+        } else if c < (32 as byte) {
+            jsonw_put(w, 92 as byte);
+            jsonw_put(w, 117 as byte);
+            jsonw_put(w, 48 as byte);
+            jsonw_put(w, 48 as byte);
+            jsonw_put(w, jsonw_hex_digit(((c as i32) / 16) % 16));
+            jsonw_put(w, jsonw_hex_digit((c as i32) % 16));
+        } else {
+            jsonw_put(w, c);
+        }
+        i = i + 1;
+    }
+    jsonw_put(w, 34 as byte);
+}
+
+/// 值前的分隔：有 key 时只补值（key 已经写过冒号），否则按容器补逗号。
+fn jsonw_sep(w: &JsonW) void {
+    if w.pending_key {
+        w.pending_key = false;
+        return;
+    }
+    if w.depth > 0 && w.depth < JSONW_MAX_DEPTH {
+        const d: usize = w.depth as usize;
+        if w.first[d] {
+            w.first[d] = false;
+        } else {
+            jsonw_put(w, 44 as byte);
+        }
+    }
+}
+
+fn jsonw_open(w: &JsonW, open: byte) void {
+    jsonw_sep(w);
+    jsonw_put(w, open);
+    if w.depth >= JSONW_MAX_DEPTH {
+        w.bad = true;
+        return;
+    }
+    w.depth = w.depth + 1;
+    w.first[w.depth as usize] = true;
+}
+
+fn jsonw_close(w: &JsonW, close: byte) void {
+    if w.depth <= 0 || w.depth >= JSONW_MAX_DEPTH {
+        w.bad = true;
+        return;
+    }
+    w.depth = w.depth - 1;
+    jsonw_put(w, close);
+}
+
+export fn jsonw_obj(w: &JsonW) void {
+    jsonw_open(w, 123 as byte);
+}
+
+export fn jsonw_end_obj(w: &JsonW) void {
+    jsonw_close(w, 125 as byte);
+}
+
+export fn jsonw_arr(w: &JsonW) void {
+    jsonw_open(w, 91 as byte);
+}
+
+export fn jsonw_end_arr(w: &JsonW) void {
+    jsonw_close(w, 93 as byte);
+}
+
+export fn jsonw_key(w: &JsonW, key: &[byte]) void {
+    if w.depth <= 0 || w.depth >= JSONW_MAX_DEPTH {
+        w.bad = true;
+        return;
+    }
+    const d: usize = w.depth as usize;
+    if d < JSONW_MAX_DEPTH {
+        if !w.first[d] {
+            jsonw_put(w, 44 as byte);
+        }
+        w.first[d] = false;
+    }
+    jsonw_escaped(w, key);
+    jsonw_put(w, 58 as byte);
+    w.pending_key = true;
+}
+
+export fn jsonw_str(w: &JsonW, s: &[byte]) void {
+    jsonw_sep(w);
+    jsonw_escaped(w, s);
+}
+
+export fn jsonw_null(w: &JsonW) void {
+    jsonw_sep(w);
+    jsonw_raw(w, &"null"[0: 4]);
+}
+
+export fn jsonw_bool(w: &JsonW, v: bool) void {
+    jsonw_sep(w);
+    if v {
+        jsonw_raw(w, &"true"[0: 4]);
+    } else {
+        jsonw_raw(w, &"false"[0: 5]);
+    }
+}
+
+fn jsonw_u64(w: &JsonW, v: u64) void {
+    var buf: [byte: 24] = [0: 24];
+    var n: usize = 0;
+    var x: u64 = v;
+    if x == 0 {
+        jsonw_put(w, 48 as byte);
+        return;
+    }
+    while x > 0 && n < 24 {
+        buf[n] = (48 as u64 +% (x % (10 as u64))) as byte;
+        n = n + 1;
+        x = x / (10 as u64);
+    }
+    while n > 0 {
+        n = n - 1;
+        jsonw_put(w, buf[n]);
+    }
+}
+
+export fn jsonw_i64(w: &JsonW, v: i64) void {
+    jsonw_sep(w);
+    if v == 0 {
+        jsonw_put(w, 48 as byte);
+        return;
+    }
+    if v < 0 {
+        jsonw_put(w, 45 as byte);
+        // i64 最小值取负会溢出：单独处理
+        if v == (-9223372036854775807 - 1) {
+            jsonw_raw(w, &"9223372036854775808"[0: 19]);
+            return;
+        }
+        jsonw_u64(w, (0 - v) as u64);
+        return;
+    }
+    jsonw_u64(w, v as u64);
+}
+
+/// 已写入的字节数。
+export fn jsonw_len(w: &JsonW) usize {
+    if w.len > JSONW_CAP {
+        return JSONW_CAP;
+    }
+    return w.len;
+}
+
+/// 已写入的内容视图。
+export fn jsonw_span(w: &JsonW) &[byte] {
+    const n: usize = jsonw_len(w);
+    return w.out[0: n];
+}
+
+export fn jsonw_ok(w: &JsonW) bool {
+    return !w.bad;
+}

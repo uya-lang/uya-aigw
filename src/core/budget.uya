@@ -1,0 +1,112 @@
+// src/core/budget.uya — C4 用户月度预算与告警
+//
+// 预算按用户存 nano（0 = 未设）；月度已用从 usage_daily 汇总当月 price_nano。
+
+export error BudgetFailed;
+
+/// 写预算（0 表示关闭告警）。
+export fn budget_set(d: &Db, user_id: i64, monthly_nano: i64, now: i64) !void {
+    if user_id <= 0 || monthly_nano < 0 {
+        return error.BudgetFailed;
+    }
+    var st: DbStmt = dbx_prepare(d,
+        "insert into budgets(user_id, monthly_nano, updated_at) values(?, ?, ?) on conflict(user_id) do update set monthly_nano = excluded.monthly_nano, updated_at = excluded.updated_at" as &const byte) catch {
+        return error.BudgetFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_i64(&st, 1, user_id) catch {
+        return error.BudgetFailed;
+    };
+    dbx_bind_i64(&st, 2, monthly_nano) catch {
+        return error.BudgetFailed;
+    };
+    dbx_bind_i64(&st, 3, now) catch {
+        return error.BudgetFailed;
+    };
+    if dbx_step(&st) != 0 {
+        return error.BudgetFailed;
+    }
+    return;
+}
+
+export fn budget_get(d: &Db, user_id: i64) !i64 {
+    var st: DbStmt = dbx_prepare(d,
+        "select monthly_nano from budgets where user_id = ?" as &const byte) catch {
+        return error.BudgetFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_i64(&st, 1, user_id) catch {
+        return error.BudgetFailed;
+    };
+    if dbx_step(&st) != 1 {
+        return 0 as i64;
+    }
+    return dbx_col_i64(&st, 0);
+}
+
+/// 当月起止 day（按 UTC）。返回 from_day；to_day 写进 out。
+export fn budget_month(ts: i64, out: &i64) i64 {
+    const day: i64 = ts / (86400 as i64);
+    // 1970-01-01 是周四；用民用历算法反推当月 1 日。
+    const z: i64 = day +% 719468;
+    const era: i64 = z / 146097;
+    const doe: i64 = z -% era *% 146097;
+    const yoe: i64 = (doe -% doe / 1460 +% doe / 36524 -% doe / 146096) / 365;
+    const y: i64 = yoe +% era *% 400;
+    const doy: i64 = doe -% (365 *% yoe +% yoe / 4 -% yoe / 100);
+    const mp: i64 = (5 *% doy +% 2) / 153;
+    const mday: i64 = doy -% (153 *% mp +% 2) / 5 +% 1;
+    var month: i64 = mp +% 3;
+    var yr: i64 = y;
+    if month > 12 {
+        month = month -% 12;
+        yr = yr +% 1;
+    }
+    const first: i64 = day -% (mday -% 1);
+    var next: i64 = first;
+    // 月末 = 下月 1 日 - 1：按 28/29/30/31 简单推进
+    if month == 1 || month == 3 || month == 5 || month == 7 || month == 8 || month == 10 || month == 12 {
+        next = first +% 31;
+    } else if month == 4 || month == 6 || month == 9 || month == 11 {
+        next = first +% 30;
+    } else {
+        const leap: bool = (yr % (4 as i64) == 0 && yr % (100 as i64) != 0) || yr % (400 as i64) == 0;
+        next = first +% (if leap { 29 } else { 28 });
+    }
+    out[0] = next -% 1;
+    return first;
+}
+
+/// 当月已用（price_nano 之和）。
+export fn budget_month_spent(d: &Db, user_id: i64, ts: i64) !i64 {
+    var to_day: i64 = 0;
+    const from_day: i64 = budget_month(ts, &to_day);
+    var st: DbStmt = dbx_prepare(d,
+        "select coalesce(sum(price_nano), 0) from usage_daily where user_id = ? and day >= ? and day <= ?" as &const byte) catch {
+        return error.BudgetFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_i64(&st, 1, user_id) catch {
+        return error.BudgetFailed;
+    };
+    dbx_bind_i64(&st, 2, from_day) catch {
+        return error.BudgetFailed;
+    };
+    dbx_bind_i64(&st, 3, to_day) catch {
+        return error.BudgetFailed;
+    };
+    if dbx_step(&st) != 1 {
+        return 0 as i64;
+    }
+    return dbx_col_i64(&st, 0);
+}
+
+/// 是否超预算（预算 0 视为未设置，永不告警）。
+export fn budget_exceeded(d: &Db, user_id: i64, ts: i64) !bool {
+    const b: i64 = try budget_get(d, user_id);
+    if b <= 0 {
+        return false;
+    }
+    const spent: i64 = try budget_month_spent(d, user_id, ts);
+    return spent >= b;
+}
