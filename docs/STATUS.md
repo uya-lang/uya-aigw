@@ -41,8 +41,8 @@
   serve 失败自动换 provider 重试；插件级重绑待接。
 - A7（已落地）：管理 REST（health/pricing GET+POST/billing/backup）+ MCP
   （initialize/tools/list/tools/call：pricing_get、billing_query、backup_status）。
-- A5（进行中）：`/v1/responses` 非流式 + previous_response_id 续轮已通；
-  reasoning/tools 透传与流式事件序列待做。
+- A5（进行中）：`/v1/responses` 非流式 + previous_response_id 续轮 + 流式事件
+  （created/delta/completed）已通；reasoning/tools 仍未透传。
 - A4（进行中）：`src/core/json.uya` 有界 JSON DOM + 构造器（44 断言）；
   schema v4 `providers`/`provider_models` + store CRUD/路由（33 断言）；
   `src/core/billing.uya` 结算（usage 双风格解析 + 查价 + journal/ledger 幂等，30 断言）；

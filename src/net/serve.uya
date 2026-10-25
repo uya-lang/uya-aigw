@@ -2112,10 +2112,6 @@ fn srv_responses(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 400, SRV_JSON_400, keep);
         return;
     }
-    if stream {
-        srv_static(c, 501, SRV_JSON_501, keep);
-        return;
-    }
     var r: RespRow = RespRow{};
     var prev_out: [byte: RESP_OUTPUT_MAX] = [0: RESP_OUTPUT_MAX];
     var prev_out_len: usize = 0;
@@ -2133,7 +2129,7 @@ fn srv_responses(c: &SrvConn, stats: &ServeStats) void {
     }
     var payload: [byte: 32768] = [0: 32768];
     const pln: usize = resp_build_chat(model[0: mn], prev_out[0: prev_out_len],
-        input[0: in_n], &payload[0], 32768);
+        input[0: in_n], stream, &payload[0], 32768);
     if pln == 0 {
         srv_static(c, 502, SRV_JSON_502, keep);
         return;
@@ -2153,6 +2149,17 @@ fn srv_responses(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 502, SRV_JSON_502, keep);
         return;
     };
+    var rid: [byte: 32] = [0: 32];
+    var ridn: usize = 0;
+    ridn = store_new_slug(&rid[0], 32) catch {
+        srv_static(c, 502, SRV_JSON_502, keep);
+        return;
+    };
+    if plan.stream {
+        srv_responses_stream(c, key.user_id, &plan, &cfg, rid[0: ridn],
+            input[0: in_n], prev[0: pn]);
+        return;
+    }
     var resp: [byte: 8192] = [0: 8192];
     var st: i32 = 0;
     var rn: usize = 0;
@@ -2184,12 +2191,6 @@ fn srv_responses(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 502, SRV_JSON_502, keep);
         return;
     }
-    var rid: [byte: 32] = [0: 32];
-    var ridn: usize = 0;
-    ridn = store_new_slug(&rid[0], 32) catch {
-        srv_static(c, 502, SRV_JSON_502, keep);
-        return;
-    };
     var dirbuf: [byte: 256] = [0: 256];
     const dlen: usize = runtime_dir_copy(&dirbuf[0], 256);
     var settle: BillingResult = BillingResult{ cost_nano: 0, price_nano: 0, rate_version: 0, duplicate: false, found: false };
@@ -2482,4 +2483,203 @@ fn srv_mcp(c: &SrvConn, stats: &ServeStats) void {
     }
     jsonw_end_obj(&w);
     srv_static(c, 200, jsonw_span(&w), keep);
+}
+
+// A5：responses 流式事件（response.created / output_text.delta / completed）
+fn srv_sse_frame(fd: i32, ev: &const byte, evn: usize, js: &[byte]) bool {
+    var eb: [byte: 16384] = [0: 16384];
+    var el: usize = 0;
+    const pre: &[byte] = &"event: "[0: 7];
+    var i: usize = 0;
+    while i < 7 && el < 16380 {
+        eb[el] = pre[i];
+        el = el + 1;
+        i = i + 1;
+    }
+    i = 0;
+    while i < evn && el < 16380 {
+        eb[el] = ev[i];
+        el = el + 1;
+        i = i + 1;
+    }
+    if el < 16380 {
+        eb[el] = 10;
+        el = el + 1;
+    }
+    const dp: &[byte] = &"data: "[0: 6];
+    i = 0;
+    while i < 6 && el < 16380 {
+        eb[el] = dp[i];
+        el = el + 1;
+        i = i + 1;
+    }
+    i = 0;
+    while i < js.len && el < 16380 {
+        eb[el] = js[i];
+        el = el + 1;
+        i = i + 1;
+    }
+    if el < 16380 {
+        eb[el] = 10;
+        el = el + 1;
+    }
+    if el < 16380 {
+        eb[el] = 10;
+        el = el + 1;
+    }
+    var ob: [byte: 16400] = [0: 16400];
+    const on: usize = hsrv_chunk(&ob[0], 16400, eb[0: el], el);
+    return on > 0 && srv_send_all(fd, ob[0: on]);
+}
+
+fn srv_responses_stream(c: &SrvConn, uid: i64, plan: &ChatPlan, cfg: &const HttppConfig,
+    rid: &[byte], input_text: &[byte], prev_id: &[byte]) void {
+    var call: HtcCall = HtcCall{};
+    htc_call_init(&call);
+    defer { htc_call_free(&call); }
+    const nowu: u64 = now_ms() catch {
+        srv_static(c, 502, SRV_JSON_502, c.keep);
+        return;
+    };
+    const o: !i32 = block_on<i32>(htc_open_async(cfg, &g_up_ctx, &"POST"[0: 4],
+        plan.path[0: plan.path_len], plan.payload[0: plan.payload_len], true,
+        nowu, nowu +% 10000, &call));
+    const orc: i32 = o catch |_| {
+        lb_report(plan.provider_id, false, store_now());
+        srv_static(c, 502, SRV_JSON_502, c.keep);
+        return;
+    };
+    if orc != 0 {
+        lb_report(plan.provider_id, false, store_now());
+        srv_static(c, 502, SRV_JSON_502, c.keep);
+        return;
+    }
+    lb_report(plan.provider_id, true, store_now());
+    const fl: !i32 = sys_fcntl(c.fd, 3, 0);
+    const flags: i32 = fl catch {
+        0;
+    };
+    if flags != 0 {
+        _ = sys_fcntl(c.fd, 4, flags & (0 -% 2049)) catch {};
+    }
+    var head: [byte: 256] = [0: 256];
+    const hn: usize = hsrv_resp_head(&head[0], 256, 200, &SRV_CTYPE_SSE[0: 17], 17,
+        0 as i64, true, false);
+    if !srv_send_all(c.fd, head[0: hn]) {
+        srv_chat_close(c);
+        return;
+    }
+    var jw: JsonW = JsonW{};
+    // response.created
+    {
+        jsonw_init(&jw);
+        jsonw_obj(&jw);
+        jsonw_key(&jw, &"type"[0: 4]);
+        jsonw_str(&jw, &"response.created"[0: 16]);
+        jsonw_key(&jw, &"response"[0: 8]);
+        jsonw_obj(&jw);
+        jsonw_key(&jw, &"id"[0: 2]);
+        jsonw_str(&jw, rid);
+        jsonw_key(&jw, &"object"[0: 6]);
+        jsonw_str(&jw, &"response"[0: 8]);
+        jsonw_key(&jw, &"model"[0: 5]);
+        jsonw_str(&jw, plan.model[0: plan.model_len]);
+        jsonw_key(&jw, &"previous_response_id"[0: 20]);
+        jsonw_str(&jw, prev_id);
+        jsonw_end_obj(&jw);
+        jsonw_end_obj(&jw);
+        if !srv_sse_frame(c.fd, &"response.created"[0: 16], 16, jsonw_span(&jw)) {
+            srv_chat_close(c);
+            return;
+        }
+    }
+    var jd: JsonDoc = JsonDoc{};
+    var usage: PriceUsage = PriceUsage{ input_tokens: 0, output_tokens: 0, cache_read_tokens: 0 };
+    var usage_found: bool = false;
+    var out_text: [byte: RESP_OUTPUT_MAX] = [0: RESP_OUTPUT_MAX];
+    var out_len: usize = 0;
+    var events: i32 = 0;
+    var done: bool = false;
+    while events < 4096 && !done {
+        var has: bool = false;
+        const r: !i32 = block_on<i32>(htc_next_event_async(&call, &has, 5000 as u64));
+        const rr: i32 = r catch |_| {
+            break;
+        };
+        if rr == 0 || !has {
+            break;
+        }
+        if sse_is_done(&call.sse) {
+            done = true;
+        } else if call.sse.ev.data_len > 0 && call.sse.ev.data[0] == (123 as byte) {
+            json_parse(&jd, call.sse.ev.data[0: call.sse.ev.data_len]) catch {};
+            if billing_usage_parse(&jd, json_root(&jd), &usage) {
+                usage_found = true;
+            }
+            const choices: i32 = json_get(&jd, json_root(&jd), &"choices"[0: 7]);
+            const c0: i32 = json_arr_at(&jd, choices, 0);
+            const delta: i32 = json_get(&jd, c0, &"delta"[0: 5]);
+            const content: i32 = json_get(&jd, delta, &"content"[0: 7]);
+            if json_kind(&jd, content) == JSON_STR {
+                var chunk: [byte: 1024] = [0: 1024];
+                const cn: usize = json_str(&jd, content, &chunk[0], 1024);
+                if cn > 0 {
+                    var i: usize = 0;
+                    while i < cn && out_len < RESP_OUTPUT_MAX {
+                        out_text[out_len] = chunk[i];
+                        out_len = out_len + 1;
+                        i = i + 1;
+                    }
+                    jsonw_init(&jw);
+                    jsonw_obj(&jw);
+                    jsonw_key(&jw, &"type"[0: 4]);
+                    jsonw_str(&jw, &"response.output_text.delta"[0: 26]);
+                    jsonw_key(&jw, &"delta"[0: 5]);
+                    jsonw_str(&jw, chunk[0: cn]);
+                    jsonw_end_obj(&jw);
+                    if !srv_sse_frame(c.fd, &"response.output_text.delta"[0: 26], 26, jsonw_span(&jw)) {
+                        break;
+                    }
+                }
+            }
+        }
+        sse_consume(&call.sse);
+        events = events + 1;
+    }
+    var settle: BillingResult = BillingResult{ cost_nano: 0, price_nano: 0, rate_version: 0, duplicate: false, found: false };
+    if usage_found {
+        var dirbuf: [byte: 256] = [0: 256];
+        const dlen: usize = runtime_dir_copy(&dirbuf[0], 256);
+        billing_settle(runtime_db(), dirbuf[0: dlen], rid, uid, store_now(), 0,
+            plan.model[0: plan.model_len], plan.provider_name[0: plan.provider_name_len],
+            &usage, &settle) catch {};
+    }
+    resp_store(runtime_db(), rid, uid, store_now(), plan.model[0: plan.model_len],
+        prev_id, input_text, out_text[0: out_len], &"{}"[0: 2]) catch {};
+    {
+        jsonw_init(&jw);
+        jsonw_obj(&jw);
+        jsonw_key(&jw, &"type"[0: 4]);
+        jsonw_str(&jw, &"response.completed"[0: 18]);
+        jsonw_key(&jw, &"response"[0: 8]);
+        jsonw_obj(&jw);
+        jsonw_key(&jw, &"id"[0: 2]);
+        jsonw_str(&jw, rid);
+        jsonw_key(&jw, &"usage"[0: 5]);
+        jsonw_obj(&jw);
+        jsonw_key(&jw, &"input_tokens"[0: 12]);
+        jsonw_i64(&jw, usage.input_tokens);
+        jsonw_key(&jw, &"output_tokens"[0: 13]);
+        jsonw_i64(&jw, usage.output_tokens);
+        jsonw_key(&jw, &"cost_nano"[0: 9]);
+        jsonw_i64(&jw, settle.cost_nano);
+        jsonw_key(&jw, &"price_nano"[0: 10]);
+        jsonw_i64(&jw, settle.price_nano);
+        jsonw_end_obj(&jw);
+        jsonw_end_obj(&jw);
+        jsonw_end_obj(&jw);
+        _ = srv_sse_frame(c.fd, &"response.completed"[0: 18], 18, jsonw_span(&jw));
+    }
+    _ = srv_send_all(c.fd, &"0\r\n\r\n"[0: 5]);
+    srv_chat_close(c);
 }

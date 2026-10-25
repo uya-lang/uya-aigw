@@ -92,12 +92,14 @@ export fn resp_get(d: &Db, id: &[byte], out: &RespRow) !void {
 
 /// 把 responses 的输入（可带上一轮 output）转成 chat 请求体。
 export fn resp_build_chat(model: &[byte], previous_output: &[byte], input_text: &[byte],
-    out: &byte, cap: usize) usize {
+    stream: bool, out: &byte, cap: usize) usize {
     var w: JsonW = JsonW{};
     jsonw_init(&w);
     jsonw_obj(&w);
     jsonw_key(&w, &"model"[0: 5]);
     jsonw_str(&w, model);
+    jsonw_key(&w, &"stream"[0: 6]);
+    jsonw_bool(&w, stream);
     jsonw_key(&w, &"messages"[0: 8]);
     jsonw_arr(&w);
     if previous_output.len > 0 {

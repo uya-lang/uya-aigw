@@ -57,14 +57,16 @@ fn test_store_roundtrip() !void {
 fn test_build_and_parse() !void {
     var buf: [byte: 1024] = [0: 1024];
     // 无历史
-    var n: usize = resp_build_chat(&"m"[0: 1], &""[0: 0], &"hi"[0: 2], &buf[0], 1024);
+    var n: usize = resp_build_chat(&"m"[0: 1], &""[0: 0], &"hi"[0: 2], false, &buf[0], 1024);
     try assert_eq_bool(n > 0, true);
     try assert_eq_bool(contains(buf[0: n], &"\"role\":\"user\""[0: 13]), true);
     try assert_eq_bool(contains(buf[0: n], &"\"messages\""[0: 10]), true);
     // 带历史：assistant 在前
-    n = resp_build_chat(&"m"[0: 1], &"prev"[0: 4], &"next"[0: 4], &buf[0], 1024);
+    n = resp_build_chat(&"m"[0: 1], &"prev"[0: 4], &"next"[0: 4], false, &buf[0], 1024);
     try assert_eq_bool(contains(buf[0: n], &"\"assistant\""[0: 11]), true);
     try assert_eq_bool(contains(buf[0: n], &"\"prev\""[0: 6]), true);
+    n = resp_build_chat(&"m"[0: 1], &""[0: 0], &"s"[0: 1], true, &buf[0], 1024);
+    try assert_eq_bool(contains(buf[0: n], &"\"stream\":true"[0: 13]), true);
     // 解析 chat 响应
     var jd: JsonDoc = JsonDoc{};
     try json_parse(&jd, &"{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"answer\"}}]}"[0: 65]);

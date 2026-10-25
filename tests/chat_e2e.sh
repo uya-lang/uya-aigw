@@ -43,8 +43,7 @@ BODY = (b'{"id":"chatcmpl-e2e","object":"chat.completion",'
         b'"prompt_tokens_details":{"cached_tokens":10000}}}')
 USAGE = (b'{"usage":{"prompt_tokens":100000,"completion_tokens":50000,'
          b'"prompt_tokens_details":{"cached_tokens":10000}}}')
-SSE = (b'data: {"i":0}\n\n'
-       b'data: {"i":1}\n\n'
+SSE = (b'data: {"choices":[{"delta":{"content":"hello-from-mock"}}]}\n\n'
        b'data: ' + USAGE + b'\n\n'
        b'data: [DONE]\n\n')
 class H(http.server.BaseHTTPRequestHandler):
@@ -145,7 +144,7 @@ SCODE=$(curl -s -N --max-time 15 -o "$TMP/stream.txt" -w '%{http_code}' -X POST 
   --data '{"model":"mock-model","stream":true,"messages":[{"role":"user","content":"hi"}]}' \
   "http://127.0.0.1:$PORT/v1/chat/completions")
 [ "$SCODE" = "200" ] || { cat "$TMP/stream.txt" >&2; fail "stream status=$SCODE"; }
-grep -q 'data: {"i":0}' "$TMP/stream.txt" || fail "stream event missing"
+grep -q 'hello-from-mock' "$TMP/stream.txt" || { cat "$TMP/stream.txt" >&2; fail "stream event missing"; }
 grep -q 'data: \[DONE\]' "$TMP/stream.txt" || fail "stream DONE missing"
 
 # 4b1) A5 responses：首轮 + previous_response_id 续轮
@@ -159,6 +158,15 @@ R2=$(curl -s --max-time 15 -X POST -H "Authorization: Bearer $TOKEN" \
   --data "{\"model\":\"mock-model\",\"input\":\"next\",\"previous_response_id\":\"$RID\"}" "$BASE/v1/responses")
 echo "$R2" | grep -q '"output_text"' || { echo "$R2" >&2; fail "responses continue"; }
 
+# 4b1b) responses 流式事件序列
+RS=$(curl -s -N --max-time 15 -X POST -H "Authorization: Bearer $TOKEN" \
+  -H 'Accept: text/event-stream' \
+  --data '{"model":"mock-model","stream":true,"input":"hello"}' "$BASE/v1/responses")
+echo "$RS" | grep -q 'response.created' || { echo "$RS" >&2; fail "responses created"; }
+echo "$RS" | grep -q 'response.output_text.delta' || { echo "$RS" >&2; fail "responses delta"; }
+echo "$RS" | grep -q 'hello-from-mock' || { echo "$RS" >&2; fail "responses delta text"; }
+echo "$RS" | grep -q 'response.completed' || { echo "$RS" >&2; fail "responses completed"; }
+
 # 4b2) models：公开列表来自 provider_models
 MJSON=$(curl -s --max-time 10 "http://127.0.0.1:$PORT/v1/models")
 echo "$MJSON" | grep -q '"id":"mock-model"' || { echo "$MJSON" >&2; fail "models list"; }
@@ -167,8 +175,8 @@ echo "$MJSON" | grep -q '"id":"mock-model"' || { echo "$MJSON" >&2; fail "models
 UJSON=$(curl -s --max-time 10 -H "Authorization: Bearer $TOKEN" \
   "http://127.0.0.1:$PORT/v1/usage?from_day=0&to_day=999999")
 echo "$UJSON" | grep -q '"mock-model"' || { echo "$UJSON" >&2; fail "usage model missing"; }
-echo "$UJSON" | grep -q '"requests":4' || { echo "$UJSON" >&2; fail "usage totals"; }
-echo "$UJSON" | grep -q '"profit_nano":528' || { echo "$UJSON" >&2; fail "usage profit"; }
+echo "$UJSON" | grep -q '"requests":5' || { echo "$UJSON" >&2; fail "usage totals"; }
+echo "$UJSON" | grep -q '"profit_nano":660' || { echo "$UJSON" >&2; fail "usage profit"; }
 
 # 4d) A7 管理 REST（--admin-key）
 AH=$(curl -s --max-time 5 -H 'Authorization: Bearer test-admin' "$BASE/admin/health")
@@ -199,5 +207,5 @@ kill "$SRV_PID" 2>/dev/null || true
 wait "$SRV_PID" 2>/dev/null || true
 SRV_PID=""
 COUNT=$(AIGW_MODE=count AIGW_DB="$SEED_DB" ./build/seed | sed -n 's/^COUNT=//p')
-[ "$COUNT" = "4" ] || fail "usage_ledger count=$COUNT"
+[ "$COUNT" = "5" ] || fail "usage_ledger count=$COUNT"
 echo "CHAT-ALL-OK status=$CODE count=$COUNT"
