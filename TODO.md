@@ -47,16 +47,13 @@ A4/A5/A8 进度（子项已完成记录见 `TODO_DONE.md`）：
 
 | ID | 任务 | 验收 | 依赖 |
 |---|---|---|---|
-| B1 | controller：`meta.db`、注册/心跳、config 版本 + 长轮询、A/S 选主、journal + 每日备份 | 重启不丢；standby 接管；standby 不备份 | A2/A7 |
 | B2 | node 集群模式：uplink 客户端、注册、拉快照、slug 归属校验 | 带 slug 落指定节点；断线回落轮询 | B1 |
 | B3 | lease + epoch + fencing + 分配/再平衡/drain | 杀节点 ≤3s 重分配；stale epoch 421；drain 后清零 | B2 |
 | B4 | edge：路径/子域、节点代理、SSE 转发、失败重试、session→node | 1k 并发流；故障自动重试 | B2 |
 | B5 | ingest 幂等 + 金额/时段重算 + usage 分片 + spool + 吊销 + journal 重放 | 断网 30s 不丢不重；恢复对账一致 | B1/B3 |
 | B6 | 集群 e2e + 部署（1 controller + 3 node + 2 edge + nginx） | `cluster_e2e.sh` 全绿 | B1–B5 |
 
-B1 进度：`meta.uya`（meta.db，21 断言）、`elect.uya`（A/S 选主，8 断言）、
-controller 控制面（`/controller/register|heartbeat|config|status` + `--meta/--node-id`
-+ standby 不备份，e2e 覆盖）已完成；config 长轮询语义与 journal 摄取待做。
+B1 已完成（见 `TODO_DONE.md`）：meta.db、A/S 选主、controller 控制面与 standby 不备份。
 
 ---
 
@@ -79,7 +76,7 @@ controller 控制面（`/controller/register|heartbeat|config|status` + `--meta/
 2. 并行：A0 spike（SQLite + money）
 3. TLS-06 → TLS-07 → TLS-08 → TLS-09 → TLS-10 → TLS-11
 4. ~~A1 → A2 → A3 → A6 → A7 → A9~~ → A4/A5/A8 收尾
-5. B1（meta.db 已完成，controller/选主待做）→ B2 → B3 → B4 → B5 → B6
+5. ~~B1~~ → B2 → B3 → B4 → B5 → B6
 6. C1 → C2 → C3 → C4 → C5 → C6
 
 ---

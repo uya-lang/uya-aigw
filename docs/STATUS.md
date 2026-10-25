@@ -26,9 +26,9 @@
 - A3（已落地）：`src/plugins/pool.uya` 插件池（stdio JSONL 子进程）：预热 min、复用、
   扩容到 max、空闲缩容到 min、崩溃指数退避、cancel、ping/pong；非阻塞 fd + poll 超时
   与按行分帧。`tests/test_pool.uya` 24 断言（`tests/plugin_echo.py` 作最小插件）。
-- B1（进行中）：`meta.db` + `elect.uya` + controller 控制面（register/heartbeat/
-  config/status，`--meta`/`--node-id`，standby 不备份）已完成；config 长轮询语义与
-  journal 摄取待接。
+- B1（已落地）：meta.db + `elect.uya` + controller 控制面（register/heartbeat/
+  config/status，`--meta`/`--node-id`，standby 不备份）。
+- B2 待做：node uplink/注册轮询/slug 归属。
 
 ## 开发命令（A9）
 
@@ -53,9 +53,9 @@
   `src/core/chat.uya` 编排（解析/路由/上游请求重写/结算，23 断言）；
   `httpsrv` 已捕获 `Authorization` 头（chat 鉴权的前置）。
   下一步把 `ChatPlan` 接到 serve 的 `POST /v1/chat/completions`（含 SSE 透传）。
-- B1（进行中）：`meta.db` + `elect.uya` + controller 控制面（register/heartbeat/
-  config/status，`--meta`/`--node-id`，standby 不备份）已完成；config 长轮询语义与
-  journal 摄取待接。
+- B1（已落地）：meta.db + `elect.uya` + controller 控制面（register/heartbeat/
+  config/status，`--meta`/`--node-id`，standby 不备份）。
+- B2 待做：node uplink/注册轮询/slug 归属。
 
 ## 开发命令（A9）
 
