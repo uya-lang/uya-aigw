@@ -22,9 +22,7 @@ Phase A0 (SQLite spike) 可与 Phase T 并行 ─────┘
 
 ## Phase T：TLS 供应商
 
-| ID | 任务 | 验收 | 依赖 |
-|---|---|---|---|
-| TLS-04 | `src/net/tlsx.uya`：指纹、pin、TOFU 多证书存储、链门控判定 | 同域多证书：已知通过；新证书链校验通过才追加；`none` 需显式开关 | TLS-03 |
+全部完成（TLS-01…TLS-11、TLS-04A 等见 `TODO_DONE.md`）。
 
 ---
 
@@ -70,7 +68,7 @@ Phase A0 (SQLite spike) 可与 Phase T 并行 ─────┘
 
 ## 当前建议顺序
 
-1. TLS-01 → TLS-02 → TLS-03 → TLS-04 → TLS-04A → TLS-05（spike，负面）→ TLS-05A（可恢复握手，已完成）
+1. ~~TLS-01 → … → TLS-05A~~（已完成，见 `TODO_DONE.md`）
 2. 并行：A0 spike（SQLite + money）
 3. TLS-06 → TLS-07 → TLS-08 → TLS-09 → TLS-10 → TLS-11
 4. A1 → A2 → ~~A3~~ → A4 → A5 → A6 → A7 → A8 → A9
