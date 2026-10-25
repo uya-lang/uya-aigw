@@ -29,7 +29,8 @@
 - A4（进行中）：`src/core/json.uya` 有界 JSON DOM + 构造器（44 断言）；
   schema v4 `providers`/`provider_models` + store CRUD/路由（33 断言）；
   `src/core/billing.uya` 结算（usage 双风格解析 + 查价 + journal/ledger 幂等，30 断言）；
-  `src/core/chat.uya` 编排（解析/路由/上游请求重写/结算，23 断言）。
+  `src/core/chat.uya` 编排（解析/路由/上游请求重写/结算，23 断言）；
+  `httpsrv` 已捕获 `Authorization` 头（chat 鉴权的前置）。
   下一步把 `ChatPlan` 接到 serve 的 `POST /v1/chat/completions`（含 SSE 透传）。
 - A2（已落地）：`schema.uya` 台阶式迁移（v1 身份、v2 价目、v3 用量账本）、`store.uya`
   用户/Key/OTP/会话（`tests/test_store.uya` 含登录→建 key→鉴权端到端）、`schedule.uya`

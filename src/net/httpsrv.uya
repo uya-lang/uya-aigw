@@ -9,6 +9,7 @@
 export const HSRV_METHOD_MAX: usize = 16;
 export const HSRV_PATH_MAX: usize = 1024;
 export const HSRV_HEAD_MAX: usize = 65536;
+export const HSRV_AUTH_MAX: usize = 256;
 
 export struct HsrvReq {
     method: [byte: HSRV_METHOD_MAX],
@@ -21,6 +22,8 @@ export struct HsrvReq {
     keep_alive: bool,
     expect_continue: bool,
     head_len: usize,        // 头部总字节数（含结尾空行）
+    auth: [byte: HSRV_AUTH_MAX], // Authorization 头的值（A4 chat 鉴权）
+    auth_len: usize,
 }
 
 fn hsl_lower(c: byte) byte {
@@ -65,6 +68,7 @@ export fn hsrv_parse_head(buf: &const byte, n: usize, max_head: usize,
     out.keep_alive = false;
     out.expect_continue = false;
     out.head_len = 0;
+    out.auth_len = 0;
     out.minor = 1;
     out.method_len = 0;
     out.path_len = 0;
@@ -200,6 +204,16 @@ export fn hsrv_parse_head(buf: &const byte, n: usize, max_head: usize,
             } else {
                 return -1;              // 只支持 chunked
             }
+        } else if hsl_eq_ci(&buf[n0], name_len, &"authorization"[0: 13], 13) {
+            if val_len > HSRV_AUTH_MAX {
+                return -1;
+            }
+            var ai: usize = 0;
+            while ai < val_len && ai < HSRV_AUTH_MAX {
+                out.auth[ai] = buf[v0 + ai];
+                ai = ai + 1;
+            }
+            out.auth_len = val_len;
         } else if hsl_eq_ci(&buf[n0], name_len, &"connection"[0: 10], 10) {
             if hsl_eq_ci(&buf[v0], val_len, &"close"[0: 5], 5) {
                 out.keep_alive = false;
