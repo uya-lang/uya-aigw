@@ -252,6 +252,28 @@ export fn uplink_register(ip: &[byte], port: u16, node_id: &[byte], role: &[byte
         jsonw_span(&w), timeout_ms, &out[0], 1024, &on);
 }
 
+/// GET /controller/config?node=<id>：拉 config 快照（版本 + epoch + 归属）。
+export fn uplink_config_node(ip: &[byte], port: u16, node_id: &[byte],
+    out: &byte, cap: usize, out_len: &usize, timeout_ms: u32) !i32 {
+    var path: [byte: 96] = [0: 96];
+    var pn: usize = 0;
+    const pre: &[byte] = &"/controller/config?node="[0: 24];
+    var i: usize = 0;
+    while i < pre.len && pn < 96 {
+        path[pn] = pre[i];
+        pn = pn + 1;
+        i = i + 1;
+    }
+    i = 0;
+    while i < node_id.len && pn < 96 {
+        path[pn] = node_id[i];
+        pn = pn + 1;
+        i = i + 1;
+    }
+    return uplink_request(ip, port, &"GET"[0: 3], path[0: pn],
+        &""[0: 0], timeout_ms, out, cap, out_len);
+}
+
 /// POST /controller/heartbeat。
 export fn uplink_heartbeat(ip: &[byte], port: u16, node_id: &[byte],
     journal_day: i64, entries: i64, timeout_ms: u32) !i32 {

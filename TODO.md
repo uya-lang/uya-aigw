@@ -47,28 +47,20 @@ A4/A5/A8 进度（子项已完成记录见 `TODO_DONE.md`）：
 
 | ID | 任务 | 验收 | 依赖 |
 |---|---|---|---|
-| B2 | node 集群模式：uplink 客户端、注册、拉快照、slug 归属校验 | 带 slug 落指定节点；断线回落轮询 | B1 |
 | B4 | edge：路径/子域、节点代理、SSE 转发、失败重试、session→node | 1k 并发流；故障自动重试 | B2 |
 | B5 | ingest 幂等 + 金额/时段重算 + usage 分片 + spool + 吊销 + journal 重放 | 断网 30s 不丢不重；恢复对账一致 | B1/B3 |
 | B6 | 集群 e2e + 部署（1 controller + 3 node + 2 edge + nginx） | `cluster_e2e.sh` 全绿 | B1–B5 |
 
+进度（子项完成记录见 `TODO_DONE.md`）：
+- B4：edge 路由核心（slug 归属 + session 亲和 + 失败清缓存 + 快照兜底，21 断言）与
+  `GET /edge/route`、`/edge/fail` 已落地；HTTP/SSE 代理与 1k 并发待做。
+- B5：幂等 ingest（`POST /controller/ingest`，重复批 `duplicate`）、区间重算、本地 spool、
+  Key 吊销已完成；spool 自动消费循环待做。
+- B6：`tests/cluster_e2e.sh`（`make cluster-e2e`）已全绿 —— 1 controller + 3 node 真 uplink 注册、
+  epoch/fencing、config 快照、edge 路由/亲和/归属、drain 迁移、ingest 幂等；nginx 反代与部署脚本待做。
 
-B5 进度：幂等 ingest（HTTP `/controller/ingest` 幂等，重复批 duplicate）、区间重算、
-本地 spool、Key 吊销已完成；spool 自动消费循环待做。
-
-B4 进度：edge 路由核心（slug 归属 + session 亲和 + 失败清缓存，11 断言）已完成；
-HTTP/SSE 代理与 1k 并发待做。
-
-B1 已完成（见 `TODO_DONE.md`）：meta.db、A/S 选主、controller 控制面与 standby 不备份。
-
-B6 进度：`tests/cluster_e2e.sh`（`make cluster-e2e`）已全绿 —— 1 controller + 3 node 真 uplink
-注册、epoch/fencing、edge 路由与亲和、drain 迁移、ingest 幂等；nginx 反代与部署脚本待做。
-
-B2 进度：`uplink.uya` + `--uplink` 已真正打通（阻塞 connect + 点分 IP 解析 + 固定缓冲请求；
-`cluster_e2e.sh` 用独立 node id 验证注册，避免假通过）；config 快照拉取、slug 归属校验待做。
-
-B3 已完成（见 `TODO_DONE.md`）：epoch/fencing/drain、控制面（421）、批量迁移/清零、
-stale 自动迁移，controller tick 每 3s 触发。
+已完成：B1（meta.db/选主/控制面）、B2（uplink、注册/心跳、config 快照、归属校验）、
+B3（epoch/fencing/drain、421、批量迁移/清零、stale 自动迁移），详见 `TODO_DONE.md`。
 
 ---
 
@@ -100,7 +92,7 @@ stale 自动迁移，controller tick 每 3s 触发。
 2. 并行：A0 spike（SQLite + money）
 3. TLS-06 → TLS-07 → TLS-08 → TLS-09 → TLS-10 → TLS-11
 4. ~~A1 → A2 → A3 → A6 → A7 → A9~~ → A4/A5/A8 收尾
-5. ~~B1 → B3 → B6~~ → B2 收尾 → B4 → B5
+5. ~~B1 → B2 → B3 → B6~~ → B4 → B5
 6. C1 → C2 → C3 → C4 → C5 → C6
 
 ---

@@ -60,5 +60,52 @@ fn test_unknown() !void {
     try assert_eq_i32(edge_route(&d, &""[0: 0], &"x"[0: 1], &nb[0], 16) as i32, 0);
 }
 
+fn test_snapshot() !void {
+    edge_reset();
+    edge_snapshot_clear();
+    try assert_eq_i32(edge_snapshot_count() as i32, 0);
+    _ = edge_snapshot_put(&"s1"[0: 2], &"edge-1"[0: 6]);
+    _ = edge_snapshot_put(&"s2"[0: 2], &"edge-2"[0: 6]);
+    try assert_eq_i32(edge_snapshot_count() as i32, 2);
+    // 覆盖同一 slug 不新增条目
+    _ = edge_snapshot_put(&"s1"[0: 2], &"edge-3"[0: 6]);
+    try assert_eq_i32(edge_snapshot_count() as i32, 2);
+    var nb: [byte: 16] = [0: 16];
+    var n: usize = edge_route_snapshot(&"s1"[0: 2], &""[0: 0], &nb[0], 16);
+    try assert_eq_bool(eq(nb[0: n], &"edge-3"[0: 6]), true);
+    // session 亲和：同一 session 固定到首次解析的节点
+    n = edge_route_snapshot(&"s2"[0: 2], &"k"[0: 1], &nb[0], 16);
+    try assert_eq_bool(eq(nb[0: n], &"edge-2"[0: 6]), true);
+    edge_fail(&"k"[0: 1]);
+    n = edge_route_snapshot(&"s1"[0: 2], &"k"[0: 1], &nb[0], 16);
+    try assert_eq_bool(eq(nb[0: n], &"edge-3"[0: 6]), true);
+    // 快照里没有的 slug
+    try assert_eq_i32(edge_route_snapshot(&"zz"[0: 2], &""[0: 0], &nb[0], 16) as i32, 0);
+    // 空参数
+    try assert_eq_i32(edge_snapshot_put(&""[0: 0], &"x"[0: 1]) as i32, 0);
+    try assert_eq_i32(edge_snapshot_put(&"s3"[0: 2], &""[0: 0]) as i32, 0);
+    edge_snapshot_clear();
+    try assert_eq_i32(edge_snapshot_count() as i32, 0);
+}
+
+fn test_snapshot_vs_meta() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_meta(&d);
+    edge_reset();
+    edge_snapshot_clear();
+    try meta_node_register(&d, &"b"[0: 1], &"edge"[0: 4], &""[0: 0], 1000);
+    _ = meta_epoch_bump(&d, &"b"[0: 1], 1000) catch { 0 as i64; };
+    try meta_assign(&d, &"m1"[0: 2], &"b"[0: 1], 1, 1000);
+    // 快照说 m1 在 edge-9，但 meta 有归属 → meta 优先
+    _ = edge_snapshot_put(&"m1"[0: 2], &"edge-9"[0: 6]);
+    var nb: [byte: 16] = [0: 16];
+    const n: usize = edge_route(&d, &"m1"[0: 2], &""[0: 0], &nb[0], 16);
+    try assert_eq_bool(eq(nb[0: n], &"b"[0: 1]), true);
+    edge_snapshot_clear();
+}
+
 test "route_affinity" { run_test("route_affinity", test_route_affinity); }
 test "unknown" { run_test("unknown", test_unknown); }
+test "snapshot" { run_test("snapshot", test_snapshot); }
+test "snapshot_vs_meta" { run_test("snapshot_vs_meta", test_snapshot_vs_meta); }

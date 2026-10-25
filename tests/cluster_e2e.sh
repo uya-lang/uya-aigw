@@ -82,6 +82,26 @@ CS=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer ck' --data '{"slug":
 echo "$CS" | grep -qi 'stale' || { echo "$CS" >&2; fail "fencing"; }
 ok epoch
 
+# 4b) B2：node 拉 config 快照（版本/epoch/归属），并暴露 /node/status
+CFG=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer ck' --data '{"payload":"{}"}' "$BASE/controller/config")
+echo "$CFG" | grep -q '"ok":true' || { echo "$CFG" >&2; fail "config put"; }
+NPORT=$(sed -n 's/^listen port=\([0-9]*\).*/\1/p' "$TMP/n.log" | head -1)
+[ -n "$NPORT" ] || { cat "$TMP/n.log" >&2; fail "node port"; }
+NS=""
+i=0
+while [ $i -lt 80 ]; do
+  NS=$(curl -s --max-time 5 "http://127.0.0.1:$NPORT/node/status")
+  echo "$NS" | grep -q '"config_version":1' && break
+  i=$((i + 1)); sleep 0.1
+done
+echo "$NS" | grep -q '"config_version":1' || { cat "$TMP/n.log" >&2; echo "$NS" >&2; fail "config snapshot"; }
+echo "$NS" | grep -q '"assignments":1' || { echo "$NS" >&2; fail "snapshot assignments"; }
+echo "$NS" | grep -q '"uplink":true' || { echo "$NS" >&2; fail "node uplink flag"; }
+# 边缘节点用本地快照就能解析归属（没有 meta.db）
+NR=$(curl -s --max-time 5 "http://127.0.0.1:$NPORT/edge/route?slug=s1")
+echo "$NR" | grep -q '"node":"node-b"' || { echo "$NR" >&2; fail "snapshot route"; }
+ok config-snapshot
+
 # 5) edge 路由 + session 亲和
 R1=$(curl -s --max-time 5 "$BASE/edge/route?slug=s1&session=sess-1")
 echo "$R1" | grep -q '"node":"node-b"' || { echo "$R1" >&2; fail "edge route"; }
@@ -89,6 +109,12 @@ R2=$(curl -s --max-time 5 "$BASE/edge/route?slug=s1&session=sess-1")
 echo "$R2" | grep -q '"node":"node-b"' || { echo "$R2" >&2; fail "affinity"; }
 RF=$(curl -s --max-time 5 "$BASE/edge/fail?session=sess-1")
 echo "$RF" | grep -q '"ok":true' || { echo "$RF" >&2; fail "edge fail"; }
+# 归属校验：node-b 认为 s1 是自己的，node-c 认为不是
+MINE=$(curl -s --max-time 5 "http://127.0.0.1:$NPORT/edge/route?slug=s1&self=node-b")
+echo "$MINE" | grep -q '"mine":true' || { echo "$MINE" >&2; fail "ownership mine"; }
+CPORT=$(sed -n 's/^listen port=\([0-9]*\).*/\1/p' "$TMP/node-c.log" | head -1)
+NOTMINE=$(curl -s --max-time 5 "http://127.0.0.1:$CPORT/edge/route?slug=s1&self=node-c")
+echo "$NOTMINE" | grep -q '"mine":false' || { echo "$NOTMINE" >&2; fail "ownership not mine"; }
 R404=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$BASE/edge/route?slug=none")
 [ "$R404" = "404" ] || fail "edge unknown slug expected 404 got $R404"
 ok edge

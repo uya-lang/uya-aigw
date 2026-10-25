@@ -88,6 +88,7 @@ const ROUTE_ADMIN_PAGE: i32 = 33;
 const ROUTE_ADMIN_JS: i32 = 34;
 const ROUTE_EDGE_ROUTE: i32 = 35;
 const ROUTE_EDGE_FAIL: i32 = 36;
+const ROUTE_NODE_STATUS: i32 = 37;
 const ROUTE_BUDGET: i32 = 30;
 const ROUTE_ESTIMATE: i32 = 29;
 const ROUTE_USAGE_CSV: i32 = 28;
@@ -218,7 +219,45 @@ var g_uplink_ip: [byte: 64] = [0: 64];
 var g_uplink_ip_len: usize = 0;
 var g_uplink_port: u16 = 0;
 var g_uplink_last_ms: u64 = 0;
+var g_cfg_last_ms: u64 = 0;
+var g_cfg_version: i64 = 0;
+var g_cfg_epoch: i64 = 0;
 var g_rebalance_last_ms: u64 = 0;
+
+/// B2：拉取并应用 controller 下发的 config 快照。
+fn srv_cfg_pull(ip: &[byte], node_id: &[byte]) void {
+    var raw: [byte: 8192] = [0: 8192];
+    var rn: usize = 0;
+    _ = uplink_config_node(ip, g_uplink_port, node_id, &raw[0], 8192, &rn, 2000) catch {
+        0 as i32;
+    };
+    if rn == 0 {
+        return;
+    }
+    var d: JsonDoc = JsonDoc{};
+    json_parse(&d, raw[0: rn]) catch {
+        return;
+    };
+    const root: i32 = json_root(&d);
+    g_cfg_version = json_i64(&d, json_get(&d, root, &"version"[0: 7]));
+    g_cfg_epoch = json_i64(&d, json_get(&d, root, &"epoch"[0: 5]));
+    const arr: i32 = json_get(&d, root, &"assign"[0: 6]);
+    if arr < 0 {
+        return;
+    }
+    const n: usize = json_arr_len(&d, arr);
+    edge_snapshot_clear();
+    var i: usize = 0;
+    while i < n && i < 128 {
+        const it: i32 = json_arr_at(&d, arr, i);
+        var sl: [byte: 128] = [0: 128];
+        const sln: usize = json_str(&d, json_get(&d, it, &"slug"[0: 4]), &sl[0], 128);
+        var nd: [byte: 64] = [0: 64];
+        const ndn: usize = json_str(&d, json_get(&d, it, &"node"[0: 4]), &nd[0], 64);
+        _ = edge_snapshot_put(sl[0: sln], nd[0: ndn]);
+        i = i + 1;
+    }
+}
 
 fn srv_uplink_setup(spec: &[byte]) void {
     g_uplink_ready = false;
@@ -592,6 +631,9 @@ fn srv_route_of(req: &HsrvReq) i32 {
     }
     if srv_path_is(req, &"/v1/keys/revoke"[0: 15]) {
         return ROUTE_KEY_REVOKE;
+    }
+    if srv_path_is(req, &"/node/status"[0: 12]) {
+        return ROUTE_NODE_STATUS;
     }
     if srv_path_is(req, &"/edge/fail"[0: 10]) {
         return ROUTE_EDGE_FAIL;
@@ -1211,6 +1253,10 @@ fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
         srv_me(c, stats);
         return;
     }
+    if c.route == ROUTE_NODE_STATUS {
+        srv_node_status(c, stats);
+        return;
+    }
     if c.route == ROUTE_EDGE_FAIL {
         srv_edge_fail(c, stats);
         return;
@@ -1221,6 +1267,10 @@ fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
     }
     if c.route == ROUTE_ADMIN_JS {
         srv_admin_js(c, stats);
+        return;
+    }
+    if c.route == ROUTE_NODE_STATUS {
+        srv_node_status(c, stats);
         return;
     }
     if c.route == ROUTE_EDGE_FAIL {
@@ -1800,6 +1850,15 @@ export fn serve_run(lfd: i32, stats: &ServeStats) !i32 {
             _ = uplink_register(ipb[0: ipn], g_uplink_port, nb[0: nn],
                 &"edge"[0: 4], &""[0: 0], 2000) catch {};
             uplink_heartbeat(ipb[0: ipn], g_uplink_port, nb[0: nn], 0, 0, 2000) catch {};
+        }
+        // B2：每 3s 拉一次 config 快照（版本/epoch/归属），边缘节点据此本地路由。
+        if ums > g_cfg_last_ms +% 3000 {
+            g_cfg_last_ms = ums;
+            var ipb2: [byte: 64] = [0: 64];
+            const ipn2: usize = srv_uplink_copy(&ipb2[0], 64);
+            var nb2: [byte: 64] = [0: 64];
+            const nn2: usize = srv_node_copy(&nb2[0], 64);
+            srv_cfg_pull(ipb2[0: ipn2], nb2[0: nn2]);
         }
     }
     runtime_tick();
@@ -3225,6 +3284,39 @@ fn srv_ctl_config(c: &SrvConn, stats: &ServeStats) void {
     jsonw_i64(&w, ver);
     jsonw_key(&w, &"payload"[0: 7]);
     jsonw_str(&w, pb[0: plen]);
+    var lbv: [byte: 64] = [0: 64];
+    var lnv: usize = 0;
+    lnv = elect_leader(&g_meta, store_now(), &lbv[0], 64) catch {
+        0 as usize;
+    };
+    var lep: i64 = 0;
+    if lnv > 0 {
+        lep = meta_epoch_get(&g_meta, lbv[0: lnv]) catch {
+            0 as i64;
+        };
+    }
+    jsonw_key(&w, &"epoch"[0: 5]);
+    jsonw_i64(&w, lep);
+    var rows: [MetaAssign: 128] = [];
+    var rn: usize = 0;
+    rn = meta_assign_list(&g_meta, &rows[0], 128) catch {
+        0 as usize;
+    };
+    jsonw_key(&w, &"assign"[0: 6]);
+    jsonw_arr(&w);
+    var i: usize = 0;
+    while i < rn {
+        jsonw_obj(&w);
+        jsonw_key(&w, &"slug"[0: 4]);
+        jsonw_str(&w, rows[i].slug[0: rows[i].slug_len]);
+        jsonw_key(&w, &"node"[0: 4]);
+        jsonw_str(&w, rows[i].node_id[0: rows[i].node_len]);
+        jsonw_key(&w, &"epoch"[0: 5]);
+        jsonw_i64(&w, rows[i].epoch);
+        jsonw_end_obj(&w);
+        i = i + 1;
+    }
+    jsonw_end_arr(&w);
     jsonw_end_obj(&w);
     srv_static(c, 200, jsonw_span(&w), keep);
 }
@@ -3886,7 +3978,7 @@ fn srv_admin_js(c: &SrvConn, stats: &ServeStats) void {
 fn srv_edge_route(c: &SrvConn, stats: &ServeStats) void {
     const keep: bool = c.keep;
     stats.requests = stats.requests +% 1;
-    if !g_meta_ready {
+    if !g_meta_ready && !g_uplink_ready {
         srv_static(c, 503, SRV_JSON_503, keep);
         return;
     }
@@ -3895,8 +3987,13 @@ fn srv_edge_route(c: &SrvConn, stats: &ServeStats) void {
     var sess: [byte: 128] = [0: 128];
     const ssn: usize = srv_query_str(&c.path[0], c.path_len, &"session"[0: 7], 7, &sess[0], 128);
     var nb: [byte: 64] = [0: 64];
-    // 归属在 meta.db（边缘节点是本地副本），不是业务库。
-    const nn: usize = edge_route(&g_meta, slug[0: sn], sess[0: ssn], &nb[0], 64);
+    // 归属在 meta.db（边缘节点是本地快照），不是业务库。
+    var nn: usize = 0;
+    if g_meta_ready {
+        nn = edge_route(&g_meta, slug[0: sn], sess[0: ssn], &nb[0], 64);
+    } else {
+        nn = edge_route_snapshot(slug[0: sn], sess[0: ssn], &nb[0], 64);
+    }
     if nn == 0 {
         srv_static(c, 404, SRV_JSON_404, keep);
         return;
@@ -3908,6 +4005,13 @@ fn srv_edge_route(c: &SrvConn, stats: &ServeStats) void {
     jsonw_str(&w, slug[0: sn]);
     jsonw_key(&w, &"node"[0: 4]);
     jsonw_str(&w, nb[0: nn]);
+    // slug 归属校验：带 self= 时回答「这个 slug 是不是我的」。
+    var sf: [byte: 64] = [0: 64];
+    const sfn: usize = srv_query_str(&c.path[0], c.path_len, &"self"[0: 4], 4, &sf[0], 64);
+    if sfn > 0 {
+        jsonw_key(&w, &"mine"[0: 4]);
+        jsonw_bool(&w, sfn == nn && srv_slice_eq(sf[0: sfn], nb[0: nn]));
+    }
     jsonw_end_obj(&w);
     srv_static(c, 200, jsonw_span(&w), keep);
 }
@@ -3920,4 +4024,30 @@ fn srv_edge_fail(c: &SrvConn, stats: &ServeStats) void {
     const sn: usize = srv_query_str(&c.path[0], c.path_len, &"session"[0: 7], 7, &sess[0], 128);
     edge_fail(sess[0: sn]);
     srv_static(c, 200, SRV_JSON_OK, keep);
+}
+
+
+/// B2：本节点视角的集群状态（配置版本 / epoch / 本地归属快照条数）。
+fn srv_node_status(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    var nb: [byte: 64] = [0: 64];
+    const nn: usize = srv_node_copy(&nb[0], 64);
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"node"[0: 4]);
+    jsonw_str(&w, nb[0: nn]);
+    jsonw_key(&w, &"config_version"[0: 14]);
+    jsonw_i64(&w, g_cfg_version);
+    jsonw_key(&w, &"epoch"[0: 5]);
+    jsonw_i64(&w, g_cfg_epoch);
+    jsonw_key(&w, &"assignments"[0: 11]);
+    jsonw_i64(&w, edge_snapshot_count() as i64);
+    jsonw_key(&w, &"meta"[0: 4]);
+    jsonw_bool(&w, g_meta_ready);
+    jsonw_key(&w, &"uplink"[0: 6]);
+    jsonw_bool(&w, g_uplink_ready);
+    jsonw_end_obj(&w);
+    srv_static(c, 200, jsonw_span(&w), keep);
 }

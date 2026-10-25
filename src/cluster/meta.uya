@@ -367,6 +367,32 @@ export fn meta_node_set_status(d: &Db, node_id: &[byte], status: &[byte], now: i
 }
 
 /// 某节点当前拥有的 slug 数。
+export struct MetaAssign {
+    slug: [byte: 128],
+    slug_len: usize,
+    node_id: [byte: META_ID_MAX],
+    node_len: usize,
+    epoch: i64,
+}
+
+/// 列出全部归属（controller 下发快照用）。
+export fn meta_assign_list(d: &Db, out: &MetaAssign, cap: usize) !usize {
+    var st: DbStmt = dbx_prepare(d,
+        "select slug, node_id, epoch from meta_assignments order by slug limit ?" as &const byte) catch {
+        return error.MetaFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_i64(&st, 1, cap as i64) catch { return error.MetaFailed; };
+    var n: usize = 0;
+    while dbx_step(&st) == 1 && n < cap {
+        out[n].slug_len = dbx_col_text(&st, 0, &out[n].slug[0], 128);
+        out[n].node_len = dbx_col_text(&st, 1, &out[n].node_id[0], META_ID_MAX);
+        out[n].epoch = dbx_col_i64(&st, 2);
+        n = n + 1;
+    }
+    return n;
+}
+
 export fn meta_assign_count(d: &Db, node_id: &[byte]) !i64 {
     var st: DbStmt = dbx_prepare(d,
         "select count(*) from meta_assignments where node_id = ?" as &const byte) catch {

@@ -66,6 +66,114 @@ fn edge_cache(h: u64, node: &const byte, n: usize) void {
     edge_at(i).node_len = k;
 }
 
+// ---- B2：controller 下发的归属快照（边缘节点没有 meta.db 时用它解析）----
+const EDGE_SNAP_MAX: usize = 256;
+
+struct EdgeAssign {
+    used: bool,
+    slug: [byte: 128],
+    slug_len: usize,
+    node: [byte: EDGE_NODE_MAX],
+    node_len: usize,
+}
+
+var g_snap: [EdgeAssign: EDGE_SNAP_MAX] = [];
+
+fn snap_at(i: usize) &EdgeAssign {
+    if i >= 0 && i < 256 {
+        return &g_snap[i];
+    }
+    return &g_snap[0];
+}
+
+fn snap_len(a: &EdgeAssign) usize {
+    if a.slug_len > 128 {
+        return 128;
+    }
+    return a.slug_len;
+}
+
+fn snap_find(slug: &[byte]) usize {
+    var i: usize = 0;
+    while i < 256 {
+        const a: &EdgeAssign = snap_at(i);
+        if a.used && a.slug_len == slug.len && edge_eq(a.slug[0: snap_len(a)], slug) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return EDGE_SNAP_MAX;
+}
+
+fn edge_eq(a: &[byte], b: &[byte]) bool {
+    if a.len != b.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < a.len {
+        if a[i] != b[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+export fn edge_snapshot_clear() void {
+    var i: usize = 0;
+    while i < 256 {
+        snap_at(i).used = false;
+        snap_at(i).slug_len = 0;
+        snap_at(i).node_len = 0;
+        i = i + 1;
+    }
+}
+
+export fn edge_snapshot_put(slug: &[byte], node: &[byte]) usize {
+    if slug.len == 0 || node.len == 0 || slug.len > 128 || node.len > EDGE_NODE_MAX {
+        return 0 as usize;
+    }
+    var i: usize = snap_find(slug);
+    if i == EDGE_SNAP_MAX {
+        i = 0;
+        while i < 256 && snap_at(i).used {
+            i = i + 1;
+        }
+        if i >= 256 {
+            return 0 as usize;
+        }
+    }
+    const a: &EdgeAssign = snap_at(i);
+    a.used = true;
+    a.slug_len = 0;
+    var k: usize = 0;
+    while k < slug.len {
+        a.slug[k] = slug[k];
+        k = k + 1;
+    }
+    a.slug_len = k;
+    a.node_len = 0;
+    k = 0;
+    while k < node.len {
+        a.node[k] = node[k];
+        k = k + 1;
+    }
+    a.node_len = k;
+    return 1 as usize;
+}
+
+export fn edge_snapshot_count() usize {
+    var i: usize = 0;
+    var n: usize = 0;
+    while i < 256 {
+        if snap_at(i).used {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
 export fn edge_reset() void {
     var i: usize = 0;
     while i < 256 {
@@ -96,9 +204,54 @@ export fn edge_route(d: &Db, slug: &[byte], session: &[byte], out: &byte,
         }
     }
     var ep: i64 = 0;
-    const n: usize = meta_assign_get(d, slug, out, cap, &ep) catch {
+    var n: usize = meta_assign_get(d, slug, out, cap, &ep) catch {
         0 as usize;
     };
+    if n == 0 {
+        // 边缘节点：用 controller 下发的快照兜底。
+        const si: usize = snap_find(slug);
+        if si < 256 {
+            var k: usize = 0;
+            while k < snap_at(si).node_len && k < cap {
+                out[k] = snap_at(si).node[k];
+                k = k + 1;
+            }
+            n = k;
+        }
+    }
+    if n > 0 && session.len > 0 {
+        edge_cache(h, out, n);
+    }
+    return n;
+}
+
+/// 只用本地快照解析（边缘节点没有 meta.db 时用）。
+export fn edge_route_snapshot(slug: &[byte], session: &[byte], out: &byte, cap: usize) usize {
+    if slug.len == 0 || cap == 0 {
+        return 0;
+    }
+    var h: u64 = 0;
+    if session.len > 0 {
+        h = edge_hash(session);
+        const idx: usize = edge_find(h);
+        if idx < 256 {
+            var k: usize = 0;
+            while k < edge_at(idx).node_len && k < 64 && k < cap {
+                out[k] = edge_at(idx).node[k];
+                k = k + 1;
+            }
+            return k;
+        }
+    }
+    const si: usize = snap_find(slug);
+    if si >= 256 {
+        return 0;
+    }
+    var n: usize = 0;
+    while n < snap_at(si).node_len && n < cap {
+        out[n] = snap_at(si).node[n];
+        n = n + 1;
+    }
     if n > 0 && session.len > 0 {
         edge_cache(h, out, n);
     }

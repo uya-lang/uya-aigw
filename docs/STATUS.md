@@ -41,7 +41,8 @@
 - C4（进行中）：Playground（流式指标）+ 账单预算（schema v8、`/v1/budget`）已落地；
   通知待做。
 - C5（进行中）：`/admin` 页 + `/admin/users`、`/admin/providers` 已落地；改价/绑定/审计待做。
-- B2（已修复）：uplink 之前其实从未成功（`tcpx_connect_v4` 在事件循环里只空转、点分 IP 未解析、
+- B2（已完成）：uplink 修复 + config 快照（版本/epoch/归属）+ `/node/status` + slug 归属校验（`/edge/route?self=`）。
+  旧问题：uplink 之前其实从未成功（`tcpx_connect_v4` 在事件循环里只空转、点分 IP 未解析、
   请求用了非 NUL 结尾的 cstr 追加）；已改为阻塞 socket/connect + `dnsx_parse_ipv4` + 固定缓冲，
   `make cluster-e2e` 用独立 node id 验证注册。
 - B4（进行中）：edge 路由核心 + `GET /edge/route`、`/edge/fail` 已落地；HTTP/SSE 代理与 1k 并发待做。
@@ -90,7 +91,8 @@
 - C4（进行中）：Playground（流式指标）+ 账单预算（schema v8、`/v1/budget`）已落地；
   通知待做。
 - C5（进行中）：`/admin` 页 + `/admin/users`、`/admin/providers` 已落地；改价/绑定/审计待做。
-- B2（已修复）：uplink 之前其实从未成功（`tcpx_connect_v4` 在事件循环里只空转、点分 IP 未解析、
+- B2（已完成）：uplink 修复 + config 快照（版本/epoch/归属）+ `/node/status` + slug 归属校验（`/edge/route?self=`）。
+  旧问题：uplink 之前其实从未成功（`tcpx_connect_v4` 在事件循环里只空转、点分 IP 未解析、
   请求用了非 NUL 结尾的 cstr 追加）；已改为阻塞 socket/connect + `dnsx_parse_ipv4` + 固定缓冲，
   `make cluster-e2e` 用独立 node id 验证注册。
 - B4（进行中）：edge 路由核心 + `GET /edge/route`、`/edge/fail` 已落地；HTTP/SSE 代理与 1k 并发待做。
