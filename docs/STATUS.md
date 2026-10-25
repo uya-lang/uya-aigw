@@ -23,12 +23,13 @@
   amalgamation（离线不可得），见 TODO A0。
 - A4（日志部分）：`src/core/reqlog.uya`，一行 `k=v` 的每请求日志（含 cost/tok-s），
   `tests/test_reqlog.uya` 全过。
-- A2（已落地）：`schema.uya` 台阶式迁移（users/api_keys/otp_codes/sessions）、`store.uya`
+- A2（已落地）：`schema.uya` 台阶式迁移（v1 身份、v2 价目、v3 用量账本）、`store.uya`
   用户/Key/OTP/会话（`tests/test_store.uya` 含登录→建 key→鉴权端到端）、`schedule.uya`
   分时规则（`tests/test_schedule.uya` 28 断言）、`backup.uya` VACUUM INTO 快照 + 保留
-  （`tests/test_backup.uya` 41 断言，快照可独立打开读回）。
-  **剩余**：价目表（price_cards/price_entries）落库与查询、计费 journal 追加/重放、
-  以及把 store/backup 接到 `aigw serve` 的启动流程。
+  （`tests/test_backup.uya` 41 断言，快照可独立打开读回）、`price.uya` 版本化价目 +
+  用户覆盖 + 分时金额、`journal.uya` 每日分片 journal + fsync + 幂等重放
+  （`tests/test_price.uya` 28 断言、`tests/test_journal.uya` 50 断言）。
+  **剩余**：把 store/backup/journal/价目接到 `aigw serve` 的启动流程与请求路径（A4 起）。
 - A1（服务端）：`src/net/serve.uya` 单线程 epoll 状态机（1024 槽）、64 MiB 包体流式排空、
   chunked SSE、SIGTERM 优雅停机；`tests/serve_smoke.sh` 断言 512 并发 SSE、线程数=1、
   停机退出码 0（`SERVE-ALL-OK`）。

@@ -12,7 +12,7 @@
 //
 // 打开流程（`schema_open`）：open → pragmas → migrate。热路径不该调它。
 
-export const SCHEMA_VERSION: i32 = 1;
+export const SCHEMA_VERSION: i32 = 3;
 
 export error SchemaFailed;
 
@@ -59,6 +59,39 @@ fn schema_v1(d: &Db) !void {
     try dbx_exec_cstr(d, "create index if not exists idx_otp_email on otp_codes(email, expires_at)" as &const byte);
     try dbx_exec_cstr(d, "create table if not exists sessions (id integer primary key, user_id integer not null references users(id) on delete cascade, token_hash text not null unique, created_at integer not null, expires_at integer not null, ip text not null default '', ua text not null default '')" as &const byte);
     try dbx_exec_cstr(d, "create index if not exists idx_sessions_user on sessions(user_id)" as &const byte);
+}
+
+// ---------------------------------------------------------------
+// v2：价目表（版本化卡片 + 条目）
+// ---------------------------------------------------------------
+//
+// price_cards.kind       0=卖价（模型级 + 用户覆盖） 1=进价（绑定级 provider+model）
+// price_cards.version    同 kind 内唯一；改价 = 新版本 + effective_from
+// price_entries.user_id  0=默认；非 0 是用户覆盖（仅卖价使用）
+// price_entries.provider 进价用（上游供应商名）；卖价留空
+// price_entries.schedule 分时规则（见 schedule.uya），空串表示不调价
+//
+// 历史请求只记录 card_id/version，改价不回写历史。
+
+fn schema_v2(d: &Db) !void {
+    try dbx_exec_cstr(d, "create table if not exists price_cards (id integer primary key, kind integer not null, version integer not null, effective_from integer not null, created_at integer not null, note text not null default '')" as &const byte);
+    try dbx_exec_cstr(d, "create unique index if not exists idx_price_cards_kind_version on price_cards(kind, version)" as &const byte);
+    try dbx_exec_cstr(d, "create index if not exists idx_price_cards_effective on price_cards(kind, effective_from)" as &const byte);
+    try dbx_exec_cstr(d, "create table if not exists price_entries (id integer primary key, card_id integer not null references price_cards(id) on delete cascade, provider text not null default '', model text not null, user_id integer not null default 0, input_nano_per_mtok integer not null default 0, output_nano_per_mtok integer not null default 0, cache_read_nano_per_mtok integer not null default 0, per_request_nano integer not null default 0, schedule text not null default '')" as &const byte);
+    try dbx_exec_cstr(d, "create unique index if not exists idx_price_entries_key on price_entries(card_id, provider, model, user_id)" as &const byte);
+}
+
+// ---------------------------------------------------------------
+// v3：用量账本（journal 重放的落点，幂等）
+// ---------------------------------------------------------------
+//
+// request_id 是幂等键：同一批 ingest 重放多少次，账本都只有一行。
+// usage_ledger 是「明细」，A6 的 rollup 汇总表在下一台阶。
+
+fn schema_v3(d: &Db) !void {
+    try dbx_exec_cstr(d, "create table if not exists usage_ledger (request_id text primary key, user_id integer not null, ts integer not null, model text not null, provider text not null default '', input_tokens integer not null default 0, output_tokens integer not null default 0, cache_read_tokens integer not null default 0, cost_nano integer not null default 0, price_nano integer not null default 0, period text not null default '', rate_version integer not null default 0)" as &const byte);
+    try dbx_exec_cstr(d, "create index if not exists idx_usage_ledger_ts on usage_ledger(ts)" as &const byte);
+    try dbx_exec_cstr(d, "create index if not exists idx_usage_ledger_user on usage_ledger(user_id, ts)" as &const byte);
 }
 
 // ---------------------------------------------------------------
@@ -120,6 +153,16 @@ export fn schema_migrate(d: &Db) !i32 {
         var failed: bool = false;
         if cur == 0 {
             schema_v1(d) catch |_| {
+                failed = true;
+            };
+            applied = true;
+        } else if cur == 1 {
+            schema_v2(d) catch |_| {
+                failed = true;
+            };
+            applied = true;
+        } else if cur == 2 {
+            schema_v3(d) catch |_| {
                 failed = true;
             };
             applied = true;

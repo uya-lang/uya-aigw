@@ -1,0 +1,292 @@
+// src/core/price.uya — A2 价目表：版本化卡片 + 条目（模型 / 供应商 / 用户覆盖）+ 分时
+//
+// 数据模型（schema v2）：
+//
+//   price_cards   一类价目（卖价 / 进价）的一个版本。改价 = 追加新版本，
+//                 `effective_from` 到点自动生效；历史请求只记 card_id/version，不回写。
+//   price_entries 卡片下的一条价：provider + model + user_id 唯一。
+//                   * 进价（PRICE_KIND_COST）：按 provider + model 查（绑定级）。
+//                   * 卖价（PRICE_KIND_SELL）：provider 留空，先查用户覆盖、再查默认。
+//                   * schedule 是该条价的分时规则（schedule.uya），空串表示不调价。
+//
+// 金额口径（与 A4 的预览、账单必须逐 nano 一致）：
+//
+//   base   = per_request_nano
+//          + round(input_tokens  * input_nano_per_mtok  / 1e6)
+//          + round(output_tokens * output_nano_per_mtok / 1e6)
+//          + round(cache_tokens  * cache_read_nano_per_mtok / 1e6)
+//   amount = round(base * permille / 1000)
+//
+// 分时倍率只缩放 token 部分 + 单次费的整体（先加后乘），不做逐项舍入，
+// 避免「预览」和「重算」因为舍入顺序不同而差 1 nano。
+
+export const PRICE_KIND_SELL: i32 = 0;
+export const PRICE_KIND_COST: i32 = 1;
+
+export error PriceFailed;
+export error PriceNotFound;
+export error PriceInvalid;
+
+/// 一张价目卡片的读模型。
+export struct PriceCard {
+    id: i64,
+    kind: i32,
+    version: i64,
+    effective_from: i64,
+    found: bool,
+}
+
+/// 一条价目（已应用分时倍率）。
+export struct PriceRates {
+    input_nano_per_mtok: i64,
+    output_nano_per_mtok: i64,
+    cache_read_nano_per_mtok: i64,
+    per_request_nano: i64,
+    permille: i32,
+    card_id: i64,
+    version: i64,
+    found: bool,
+}
+
+/// 一次请求的 token 用量。
+export struct PriceUsage {
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+}
+
+fn price_kind_ok(kind: i32) bool {
+    return kind == PRICE_KIND_SELL || kind == PRICE_KIND_COST;
+}
+
+fn price_rates_ok(input: i64, output: i64, cache: i64, per_req: i64) bool {
+    return input >= 0 && output >= 0 && cache >= 0 && per_req >= 0;
+}
+
+// ---------------------------------------------------------------
+// 卡片
+// ---------------------------------------------------------------
+
+/// 建一张价目卡片；`version` 在同一 kind 内唯一。返回 id。
+export fn price_card_create(d: &Db, kind: i32, version: i64, effective_from: i64,
+    created_at: i64, note: &[byte], out: &PriceCard) !void {
+    if !price_kind_ok(kind) || version <= 0 {
+        return error.PriceInvalid;
+    }
+    var st: DbStmt = dbx_prepare(d,
+        "insert into price_cards(kind, version, effective_from, created_at, note) values(?, ?, ?, ?, ?)" as &const byte) catch {
+        return error.PriceFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_i64(&st, 1, kind as i64) catch {
+        return error.PriceFailed;
+    };
+    dbx_bind_i64(&st, 2, version) catch {
+        return error.PriceFailed;
+    };
+    dbx_bind_i64(&st, 3, effective_from) catch {
+        return error.PriceFailed;
+    };
+    dbx_bind_i64(&st, 4, created_at) catch {
+        return error.PriceFailed;
+    };
+    dbx_bind_text(&st, 5, note) catch {
+        return error.PriceFailed;
+    };
+    if dbx_step(&st) != 0 {
+        return error.PriceFailed;
+    }
+    out.id = dbx_last_insert_rowid(d);
+    out.kind = kind;
+    out.version = version;
+    out.effective_from = effective_from;
+    out.found = true;
+    return;
+}
+
+/// 取 `ts` 时刻生效的卡片：effective_from <= ts 里最新的一张。
+export fn price_card_lookup(d: &Db, kind: i32, ts: i64, out: &PriceCard) !void {
+    if !price_kind_ok(kind) {
+        return error.PriceInvalid;
+    }
+    var st: DbStmt = dbx_prepare(d,
+        "select id, version, effective_from from price_cards where kind = ? and effective_from <= ? order by effective_from desc, version desc limit 1" as &const byte) catch {
+        return error.PriceFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_i64(&st, 1, kind as i64) catch {
+        return error.PriceFailed;
+    };
+    dbx_bind_i64(&st, 2, ts) catch {
+        return error.PriceFailed;
+    };
+    if dbx_step(&st) != 1 {
+        out.found = false;
+        return error.PriceNotFound;
+    }
+    out.id = dbx_col_i64(&st, 0);
+    out.kind = kind;
+    out.version = dbx_col_i64(&st, 1);
+    out.effective_from = dbx_col_i64(&st, 2);
+    out.found = true;
+    return;
+}
+
+// ---------------------------------------------------------------
+// 条目
+// ---------------------------------------------------------------
+
+/// 写入/覆盖一条价目。同一 (card, provider, model, user_id) 只保留一条。
+export fn price_entry_put(d: &Db, card_id: i64, provider: &[byte], model: &[byte],
+    user_id: i64, input_nano_per_mtok: i64, output_nano_per_mtok: i64,
+    cache_read_nano_per_mtok: i64, per_request_nano: i64, schedule: &[byte]) !void {
+    if card_id <= 0 || model.len == 0 || user_id < 0 {
+        return error.PriceInvalid;
+    }
+    if !price_rates_ok(input_nano_per_mtok, output_nano_per_mtok,
+        cache_read_nano_per_mtok, per_request_nano) {
+        return error.PriceInvalid;
+    }
+    var s: Sched = Sched{ rules: [], count: 0 };
+    schedule_parse(schedule, &s) catch |_| {
+        return error.PriceInvalid;
+    };
+    var st: DbStmt = dbx_prepare(d,
+        "insert or replace into price_entries(card_id, provider, model, user_id, input_nano_per_mtok, output_nano_per_mtok, cache_read_nano_per_mtok, per_request_nano, schedule) values(?, ?, ?, ?, ?, ?, ?, ?, ?)" as &const byte) catch {
+        return error.PriceFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_i64(&st, 1, card_id) catch {
+        return error.PriceFailed;
+    };
+    dbx_bind_text(&st, 2, provider) catch {
+        return error.PriceFailed;
+    };
+    dbx_bind_text(&st, 3, model) catch {
+        return error.PriceFailed;
+    };
+    dbx_bind_i64(&st, 4, user_id) catch {
+        return error.PriceFailed;
+    };
+    dbx_bind_i64(&st, 5, input_nano_per_mtok) catch {
+        return error.PriceFailed;
+    };
+    dbx_bind_i64(&st, 6, output_nano_per_mtok) catch {
+        return error.PriceFailed;
+    };
+    dbx_bind_i64(&st, 7, cache_read_nano_per_mtok) catch {
+        return error.PriceFailed;
+    };
+    dbx_bind_i64(&st, 8, per_request_nano) catch {
+        return error.PriceFailed;
+    };
+    dbx_bind_text(&st, 9, schedule) catch {
+        return error.PriceFailed;
+    };
+    if dbx_step(&st) != 0 {
+        return error.PriceFailed;
+    }
+    return;
+}
+
+/// 在一张卡片里查价：用户覆盖优先，其次默认（user_id=0）。
+fn price_entry_lookup(d: &Db, card: &PriceCard, provider: &[byte], model: &[byte],
+    user_id: i64, ts: i64, tz_min: i32, out: &PriceRates) !void {
+    var st: DbStmt = dbx_prepare(d,
+        "select input_nano_per_mtok, output_nano_per_mtok, cache_read_nano_per_mtok, per_request_nano, schedule from price_entries where card_id = ? and provider = ? and model = ? and user_id in (?, 0) order by user_id desc limit 1" as &const byte) catch {
+        return error.PriceFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_i64(&st, 1, card.id) catch {
+        return error.PriceFailed;
+    };
+    dbx_bind_text(&st, 2, provider) catch {
+        return error.PriceFailed;
+    };
+    dbx_bind_text(&st, 3, model) catch {
+        return error.PriceFailed;
+    };
+    dbx_bind_i64(&st, 4, user_id) catch {
+        return error.PriceFailed;
+    };
+    if dbx_step(&st) != 1 {
+        out.found = false;
+        return error.PriceNotFound;
+    }
+    out.input_nano_per_mtok = dbx_col_i64(&st, 0);
+    out.output_nano_per_mtok = dbx_col_i64(&st, 1);
+    out.cache_read_nano_per_mtok = dbx_col_i64(&st, 2);
+    out.per_request_nano = dbx_col_i64(&st, 3);
+    var sched_buf: [byte: 1024] = [0: 1024];
+    const sn: usize = dbx_col_text(&st, 4, &sched_buf[0], 1024);
+    out.permille = schedule_permille_of(sched_buf[0: sn], ts, tz_min);
+    out.card_id = card.id;
+    out.version = card.version;
+    out.found = true;
+    return;
+}
+
+/// 一站式查价：先定位 `ts` 生效的卡片，再取该模型（进价还要 provider）的条目。
+/// 卖价传 `provider = ""`；用户覆盖只在卖价上生效（进价的 user_id 恒为 0）。
+export fn price_lookup(d: &Db, kind: i32, model: &[byte], provider: &[byte],
+    user_id: i64, ts: i64, tz_min: i32, out: &PriceRates) !void {
+    out.found = false;
+    var card: PriceCard = PriceCard{ id: 0, kind: kind, version: 0, effective_from: 0, found: false };
+    price_card_lookup(d, kind, ts, &card) catch |err| {
+        return err;
+    };
+    var uid: i64 = 0;
+    if kind == PRICE_KIND_SELL {
+        uid = user_id;
+    }
+    return price_entry_lookup(d, &card, provider, model, uid, ts, tz_min, out);
+}
+
+// ---------------------------------------------------------------
+// 金额
+// ---------------------------------------------------------------
+
+/// 按价目算一笔金额（nano-USD）。口径见文件头注释。
+export fn price_amount(rates: &PriceRates, usage: &PriceUsage) i64 {
+    var v: i64 = rates.per_request_nano;
+    v = money_add(v, money_cost_nano(usage.input_tokens, rates.input_nano_per_mtok));
+    v = money_add(v, money_cost_nano(usage.output_tokens, rates.output_nano_per_mtok));
+    v = money_add(v, money_cost_nano(usage.cache_read_tokens, rates.cache_read_nano_per_mtok));
+    var pm: i32 = rates.permille;
+    if pm <= 0 {
+        pm = SCHED_BASE_PERMILLE;
+    }
+    return money_scale_permille(v, pm as i64);
+}
+
+/// 一次请求同时算进价与卖价（A4 / A6 用）。缺任一侧价目返回 PriceNotFound。
+export fn price_quote(d: &Db, model: &[byte], provider: &[byte], user_id: i64,
+    ts: i64, tz_min: i32, usage: &PriceUsage,
+    cost_nano_out: &i64, price_nano_out: &i64) !void {
+    var cost_rates: PriceRates = PriceRates{
+        input_nano_per_mtok: 0,
+        output_nano_per_mtok: 0,
+        cache_read_nano_per_mtok: 0,
+        per_request_nano: 0,
+        permille: SCHED_BASE_PERMILLE,
+        card_id: 0,
+        version: 0,
+        found: false,
+    };
+    var sell_rates: PriceRates = PriceRates{
+        input_nano_per_mtok: 0,
+        output_nano_per_mtok: 0,
+        cache_read_nano_per_mtok: 0,
+        per_request_nano: 0,
+        permille: SCHED_BASE_PERMILLE,
+        card_id: 0,
+        version: 0,
+        found: false,
+    };
+    try price_lookup(d, PRICE_KIND_COST, model, provider, 0, ts, tz_min, &cost_rates);
+    var no_provider: [byte: 1] = [0: 1];
+    try price_lookup(d, PRICE_KIND_SELL, model, no_provider[0: 0], user_id, ts, tz_min, &sell_rates);
+    cost_nano_out[0] = price_amount(&cost_rates, usage);
+    price_nano_out[0] = price_amount(&sell_rates, usage);
+    return;
+}

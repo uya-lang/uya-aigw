@@ -1,0 +1,521 @@
+// src/core/journal.uya — A2 计费 journal：追加 + fsync + 重放 + 保留
+//
+// 为什么要有 journal：每日备份的 RPO 是一天，计费不能接受。每批用量在写库成功
+// 之后追加一行到当天的 journal 文件并 fsync，恢复时先打开数据库、再重放最近
+// N 天的文件，就能把 RPO 压到「一批」（A4 的批量间隔，目标 5s）。
+//
+// 文件格式（一行一条，TAB 分隔，末尾 LF）：
+//
+//   1 <request_id> <user_id> <ts> <input_tokens> <output_tokens>
+//     <cache_read_tokens> <cost_nano> <price_nano> <rate_version>
+//     <model> <provider> <period>
+//
+//   * 首列是格式版本，当前 1；遇到不认识的版本按坏行跳过（向前兼容的余地）。
+//   * request_id 是幂等键：重放用 `insert or ignore`，重复重放不会重复计费。
+//   * 文本列里的 TAB/CR/LF 在写入时替换成 `_`，读侧只按 TAB 切分。
+//   * 写侧永远整行一次 write + fsync；崩溃最多留下半行，重放按坏行忽略。
+//     这就是「最多丢最后一批、不会写出半个金额」的边界。
+//
+// 文件按 UTC 日期分片：`<dir>/aigw-journal-YYYYMMDD.log`；保留策略按天回推，
+// 与 backup.uya 一样不扫目录（文件名能由时间反推）。
+
+use libc.syscall;
+
+@c_import("journal.c");
+
+extern fn aigw_journal_fsync(fd: i32) i32;
+
+/// 单行上限（含换行）。超过就按坏行处理。
+export const JOURNAL_LINE_MAX: usize = 1024;
+/// 重放时的读块大小。
+const JOURNAL_READ_CHUNK: usize = 4096;
+
+export error JournalFailed;
+
+/// 重放/清理结果。
+export struct JournalStats {
+    lines: u64,
+    applied: u64,
+    duplicate: u64,
+    bad: u64,
+}
+
+/// 当前版本号（写进每行首列）。
+const JOURNAL_FORMAT: i64 = 1;
+
+// ---------------------------------------------------------------
+// 编码小工具
+// ---------------------------------------------------------------
+
+fn journal_put_byte(out: &byte, cap: usize, off: &usize, b: byte) bool {
+    if off[0] >= cap {
+        return false;
+    }
+    out[off[0]] = b;
+    off[0] = off[0] + 1;
+    return true;
+}
+
+fn journal_put_i64(out: &byte, cap: usize, off: &usize, v: i64) bool {
+    var tmp: [byte: 24] = [0: 24];
+    var n: usize = 0;
+    var x: i64 = v;
+    var neg: bool = false;
+    if x < 0 {
+        neg = true;
+        x = 0 -% x;
+    }
+    if x == 0 {
+        tmp[0] = '0' as byte;
+        n = 1;
+    }
+    while x > 0 && n < 24 {
+        tmp[n] = ('0' as byte) +% ((x % (10 as i64)) as byte);
+        x = x / (10 as i64);
+        n = n + 1;
+    }
+    if neg {
+        if !journal_put_byte(out, cap, off, '-' as byte) {
+            return false;
+        }
+    }
+    var i: usize = n;
+    while i > 0 {
+        if !journal_put_byte(out, cap, off, tmp[i - 1]) {
+            return false;
+        }
+        i = i - 1;
+    }
+    return true;
+}
+
+/// 写入一个文本列（TAB/CR/LF 替换成 `_`）。
+fn journal_put_text(out: &byte, cap: usize, off: &usize, s: &[byte]) bool {
+    var i: usize = 0;
+    while i < s.len {
+        var c: byte = s[i];
+        if c == (9 as byte) || c == (10 as byte) || c == (13 as byte) {
+            c = '_' as byte;
+        }
+        if !journal_put_byte(out, cap, off, c) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// 十进制解析（允许负号）。越界/非法返回 false。
+fn journal_parse_i64(s: &[byte], out: &i64) bool {
+    if s.len == 0 {
+        return false;
+    }
+    var i: usize = 0;
+    var neg: bool = false;
+    if s[0] == ('-' as byte) {
+        neg = true;
+        i = 1;
+    }
+    if i >= s.len {
+        return false;
+    }
+    var v: i64 = 0;
+    while i < s.len {
+        const c: byte = s[i];
+        if c < ('0' as byte) || c > ('9' as byte) {
+            return false;
+        }
+        const d: i64 = (c as i64) - 48;
+        if v > (922337203685477580 as i64) {
+            return false;
+        }
+        const v10: i64 = v *% (10 as i64);
+        v = v10 +% d;
+        if v < 0 {
+            return false;
+        }
+        i = i + 1;
+    }
+    if neg {
+        v = 0 -% v;
+    }
+    out[0] = v;
+    return true;
+}
+
+/// 拼 `<dir>/aigw-journal-YYYYMMDD.log`，返回长度（0 = 放不下）。
+export fn journal_path(dir: &[byte], ts: i64, out: &byte, cap: usize) usize {
+    var off: usize = 0;
+    var i: usize = 0;
+    while i < dir.len {
+        if !journal_put_byte(out, cap, &off, dir[i]) {
+            return 0;
+        }
+        i = i + 1;
+    }
+    const head: &[byte] = &"/aigw-journal-"[0: 14];
+    i = 0;
+    while i < head.len {
+        if !journal_put_byte(out, cap, &off, head[i]) {
+            return 0;
+        }
+        i = i + 1;
+    }
+    if backup_stamp(ts, &out[off], cap - off) != 8 {
+        return 0;
+    }
+    off = off + 8;
+    const tail: &[byte] = &".log"[0: 4];
+    i = 0;
+    while i < tail.len {
+        if !journal_put_byte(out, cap, &off, tail[i]) {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return off;
+}
+
+// ---------------------------------------------------------------
+// 写
+// ---------------------------------------------------------------
+
+/// 把一行记录格式化到 `out`，返回长度（0 = 超长）。行尾带 LF。
+export fn journal_format(request_id: &[byte], user_id: i64, model: &[byte],
+    provider: &[byte], ts: i64, input_tokens: i64, output_tokens: i64,
+    cache_read_tokens: i64, cost_nano: i64, price_nano: i64,
+    period: &[byte], rate_version: i64, out: &byte, cap: usize) usize {
+    if request_id.len == 0 || cap == 0 {
+        return 0;
+    }
+    var off: usize = 0;
+    if !journal_put_i64(out, cap, &off, JOURNAL_FORMAT) {
+        return 0;
+    }
+    if !journal_put_byte(out, cap, &off, 9 as byte) {
+        return 0;
+    }
+    if !journal_put_text(out, cap, &off, request_id) {
+        return 0;
+    }
+    const nums: [i64: 8] = [user_id, ts, input_tokens, output_tokens,
+        cache_read_tokens, cost_nano, price_nano, rate_version];
+    var k: usize = 0;
+    while k < 8 {
+        if !journal_put_byte(out, cap, &off, 9 as byte) {
+            return 0;
+        }
+        if !journal_put_i64(out, cap, &off, nums[k]) {
+            return 0;
+        }
+        k = k + 1;
+    }
+    // 文本列：model、provider、period（顺序与 parse 的字段序号一致）
+    if !journal_put_byte(out, cap, &off, 9 as byte) {
+        return 0;
+    }
+    if !journal_put_text(out, cap, &off, model) {
+        return 0;
+    }
+    if !journal_put_byte(out, cap, &off, 9 as byte) {
+        return 0;
+    }
+    if !journal_put_text(out, cap, &off, provider) {
+        return 0;
+    }
+    if !journal_put_byte(out, cap, &off, 9 as byte) {
+        return 0;
+    }
+    if !journal_put_text(out, cap, &off, period) {
+        return 0;
+    }
+    if !journal_put_byte(out, cap, &off, 10 as byte) {
+        return 0;
+    }
+    return off;
+}
+
+/// 追加一段已经成行的字节（可多行），写成功后 fsync。
+export fn journal_append_bytes(path: &[byte], data: &[byte]) !void {
+    if path.len == 0 || path.len + 1 > 1024 {
+        return error.JournalFailed;
+    }
+    var p: [byte: 1024] = [0: 1024];
+    var i: usize = 0;
+    while i < path.len {
+        p[i] = path[i];
+        i = i + 1;
+    }
+    p[path.len] = 0 as byte;
+    const fd: i32 = sys_open(&p[0] as *const byte,
+        (O_WRONLY | O_CREAT | O_APPEND) as i32, 420 as i32) catch |_| {
+        return error.JournalFailed;
+    };
+    var off: usize = 0;
+    while off < data.len {
+        const at: &const byte = data.ptr + off;
+        const r: !isize = sys_write(fd, at, data.len - off);
+        const w: isize = r catch |_| {
+            _ = sys_close(fd) catch {};
+            return error.JournalFailed;
+        };
+        if w <= 0 {
+            _ = sys_close(fd) catch {};
+            return error.JournalFailed;
+        }
+        off = off +% (w as usize);
+    }
+    _ = aigw_journal_fsync(fd);
+    _ = sys_close(fd) catch {};
+    return;
+}
+
+/// 追加一行记录（格式化 + 落盘）。写不进去返回 JournalFailed，由调用方决定重试/告警。
+export fn journal_append(path: &[byte], request_id: &[byte], user_id: i64,
+    model: &[byte], provider: &[byte], ts: i64, input_tokens: i64,
+    output_tokens: i64, cache_read_tokens: i64, cost_nano: i64,
+    price_nano: i64, period: &[byte], rate_version: i64) !void {
+    var line: [byte: JOURNAL_LINE_MAX] = [0: JOURNAL_LINE_MAX];
+    const n: usize = journal_format(request_id, user_id, model, provider, ts,
+        input_tokens, output_tokens, cache_read_tokens, cost_nano, price_nano,
+        period, rate_version, &line[0], JOURNAL_LINE_MAX);
+    if n == 0 {
+        return error.JournalFailed;
+    }
+    return journal_append_bytes(path, line[0: n]);
+}
+
+/// 按天回推的保留策略：删掉 `keep_days` 天之前的 journal 文件，返回删除个数。
+/// 与 backup_prune 同一套路：不扫目录，文件名由时间反推。
+export fn journal_prune(dir: &[byte], ts: i64, keep_days: i32) i32 {
+    var k: i32 = keep_days;
+    if k < 1 {
+        k = 1;
+    }
+    var removed: i32 = 0;
+    var day: i32 = k;
+    while day < k +% 30 {
+        const older: i64 = ts -% ((day as i64) *% (86400 as i64));
+        var path: [byte: 512] = [0: 512];
+        const pn: usize = journal_path(dir, older, &path[0], 512);
+        if pn == 0 || pn >= 512 {
+            break;
+        }
+        path[pn] = 0 as byte;
+        const r: !i32 = sys_unlink(&path[0] as *const byte);
+        const rc: i32 = r catch {
+            0 - 1;
+        };
+        if rc == 0 {
+            removed = removed + 1;
+        }
+        day = day +% 1;
+    }
+    return removed;
+}
+
+// ---------------------------------------------------------------
+// 重放
+// ---------------------------------------------------------------
+
+/// 一行解析出来的字段（按 TAB 切分后的起止下标）。
+struct JournalFields {
+    starts: [usize: 16],
+    ends: [usize: 16],
+    count: usize,
+}
+
+fn journal_split(line: &[byte], out: &JournalFields) void {
+    out.count = 0;
+    var start: usize = 0;
+    var i: usize = 0;
+    while i <= line.len {
+        if i == line.len || line[i] == (9 as byte) {
+            if out.count < 16 {
+                out.starts[out.count] = start;
+                out.ends[out.count] = i;
+                out.count = out.count + 1;
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn journal_field(line: &[byte], f: &JournalFields, idx: usize) &[byte] {
+    if idx >= f.count || idx >= 16 {
+        return line[0: 0];
+    }
+    const a: usize = f.starts[idx];
+    const b: usize = f.ends[idx];
+    if b < a || b > line.len {
+        return line[0: 0];
+    }
+    // Uya 0.11 的切片语法是 `[start: len]`（不是 start..end），这里必须传长度。
+    return line[a: b - a];
+}
+
+/// 应用一行到账本。返回 1=新增，0=重复，-1=坏行。
+fn journal_apply_line(d: &Db, st: &DbStmt, line: &[byte]) i32 {
+    var f: JournalFields = JournalFields{ starts: [], ends: [], count: 0 };
+    journal_split(line, &f);
+    if f.count != 13 {
+        return 0 - 1;
+    }
+    var ver: i64 = 0;
+    if !journal_parse_i64(journal_field(line, &f, 0), &ver) || ver != JOURNAL_FORMAT {
+        return 0 - 1;
+    }
+    var nums: [i64: 8] = [0: 8];
+    // 字段 2..=9：user_id, ts, input, output, cache, cost, price, rate_version
+    var k: usize = 0;
+    while k < 8 {
+        if !journal_parse_i64(journal_field(line, &f, k + 2), &nums[k]) {
+            return 0 - 1;
+        }
+        k = k + 1;
+    }
+    if nums[0] < 0 {
+        return 0 - 1;
+    }
+    dbx_reset(st);
+    dbx_bind_text(st, 1, journal_field(line, &f, 1)) catch {
+        return 0 - 1;
+    };
+    dbx_bind_i64(st, 2, nums[0]) catch {
+        return 0 - 1;
+    };
+    dbx_bind_i64(st, 3, nums[1]) catch {
+        return 0 - 1;
+    };
+    dbx_bind_text(st, 4, journal_field(line, &f, 10)) catch {
+        return 0 - 1;
+    };
+    dbx_bind_text(st, 5, journal_field(line, &f, 11)) catch {
+        return 0 - 1;
+    };
+    dbx_bind_i64(st, 6, nums[2]) catch {
+        return 0 - 1;
+    };
+    dbx_bind_i64(st, 7, nums[3]) catch {
+        return 0 - 1;
+    };
+    dbx_bind_i64(st, 8, nums[4]) catch {
+        return 0 - 1;
+    };
+    dbx_bind_i64(st, 9, nums[5]) catch {
+        return 0 - 1;
+    };
+    dbx_bind_i64(st, 10, nums[6]) catch {
+        return 0 - 1;
+    };
+    dbx_bind_text(st, 11, journal_field(line, &f, 12)) catch {
+        return 0 - 1;
+    };
+    dbx_bind_i64(st, 12, nums[7]) catch {
+        return 0 - 1;
+    };
+    if dbx_step(st) != 0 {
+        return 0 - 1;
+    }
+    if dbx_changes(d) == 1 {
+        return 1;
+    }
+    return 0;
+}
+
+/// 重放一个 journal 文件到 `usage_ledger`。文件不存在按 0 行成功处理。
+/// 幂等：同一文件重放多次只有第一次 applied 增加，其余计入 duplicate。
+export fn journal_replay(d: &Db, path: &[byte], stats: &JournalStats) !void {
+    if path.len == 0 || path.len + 1 > 1024 {
+        return error.JournalFailed;
+    }
+    var p: [byte: 1024] = [0: 1024];
+    var i: usize = 0;
+    while i < path.len {
+        p[i] = path[i];
+        i = i + 1;
+    }
+    p[path.len] = 0 as byte;
+    const fd: i32 = sys_open(&p[0] as *const byte, O_RDONLY as i32, 0 as i32) catch |_| {
+        // 没有当天文件（或目录还不存在）不是错误
+        return;
+    };
+    var st: DbStmt = dbx_prepare(d,
+        "insert or ignore into usage_ledger(request_id, user_id, ts, model, provider, input_tokens, output_tokens, cache_read_tokens, cost_nano, price_nano, period, rate_version) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)" as &const byte) catch {
+        _ = sys_close(fd) catch {};
+        return error.JournalFailed;
+    };
+    defer { dbx_finalize(&st); }
+
+    var buf: [byte: JOURNAL_READ_CHUNK] = [0: JOURNAL_READ_CHUNK];
+    var line: [byte: JOURNAL_LINE_MAX] = [0: JOURNAL_LINE_MAX];
+    var line_len: usize = 0;
+    var overflow: bool = false;
+    while true {
+        const r: !isize = sys_read(fd, &buf[0], JOURNAL_READ_CHUNK);
+        const n: isize = r catch {
+            _ = sys_close(fd) catch {};
+            return error.JournalFailed;
+        };
+        if n <= 0 {
+            break;
+        }
+        var k: usize = 0;
+        while k < (n as usize) {
+            const c: byte = buf[k];
+            if c == (10 as byte) {
+                stats.lines = stats.lines +% 1;
+                if overflow {
+                    stats.bad = stats.bad +% 1;
+                } else {
+                    const rc: i32 = journal_apply_line(d, &st, line[0: line_len]);
+                    if rc == 1 {
+                        stats.applied = stats.applied +% 1;
+                    } else if rc == 0 {
+                        stats.duplicate = stats.duplicate +% 1;
+                    } else {
+                        stats.bad = stats.bad +% 1;
+                    }
+                }
+                line_len = 0;
+                overflow = false;
+            } else if line_len < JOURNAL_LINE_MAX {
+                line[line_len] = c;
+                line_len = line_len +% 1;
+            } else {
+                overflow = true;
+            }
+            k = k + 1;
+        }
+    }
+    _ = sys_close(fd) catch {};
+    // 末尾没有换行 = 崩溃留下的半行，不应用
+    if line_len > 0 || overflow {
+        stats.bad = stats.bad +% 1;
+    }
+    return;
+}
+
+/// 便捷：重放目录下最近 `days` 天（含今天）的 journal。返回累计结果。
+export fn journal_replay_days(d: &Db, dir: &[byte], ts: i64, days: i32,
+    stats: &JournalStats) !void {
+    var n: i32 = days;
+    if n < 1 {
+        n = 1;
+    }
+    var i: i32 = 0;
+    while i < n {
+        const day_ts: i64 = ts -% ((i as i64) *% (86400 as i64));
+        var path: [byte: 512] = [0: 512];
+        const pn: usize = journal_path(dir, day_ts, &path[0], 512);
+        if pn == 0 {
+            return error.JournalFailed;
+        }
+        journal_replay(d, path[0: pn], stats) catch |_| {
+            return error.JournalFailed;
+        };
+        i = i + 1;
+    }
+    return;
+}
