@@ -26,6 +26,8 @@
 - A3（已落地）：`src/plugins/pool.uya` 插件池（stdio JSONL 子进程）：预热 min、复用、
   扩容到 max、空闲缩容到 min、崩溃指数退避、cancel、ping/pong；非阻塞 fd + poll 超时
   与按行分帧。`tests/test_pool.uya` 24 断言（`tests/plugin_echo.py` 作最小插件）。
+- A2（已落地）：登录→建 key→调用闭环已通：`/v1/auth/otp`（dev 回显）、
+  `/v1/auth/login`、`/v1/keys`、`/v1/me`，e2e 用 HTTP 拿 Key 调 chat。
 - A6（已落地）：`usage_daily` 汇总 + `rollup` 重建/查询；billing 实时 upsert；
   `/v1/usage`（data+totals 含 profit）与 `/v1/models`；chat e2e 断言 models/usage/profit。
 - A5/A7 待做：responses 与 管理 REST/MCP。

@@ -30,7 +30,6 @@ Phase A0 (SQLite spike) 可与 Phase T 并行 ─────┘
 
 | ID | 任务 | 验收 | 依赖 |
 |---|---|---|---|
-| A2 | schema/迁移 + users/keys/OTP/会话 + rate card + schedule 解析 + 每日备份 + journal | 登录→建 key→调用；时段单测；备份/恢复冒烟 | A1 |
 | A4 | chat 流/非流、快路径、tools、usage、分时 cost/price、批量落库 | SSE 对齐；金额与 preview 一致；落库不影响 p99 | A2/A3/TLS-09 |
 | A5 | responses：`previous_response_id`、reasoning、工具、事件序列 | 事件顺序正确；续轮 | A4 |
 | A7 | 管理 REST + MCP（pricing/schedule/billing/backup） | 改价/改时段/预览/账单/备份状态 | A2/A6 |
@@ -70,7 +69,7 @@ Phase A0 (SQLite spike) 可与 Phase T 并行 ─────┘
 1. ~~TLS-01 → … → TLS-05A~~（已完成，见 `TODO_DONE.md`）
 2. 并行：A0 spike（SQLite + money）
 3. TLS-06 → TLS-07 → TLS-08 → TLS-09 → TLS-10 → TLS-11
-4. A1 → A2 → ~~A3~~ → A4 → A5 → ~~A6~~ → A7 → A8 → A9
+4. ~~A1 → A2 → A3~~ → A4 → A5 → ~~A6~~ → A7 → A8 → A9
 5. B1 → B2 → B3 → B4 → B5 → B6
 6. C1 → C2 → C3 → C4 → C5 → C6
 

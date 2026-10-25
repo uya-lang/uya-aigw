@@ -70,6 +70,10 @@ const ROUTE_MODELS: i32 = 2;
 const ROUTE_SSE: i32 = 3;
 const ROUTE_CHAT: i32 = 4;
 const ROUTE_USAGE: i32 = 5;
+const ROUTE_OTP: i32 = 6;
+const ROUTE_LOGIN: i32 = 7;
+const ROUTE_KEYS: i32 = 8;
+const ROUTE_ME: i32 = 9;
 
 /// chat 请求体上限（与 CHAT_PAYLOAD_MAX 一致；超了回 413）。
 const SRV_BODY_CAP: usize = 32768;
@@ -459,6 +463,18 @@ fn srv_route_of(req: &HsrvReq) i32 {
     }
     if srv_path_is(req, &"/v1/usage"[0: 9]) {
         return ROUTE_USAGE;
+    }
+    if srv_path_is(req, &"/v1/auth/otp"[0: 12]) {
+        return ROUTE_OTP;
+    }
+    if srv_path_is(req, &"/v1/auth/login"[0: 14]) {
+        return ROUTE_LOGIN;
+    }
+    if srv_path_is(req, &"/v1/keys"[0: 8]) {
+        return ROUTE_KEYS;
+    }
+    if srv_path_is(req, &"/v1/me"[0: 6]) {
+        return ROUTE_ME;
     }
     return ROUTE_404;
 }
@@ -940,6 +956,22 @@ fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
         srv_usage(c, stats);
         return;
     }
+    if c.route == ROUTE_OTP {
+        srv_otp(c, stats);
+        return;
+    }
+    if c.route == ROUTE_LOGIN {
+        srv_login(c, stats);
+        return;
+    }
+    if c.route == ROUTE_KEYS {
+        srv_keys(c, stats);
+        return;
+    }
+    if c.route == ROUTE_ME {
+        srv_me(c, stats);
+        return;
+    }
     stats.requests = stats.requests +% 1;
     srv_static(c, 404, SRV_JSON_404, keep);
 }
@@ -951,7 +983,7 @@ fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
 /// 排空包体：1=排完，0=还要更多数据，-1=协议错误。
 /// chat 路由：把包体字节采集到连接缓冲（其他路由只排空，不占内存时间）。
 fn srv_capture(c: &SrvConn, start: usize, take: usize) void {
-    if c.route != ROUTE_CHAT {
+    if c.body_overflow {
         return;
     }
     var i: usize = 0;
@@ -1440,4 +1472,194 @@ export fn serve_run(lfd: i32, stats: &ServeStats) !i32 {
     g_epfd = 0 - 1;
     rc = 0;
     return rc;
+}
+
+// ---------------------------------------------------------------
+// A2：OTP / 登录 / 建 Key / me（HTTP 认证入口）
+// ---------------------------------------------------------------
+
+/// 开发模式：OTP 响应里带验证码（默认关闭）。
+var g_dev_otp: bool = false;
+
+fn srv_json_body_str(c: &SrvConn, key: &[byte], out: &byte, cap: usize) usize {
+    if c.body_len == 0 {
+        return 0;
+    }
+    var d: JsonDoc = JsonDoc{};
+    json_parse(&d, c.body[0: c.body_len]) catch {
+        return 0;
+    };
+    const v: i32 = json_get(&d, json_root(&d), key);
+    if json_kind(&d, v) != JSON_STR {
+        return 0;
+    }
+    return json_str(&d, v, out, cap);
+}
+
+/// 从 Authorization 解析会话或 API Key，写回 user_id。
+fn srv_bearer_uid(c: &SrvConn, uid: &i64) bool {
+    var tok: [byte: 256] = [0: 256];
+    const tn: usize = chat_bearer_span(&c.auth[0], c.auth_len, &tok[0], 256);
+    if tn == 0 {
+        return false;
+    }
+    var su: i64 = 0;
+    store_verify_session(runtime_db(), tok[0: tn], store_now(), &su) catch {
+        var k: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
+        store_verify_key(runtime_db(), tok[0: tn], &k) catch {
+            return false;
+        };
+        uid[0] = k.user_id;
+        return true;
+    };
+    uid[0] = su;
+    return true;
+}
+
+/// POST /v1/auth/otp：发验证码（`--dev-otp` 时响应里带 code）
+fn srv_otp(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    if !runtime_ready() {
+        srv_static(c, 503, SRV_JSON_503, keep);
+        return;
+    }
+    if c.body_overflow {
+        srv_static(c, 413, SRV_JSON_413, keep);
+        return;
+    }
+    var email: [byte: 128] = [0: 128];
+    const en: usize = srv_json_body_str(c, &"email"[0: 5], &email[0], 128);
+    if en == 0 {
+        srv_static(c, 400, SRV_JSON_400, keep);
+        return;
+    }
+    var code: [byte: 16] = [0: 16];
+    const cn: usize = store_request_otp(runtime_db(), email[0: en], store_now(),
+        600, &code[0], 16) catch {
+        srv_static(c, 400, SRV_JSON_400, keep);
+        return;
+    };
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"ok"[0: 2]);
+    jsonw_bool(&w, true);
+    if g_dev_otp {
+        jsonw_key(&w, &"code"[0: 4]);
+        jsonw_str(&w, code[0: cn]);
+    }
+    jsonw_end_obj(&w);
+    srv_static(c, 200, jsonw_span(&w), keep);
+}
+
+/// POST /v1/auth/login：校验 OTP（用户不存在则建），发会话 token。
+fn srv_login(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    if !runtime_ready() {
+        srv_static(c, 503, SRV_JSON_503, keep);
+        return;
+    }
+    if c.body_overflow {
+        srv_static(c, 413, SRV_JSON_413, keep);
+        return;
+    }
+    var email: [byte: 128] = [0: 128];
+    const en: usize = srv_json_body_str(c, &"email"[0: 5], &email[0], 128);
+    var code: [byte: 16] = [0: 16];
+    const cn: usize = srv_json_body_str(c, &"code"[0: 4], &code[0], 16);
+    if en == 0 || cn == 0 {
+        srv_static(c, 400, SRV_JSON_400, keep);
+        return;
+    }
+    store_verify_otp(runtime_db(), email[0: en], code[0: cn], store_now()) catch {
+        srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    };
+    var u: StoreUser = StoreUser{ id: 0, status: 0, found: false };
+    store_find_user(runtime_db(), email[0: en], &u) catch {
+        var slug: [byte: 16] = [0: 16];
+        const sn: usize = store_new_slug(&slug[0], 16) catch {
+            srv_static(c, 502, SRV_JSON_502, keep);
+            return;
+        };
+        store_create_user(runtime_db(), email[0: en], slug[0: sn], store_now(), &u) catch {
+            srv_static(c, 502, SRV_JSON_502, keep);
+            return;
+        };
+    };
+    var tok: [byte: 64] = [0: 64];
+    const tn: usize = store_create_session(runtime_db(), u.id, store_now(),
+        604800, &tok[0], 64) catch {
+        srv_static(c, 502, SRV_JSON_502, keep);
+        return;
+    };
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"session"[0: 7]);
+    jsonw_str(&w, tok[0: tn]);
+    jsonw_key(&w, &"user_id"[0: 7]);
+    jsonw_i64(&w, u.id);
+    jsonw_end_obj(&w);
+    srv_static(c, 200, jsonw_span(&w), keep);
+}
+
+/// POST /v1/keys：会话鉴权后建 Key。
+fn srv_keys(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    if !runtime_ready() {
+        srv_static(c, 503, SRV_JSON_503, keep);
+        return;
+    }
+    if c.body_overflow {
+        srv_static(c, 413, SRV_JSON_413, keep);
+        return;
+    }
+    var uid: i64 = 0;
+    if !srv_bearer_uid(c, &uid) {
+        srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    }
+    var name: [byte: 64] = [0: 64];
+    const nn: usize = srv_json_body_str(c, &"name"[0: 4], &name[0], 64);
+    var kb: [byte: 64] = [0: 64];
+    const kn: usize = store_create_key(runtime_db(), uid, name[0: nn], store_now(),
+        &kb[0], 64) catch {
+        srv_static(c, 502, SRV_JSON_502, keep);
+        return;
+    };
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"key"[0: 3]);
+    jsonw_str(&w, kb[0: kn]);
+    jsonw_key(&w, &"user_id"[0: 7]);
+    jsonw_i64(&w, uid);
+    jsonw_end_obj(&w);
+    srv_static(c, 200, jsonw_span(&w), keep);
+}
+
+/// GET /v1/me：会话或 Key 均可用。
+fn srv_me(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    if !runtime_ready() {
+        srv_static(c, 503, SRV_JSON_503, keep);
+        return;
+    }
+    var uid: i64 = 0;
+    if !srv_bearer_uid(c, &uid) {
+        srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    }
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"user_id"[0: 7]);
+    jsonw_i64(&w, uid);
+    jsonw_end_obj(&w);
+    srv_static(c, 200, jsonw_span(&w), keep);
 }

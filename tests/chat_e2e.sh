@@ -86,8 +86,7 @@ UYA_ROOT="$UYA_ROOT" "$UYA" build \
 
 SEED_DB="$TMP/data/aigw.db"
 mkdir -p "$TMP/data"
-TOKEN=$(AIGW_MODE=seed AIGW_DB="$SEED_DB" AIGW_UPSTREAM_PORT="$MPORT" ./build/seed | sed -n 's/^TOKEN=//p')
-[ -n "$TOKEN" ] || fail "seed token"
+AIGW_MODE=seed AIGW_DB="$SEED_DB" AIGW_UPSTREAM_PORT="$MPORT" ./build/seed >/dev/null
 
 UYA_ROOT="$UYA_ROOT" "$UYA" build \
   src/foundation/buf.uya src/net/httpsrv.uya src/net/tcpx.uya src/net/serve.uya \
@@ -103,7 +102,7 @@ UYA_ROOT="$UYA_ROOT" "$UYA" build \
   -o build/aigw >"$TMP/build.log" 2>&1 || { cat "$TMP/build.log" >&2; fail "aigw build"; }
 
 ./build/aigw serve --host 127.0.0.1 --port 0 --db "$SEED_DB" --data-dir "$TMP/data" \
-  --ca "$TMP/root.pem" >"$TMP/serve.log" 2>&1 &
+  --ca "$TMP/root.pem" --dev-otp >"$TMP/serve.log" 2>&1 &
 SRV_PID=$!
 PORT=""
 for _ in $(seq 1 200); do
@@ -113,6 +112,20 @@ for _ in $(seq 1 200); do
   sleep 0.05
 done
 [ -n "$PORT" ] || { cat "$TMP/serve.log" >&2; fail "no port"; }
+
+BASE="http://127.0.0.1:$PORT"
+# 3b) A2 HTTP 认证：OTP → 登录 → 建 Key → /v1/me
+OTPJSON=$(curl -s --max-time 5 -X POST --data '{"email":"http@example.com"}' "$BASE/v1/auth/otp")
+CODE=$(echo "$OTPJSON" | sed -n 's/.*"code":"\([0-9]*\)".*/\1/p')
+[ -n "$CODE" ] || { echo "$OTPJSON" >&2; fail "otp code"; }
+LOGIN=$(curl -s --max-time 5 -X POST --data "{\"email\":\"http@example.com\",\"code\":\"$CODE\"}" "$BASE/v1/auth/login")
+SESSION=$(echo "$LOGIN" | sed -n 's/.*"session":"\([^"]*\)".*/\1/p')
+[ -n "$SESSION" ] || { echo "$LOGIN" >&2; fail "login session"; }
+KEYS=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $SESSION" --data '{"name":"e2e"}' "$BASE/v1/keys")
+TOKEN=$(echo "$KEYS" | sed -n 's/.*"key":"\([^"]*\)".*/\1/p')
+[ -n "$TOKEN" ] || { echo "$KEYS" >&2; fail "key create"; }
+ME=$(curl -s --max-time 5 -H "Authorization: Bearer $SESSION" "$BASE/v1/me")
+echo "$ME" | grep -q '"user_id":' || { echo "$ME" >&2; fail "me"; }
 
 # 4) chat 调用
 CODE=$(curl -s --max-time 15 -o "$TMP/resp.json" -w '%{http_code}' -X POST \
