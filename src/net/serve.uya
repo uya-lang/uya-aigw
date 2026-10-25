@@ -82,6 +82,8 @@ const ROUTE_RESPONSES: i32 = 14;
 const ROUTE_MCP: i32 = 15;
 const ROUTE_KEY_REVOKE: i32 = 24;
 const ROUTE_CTL_INGEST: i32 = 25;
+const ROUTE_UI: i32 = 26;
+const ROUTE_UI_JS: i32 = 27;
 const ROUTE_CTL_EPOCH: i32 = 21;
 const ROUTE_CTL_ASSIGN: i32 = 22;
 const ROUTE_CTL_DRAIN: i32 = 23;
@@ -587,6 +589,12 @@ fn srv_route_of(req: &HsrvReq) i32 {
     if srv_path_is(req, &"/v1/me"[0: 6]) {
         return ROUTE_ME;
     }
+    if srv_path_is(req, &"/ui/app.js"[0: 10]) {
+        return ROUTE_UI_JS;
+    }
+    if srv_path_is(req, &"/"[0: 1]) || srv_path_is(req, &"/ui"[0: 3]) {
+        return ROUTE_UI;
+    }
     if srv_path_is(req, &"/controller/ingest"[0: 18]) {
         return ROUTE_CTL_INGEST;
     }
@@ -650,14 +658,19 @@ fn srv_put(out: &byte, cap: usize, off: &usize, data: &[byte]) bool {
 }
 
 /// 组装静态回包（头 + body），并进入 WRITE。
-fn srv_static(c: &SrvConn, status: i32, body: &[byte], keep: bool) void {
-    const n: usize = hsrv_resp_head(&c.out[0], SRV_OUT_CAP, status, &SRV_CTYPE_JSON[0: 16], 16,
+fn srv_static_ct(c: &SrvConn, status: i32, body: &[byte], keep: bool,
+    ctype: &[byte], ctype_len: usize) void {
+    const n: usize = hsrv_resp_head(&c.out[0], SRV_OUT_CAP, status, ctype, ctype_len,
         body.len as i64, false, keep);
-    var off: usize = n;
-    _ = srv_put(&c.out[0], SRV_OUT_CAP, &off, body);
-    c.out_len = off;
+    var off2: usize = n;
+    _ = srv_put(&c.out[0], SRV_OUT_CAP, &off2, body);
+    c.out_len = off2;
     c.out_pos = 0;
     c.state = ST_WRITE;
+}
+
+fn srv_static(c: &SrvConn, status: i32, body: &[byte], keep: bool) void {
+    srv_static_ct(c, status, body, keep, SRV_CTYPE_JSON[0: 16], 16);
 }
 
 /// SSE 结束/出错：直接切到 ST_WRITE 并关闭连接（流式响应已绕过 out 缓冲）。
@@ -1150,6 +1163,14 @@ fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
     }
     if c.route == ROUTE_ME {
         srv_me(c, stats);
+        return;
+    }
+    if c.route == ROUTE_UI {
+        srv_ui(c, stats);
+        return;
+    }
+    if c.route == ROUTE_UI_JS {
+        srv_ui_js(c, stats);
         return;
     }
     if c.route == ROUTE_CTL_INGEST {
@@ -3341,4 +3362,25 @@ fn srv_ctl_ingest(c: &SrvConn, stats: &ServeStats) void {
     jsonw_i64(&w, st.bad);
     jsonw_end_obj(&w);
     srv_static(c, 200, jsonw_span(&w), keep);
+}
+
+
+// C1：静态壳（首页 + 脚本）。
+const SRV_CTYPE_HTML: &[byte] = &"text/html; charset=utf-8"[0: 23];
+const SRV_CTYPE_JS: &[byte] = &"application/javascript"[0: 22];
+
+fn srv_ui(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    var buf: [byte: 16384] = [0: 16384];
+    const n: usize = ui_index(&buf[0], 16384);
+    srv_static_ct(c, 200, buf[0: n], keep, SRV_CTYPE_HTML[0: 23], 23);
+}
+
+fn srv_ui_js(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    var buf: [byte: 16384] = [0: 16384];
+    const n: usize = ui_app_js(&buf[0], 16384);
+    srv_static_ct(c, 200, buf[0: n], keep, SRV_CTYPE_JS[0: 22], 22);
 }

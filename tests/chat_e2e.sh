@@ -92,7 +92,7 @@ AIGW_MODE=seed AIGW_DB="$SEED_DB" AIGW_UPSTREAM_PORT="$MPORT" ./build/seed >/dev
 
 UYA_ROOT="$UYA_ROOT" "$UYA" build \
   src/foundation/buf.uya src/net/httpsrv.uya src/net/tcpx.uya src/net/serve.uya \
-  src/core/money.uya src/core/reqlog.uya src/core/dbx.uya src/cluster/meta.uya src/cluster/elect.uya src/cluster/uplink.uya src/cluster/ingest.uya src/net/rsav.uya \
+  src/core/money.uya src/core/reqlog.uya src/core/dbx.uya src/cluster/meta.uya src/cluster/elect.uya src/cluster/uplink.uya src/cluster/ingest.uya src/net/ui.uya src/net/rsav.uya \
   src/core/schema.uya src/core/store.uya src/core/backup.uya src/core/journal.uya \
   src/core/runtime.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/rollup.uya \
   src/core/billing.uya src/core/lb.uya src/core/responses.uya src/core/chat.uya src/providers/upstream.uya \
@@ -257,6 +257,15 @@ echo "$CST2" | grep -q '"node-b"' || { cat "$TMP/nodeb.log" >&2; echo "$CST2" >&
 kill "$NB_PID" 2>/dev/null || true
 wait "$NB_PID" 2>/dev/null || true
 NB_PID=""
+
+# 4i) C1：静态壳与前端脚本
+UI=$(curl -s --max-time 5 "$BASE/")
+echo "$UI" | grep -q 'id="login"' || { echo "$UI" >&2; fail "ui index"; }
+echo "$UI" | grep -q '/ui/app.js' || { echo "$UI" >&2; fail "ui script tag"; }
+UIJS=$(curl -s --max-time 5 "$BASE/ui/app.js")
+echo "$UIJS" | grep -q '/v1/keys/revoke' || { echo "$UIJS" >&2; fail "ui js"; }
+CT=$(curl -s --max-time 5 -o /dev/null -w '%{content_type}' "$BASE/")
+case "$CT" in text/html*) ;; *) fail "ui content-type=$CT";; esac
 
 # 4h) B5：controller 幂等 ingest（重复批 duplicate=2）
 ING='{"rows":[{"request_id":"ing1","user_id":1,"ts":1700000000,"model":"mock-model","provider":"mock","input_tokens":10,"output_tokens":5,"cache_read_tokens":0,"cost_nano":2,"price_nano":3,"period":"","rate_version":1},{"request_id":"ing2","user_id":1,"ts":1700000060,"model":"mock-model","provider":"mock","input_tokens":20,"output_tokens":10,"cache_read_tokens":0,"cost_nano":4,"price_nano":6,"period":"","rate_version":1}]}'

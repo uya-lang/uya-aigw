@@ -35,6 +35,7 @@
 - B2 收尾：config 快照与 slug 归属校验。
 - B5（进行中）：幂等 ingest（含 HTTP 入口）+ 区间重算 + 本地 spool + Key 吊销已通；
   spool 自动消费循环待做。
+- C1（进行中）：静态壳 `/` + `/ui/app.js`（登录/资料/密钥/接入点 + curl 示例）已落地。
 - B4（进行中）：edge 路由核心（slug 归属 + session 亲和 + 失败清缓存，11 断言）；
   HTTP/SSE 代理待做。
 
@@ -70,6 +71,7 @@
 - B2 收尾：config 快照与 slug 归属校验。
 - B5（进行中）：幂等 ingest（含 HTTP 入口）+ 区间重算 + 本地 spool + Key 吊销已通；
   spool 自动消费循环待做。
+- C1（进行中）：静态壳 `/` + `/ui/app.js`（登录/资料/密钥/接入点 + curl 示例）已落地。
 - B4（进行中）：edge 路由核心（slug 归属 + session 亲和 + 失败清缓存，11 断言）；
   HTTP/SSE 代理待做。
 
