@@ -134,11 +134,16 @@ SCODE=$(curl -s -N --max-time 15 -o "$TMP/stream.txt" -w '%{http_code}' -X POST 
 grep -q 'data: {"i":0}' "$TMP/stream.txt" || fail "stream event missing"
 grep -q 'data: \[DONE\]' "$TMP/stream.txt" || fail "stream DONE missing"
 
+# 4b2) models：公开列表来自 provider_models
+MJSON=$(curl -s --max-time 10 "http://127.0.0.1:$PORT/v1/models")
+echo "$MJSON" | grep -q '"id":"mock-model"' || { echo "$MJSON" >&2; fail "models list"; }
+
 # 4c) 用量汇总（A6：billing 实时 upsert usage_daily）
 UJSON=$(curl -s --max-time 10 -H "Authorization: Bearer $TOKEN" \
   "http://127.0.0.1:$PORT/v1/usage?from_day=0&to_day=999999")
 echo "$UJSON" | grep -q '"mock-model"' || { echo "$UJSON" >&2; fail "usage model missing"; }
 echo "$UJSON" | grep -q '"requests":2' || { echo "$UJSON" >&2; fail "usage totals"; }
+echo "$UJSON" | grep -q '"profit_nano":264' || { echo "$UJSON" >&2; fail "usage profit"; }
 
 # 5) 停机后查账本
 kill "$SRV_PID" 2>/dev/null || true

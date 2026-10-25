@@ -625,6 +625,54 @@ fn srv_chat_stream(c: &SrvConn, plan: &ChatPlan, cfg: &const HttppConfig, nowu: 
     srv_chat_close(c);
 }
 
+/// A6：/v1/models 从 enabled 供应商的模型映射里取（公开，便于客户端探活）。
+fn srv_models(c: &SrvConn) void {
+    const keep: bool = c.keep;
+    if !runtime_ready() {
+        srv_static(c, 200, SRV_JSON_MODELS, keep);
+        return;
+    }
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"object"[0: 6]);
+    jsonw_str(&w, &"list"[0: 4]);
+    jsonw_key(&w, &"data"[0: 4]);
+    jsonw_arr(&w);
+    var st: DbStmt = dbx_prepare(runtime_db(),
+        "select distinct m.model from provider_models m join providers p on p.id = m.provider_id where p.enabled = 1 order by m.model limit 256" as &const byte) catch {
+        jsonw_end_arr(&w);
+        jsonw_end_obj(&w);
+        srv_static(c, 200, jsonw_span(&w), keep);
+        return;
+    };
+    var n: i32 = 0;
+    while n < 256 {
+        if dbx_step(&st) != 1 {
+            break;
+        }
+        var mbuf: [byte: 64] = [0: 64];
+        const mn: usize = dbx_col_text(&st, 0, &mbuf[0], 64);
+        jsonw_obj(&w);
+        jsonw_key(&w, &"id"[0: 2]);
+        jsonw_str(&w, mbuf[0: mn]);
+        jsonw_key(&w, &"object"[0: 6]);
+        jsonw_str(&w, &"model"[0: 5]);
+        jsonw_key(&w, &"owned_by"[0: 8]);
+        jsonw_str(&w, &"aigw"[0: 4]);
+        jsonw_end_obj(&w);
+        n = n + 1;
+    }
+    dbx_finalize(&st);
+    jsonw_end_arr(&w);
+    jsonw_end_obj(&w);
+    if !jsonw_ok(&w) {
+        srv_static(c, 200, SRV_JSON_MODELS, keep);
+        return;
+    }
+    srv_static(c, 200, jsonw_span(&w), keep);
+}
+
 /// 从 query 里取一个整数值（`?a=1&b=2`）；没有返回 -1。
 fn srv_query_day(path: &const byte, n: usize, key: &const byte, kn: usize) i64 {
     var i: usize = 0;
@@ -770,6 +818,8 @@ fn srv_usage(c: &SrvConn, stats: &ServeStats) void {
     jsonw_i64(&w, t_cost);
     jsonw_key(&w, &"price_nano"[0: 10]);
     jsonw_i64(&w, t_price);
+    jsonw_key(&w, &"profit_nano"[0: 11]);
+    jsonw_i64(&w, t_price -% t_cost);
     jsonw_end_obj(&w);
     jsonw_end_obj(&w);
     if !jsonw_ok(&w) {
@@ -865,7 +915,7 @@ fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
     }
     if c.route == ROUTE_MODELS {
         stats.requests = stats.requests +% 1;
-        srv_static(c, 200, SRV_JSON_MODELS, keep);
+        srv_models(c);
         return;
     }
     if c.route == ROUTE_SSE {
