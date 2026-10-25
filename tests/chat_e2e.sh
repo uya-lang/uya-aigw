@@ -40,6 +40,12 @@ port, cert, key, reqfile = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[
 BODY = (b'{"id":"chatcmpl-e2e","object":"chat.completion","usage":{'
         b'"prompt_tokens":100000,"completion_tokens":50000,'
         b'"prompt_tokens_details":{"cached_tokens":10000}}}')
+USAGE = (b'{"usage":{"prompt_tokens":100000,"completion_tokens":50000,'
+         b'"prompt_tokens_details":{"cached_tokens":10000}}}')
+SSE = (b'data: {"i":0}\n\n'
+       b'data: {"i":1}\n\n'
+       b'data: ' + USAGE + b'\n\n'
+       b'data: [DONE]\n\n')
 class H(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     def log_message(self, *a): pass
@@ -48,11 +54,19 @@ class H(http.server.BaseHTTPRequestHandler):
         data = self.rfile.read(n)
         with open(reqfile, "wb") as f:
             f.write(data)
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(BODY)))
-        self.end_headers()
-        self.wfile.write(BODY); self.wfile.flush()
+        if "text/event-stream" in (self.headers.get("Accept") or ""):
+            data = SSE
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data); self.wfile.flush()
+        else:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(BODY)))
+            self.end_headers()
+            self.wfile.write(BODY); self.wfile.flush()
 srv = http.server.HTTPServer(("127.0.0.1", port), H)
 sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 sctx.load_cert_chain(cert, key)
@@ -111,10 +125,19 @@ grep -q '"usage"' "$TMP/resp.json" || fail "no usage in response"
 grep -q '"upstream-model"' "$TMP/req.json" || fail "model not rewritten upstream"
 grep -q '"messages"' "$TMP/req.json" || fail "messages lost"
 
+# 4b) 流式：SSE 逐事件透传 + [DONE]
+SCODE=$(curl -s -N --max-time 15 -o "$TMP/stream.txt" -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $TOKEN" -H 'Accept: text/event-stream' \
+  --data '{"model":"mock-model","stream":true,"messages":[{"role":"user","content":"hi"}]}' \
+  "http://127.0.0.1:$PORT/v1/chat/completions")
+[ "$SCODE" = "200" ] || { cat "$TMP/stream.txt" >&2; fail "stream status=$SCODE"; }
+grep -q 'data: {"i":0}' "$TMP/stream.txt" || fail "stream event missing"
+grep -q 'data: \[DONE\]' "$TMP/stream.txt" || fail "stream DONE missing"
+
 # 5) 停机后查账本
 kill "$SRV_PID" 2>/dev/null || true
 wait "$SRV_PID" 2>/dev/null || true
 SRV_PID=""
 COUNT=$(AIGW_MODE=count AIGW_DB="$SEED_DB" ./build/seed | sed -n 's/^COUNT=//p')
-[ "$COUNT" = "1" ] || fail "usage_ledger count=$COUNT"
+[ "$COUNT" = "2" ] || fail "usage_ledger count=$COUNT"
 echo "CHAT-ALL-OK status=$CODE count=$COUNT"

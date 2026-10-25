@@ -23,6 +23,7 @@
 use libc.syscall;
 use libc.signal;
 use libc.errno;
+use std.async;
 
 /// 单连接读缓冲。请求头必须一次装下；包体按块流式排空，不需要整块驻留。
 export const SRV_IO_CAP: usize = 16384;
@@ -484,7 +485,141 @@ fn srv_static(c: &SrvConn, status: i32, body: &[byte], keep: bool) void {
     c.state = ST_WRITE;
 }
 
-/// chat：鉴权 → 解析/路由 → （上游传输下一步接）占位 501。
+/// SSE 结束/出错：直接切到 ST_WRITE 并关闭连接（流式响应已绕过 out 缓冲）。
+fn srv_chat_close(c: &SrvConn) void {
+    c.keep = false;
+    c.out_len = 0;
+    c.out_pos = 0;
+    c.state = ST_WRITE;
+}
+
+/// 阻塞发送（流式路径把 fd 临时切成阻塞，写完即关连接）。
+fn srv_send_all(fd: i32, data: &[byte]) bool {
+    var off: usize = 0;
+    while off < data.len {
+        const r: !isize = sys_send(fd, &data.ptr[off], data.len - off, 0);
+        const n: isize = r catch |err| {
+            if @error_id(err) as i32 == EINTR {
+                continue;
+            }
+            return false;
+        };
+        if n <= 0 {
+            return false;
+        }
+        off = off +% (n as usize);
+    }
+    return true;
+}
+
+/// 流式 chat：打开上游 → 逐事件 chunk 透传 → 终止块。阻塞，写完关连接。
+fn srv_chat_stream(c: &SrvConn, plan: &ChatPlan, cfg: &const HttppConfig, nowu: u64,
+    user_id: i64) void {
+    var call: HtcCall = HtcCall{};
+    htc_call_init(&call);
+    defer { htc_call_free(&call); }
+    const deadline: u64 = nowu +% 10000;
+    const o: !i32 = block_on<i32>(htc_open_async(cfg, &g_up_ctx, &"POST"[0: 4],
+        plan.path[0: plan.path_len], plan.payload[0: plan.payload_len], true, nowu, deadline, &call));
+    const orc: i32 = o catch |_| {
+        srv_static(c, 502, SRV_JSON_502, c.keep);
+        return;
+    };
+    if orc != 0 {
+        srv_static(c, 502, SRV_JSON_502, c.keep);
+        return;
+    }
+    // 临时阻塞发送：SSE 期间不参与 epoll 写事件
+    const fl: !i32 = sys_fcntl(c.fd, 3, 0);
+    const flags: i32 = fl catch {
+        0;
+    };
+    if flags != 0 {
+        _ = sys_fcntl(c.fd, 4, flags & (0 -% 2049)) catch {};
+    }
+    var head: [byte: 256] = [0: 256];
+    const hn: usize = hsrv_resp_head(&head[0], 256, 200, &SRV_CTYPE_SSE[0: 17], 17,
+        0 as i64, true, false);
+    if !srv_send_all(c.fd, head[0: hn]) {
+        srv_chat_close(c);
+        return;
+    }
+    var events: i32 = 0;
+    var done: bool = false;
+    var jd: JsonDoc = JsonDoc{};
+    var usage: PriceUsage = PriceUsage{ input_tokens: 0, output_tokens: 0, cache_read_tokens: 0 };
+    var usage_found: bool = false;
+    while events < 4096 && !done {
+        var has: bool = false;
+        const r: !i32 = block_on<i32>(htc_next_event_async(&call, &has, 5000 as u64));
+        const rr: i32 = r catch |_| {
+            break;
+        };
+        if rr == 0 || !has {
+            break;
+        }
+        if sse_is_done(&call.sse) {
+            done = true;
+        } else {
+            const dl0: usize = call.sse.ev.data_len;
+            if dl0 > 0 && call.sse.ev.data[0] == (123 as byte) {
+                json_parse(&jd, call.sse.ev.data[0: dl0]) catch {};
+                if billing_usage_parse(&jd, json_root(&jd), &usage) {
+                    usage_found = true;
+                }
+            }
+        }
+        var eb: [byte: 16384] = [0: 16384];
+        var el: usize = 0;
+        const pre: &[byte] = &"data: "[0: 6];
+        var i: usize = 0;
+        while i < 6 {
+            eb[el] = pre[i];
+            el = el + 1;
+            i = i + 1;
+        }
+        const dl: usize = call.sse.ev.data_len;
+        i = 0;
+        while i < dl && el < 16380 {
+            eb[el] = call.sse.ev.data[i];
+            el = el + 1;
+            i = i + 1;
+        }
+        if el == 0 || eb[el - 1] != (10 as byte) {
+            eb[el] = 10 as byte;
+            el = el + 1;
+        }
+        eb[el] = 10 as byte;
+        el = el + 1;
+        var ob: [byte: 16400] = [0: 16400];
+        const on: usize = hsrv_chunk(&ob[0], 16400, eb[0: el], el);
+        if on == 0 || !srv_send_all(c.fd, ob[0: on]) {
+            srv_chat_close(c);
+            return;
+        }
+        sse_consume(&call.sse);
+        events = events + 1;
+    }
+    _ = srv_send_all(c.fd, &"0\r\n\r\n"[0: 5]);
+    if usage_found {
+        var rid: [byte: 32] = [0: 32];
+        var ridn: usize = 0;
+        ridn = store_new_slug(&rid[0], 32) catch {
+            0 as usize;
+        };
+        if ridn > 0 {
+            var dirbuf: [byte: 256] = [0: 256];
+            const dn: usize = runtime_dir_copy(&dirbuf[0], 256);
+            var settle: BillingResult = BillingResult{ cost_nano: 0, price_nano: 0, rate_version: 0, duplicate: false, found: false };
+            billing_settle(runtime_db(), dirbuf[0: dn], rid[0: ridn], user_id,
+                store_now(), 0, plan.model[0: plan.model_len],
+                plan.provider_name[0: plan.provider_name_len], &usage, &settle) catch {};
+        }
+    }
+    srv_chat_close(c);
+}
+
+/// chat：鉴权 → 解析/路由 → 非流式结算 / 流式透传。
 fn srv_chat(c: &SrvConn, stats: &ServeStats) void {
     const keep: bool = c.keep;
     stats.requests = stats.requests +% 1;
@@ -512,24 +647,23 @@ fn srv_chat(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 400, SRV_JSON_400, keep);
         return;
     };
-    if plan.stream {
-        srv_static(c, 501, SRV_JSON_501, keep);
-        return;
-    }
     var cfg: HttppConfig = httpp_empty();
     if !upstream_config(&plan.host[0], plan.host_len, plan.port, plan.auth_type,
         &plan.secret[0], plan.secret_len, &cfg) {
         srv_static(c, 400, SRV_JSON_400, keep);
         return;
     }
-    var resp: [byte: 8192] = [0: 8192];
-    var st: i32 = 0;
-    var rn: usize = 0;
-    // htc 的时间基准是 std.time.now_ms（wall clock），不是 serve 的单调时钟
     const nowu: u64 = now_ms() catch {
         srv_static(c, 502, SRV_JSON_502, keep);
         return;
     };
+    if plan.stream {
+        srv_chat_stream(c, &plan, &cfg, nowu, key.user_id);
+        return;
+    }
+    var resp: [byte: 8192] = [0: 8192];
+    var st: i32 = 0;
+    var rn: usize = 0;
     upstream_post(&g_up_ctx, &cfg, plan.path[0: plan.path_len],
         plan.payload[0: plan.payload_len], nowu, nowu +% 60000,
         &resp[0], 8192, &st, &rn) catch {
