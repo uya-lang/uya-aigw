@@ -28,21 +28,13 @@ Phase A0 (SQLite spike) 可与 Phase T 并行 ─────┘
 
 ## Phase A：单节点
 
-| ID | 任务 | 验收 | 依赖 |
-|---|---|---|---|
-| A4 | chat 流/非流、快路径、tools、usage、分时 cost/price、批量落库 | SSE 对齐；金额与 preview 一致；落库不影响 p99 | A2/A3/TLS-09 |
-
-A4 进度（子项已完成记录见 `TODO_DONE.md`）：
-- A4：chat 非流/流式、鉴权→路由→上游 TLS→分时价→journal/ledger、SSE、金额 e2e、失败转移
-  已落地；无 DOM 快路径（顶层扫描 model/stream）与批量落库（512 行/200ms 事务、journal
-  批追加、查询前 flush）已完成；剩余：上游异步化（p99）。
+全部完成（A1…A9：事件循环、schema/认证/备份/journal、插件池、chat 非流/流式与 tools、快路径、
+批量落库、上游等待事件驱动 + p99 回归，见 `TODO_DONE.md`）。
 
 ---
 
 ## Phase B：集群
 
-| ID | 任务 | 验收 | 依赖 |
-|---|---|---|---|
 全部完成（B1…B6：meta.db/选主、uplink、epoch/fencing/drain、edge 路由与 SSE 流式转发、
 ingest 幂等 + usage 分片 `hash(user_id)%4`、spool、journal 重放、集群 e2e 与部署，见 `TODO_DONE.md`）。
 
@@ -50,20 +42,13 @@ ingest 幂等 + usage 分片 `hash(user_id)%4`、spool、journal 重放、集群
 
 ## Phase C：后台
 
-| ID | 任务 | 验收 | 依赖 |
-|---|---|---|---|
 全部完成（C1…C6、含分时价编辑、审计动作与站内通知，见 `TODO_DONE.md`）。
 
 ---
 
 ## 当前建议顺序
 
-1. ~~TLS-01 → … → TLS-05A~~（已完成，见 `TODO_DONE.md`）
-2. 并行：A0 spike（SQLite + money）
-3. TLS-06 → TLS-07 → TLS-08 → TLS-09 → TLS-10 → TLS-11
-4. ~~A1 → A2 → A3 → A6 → A7 → A9 → A8 插件重绑 → A4 快路径/批量落库 → A5 流式工具事件~~ → A4 上游异步化
-5. ~~B1 → B2 → B3 → B6 → B4 edge→node 流式转发 → B5 usage 分片~~（Phase B 全部完成）
-6. ~~C1 → C2 → C3 → C4 → C5 → C6~~（Phase C 全部完成）
+全部阶段（T / A / B / C）已完成，逐项记录与提交提示见 `TODO_DONE.md`。
 
 ---
 

@@ -1019,7 +1019,7 @@ fn srv_chat_stream(c: &SrvConn, plan: &ChatPlan, cfg: &const HttppConfig, nowu: 
     htc_call_init(&call);
     defer { htc_call_free(&call); }
     const deadline: u64 = nowu +% 10000;
-    const o: !i32 = block_on<i32>(htc_open_async(cfg, &g_up_ctx, &"POST"[0: 4],
+    const o: !i32 = wait_i32(htc_open_async(cfg, &g_up_ctx, &"POST"[0: 4],
         plan.path[0: plan.path_len], plan.payload[0: plan.payload_len], true, nowu, deadline, &call));
     const orc: i32 = o catch |_| {
         lb_report(plan.provider_id, false, store_now());
@@ -1054,7 +1054,7 @@ fn srv_chat_stream(c: &SrvConn, plan: &ChatPlan, cfg: &const HttppConfig, nowu: 
     var usage_found: bool = false;
     while events < 4096 && !done {
         var has: bool = false;
-        const r: !i32 = block_on<i32>(htc_next_event_async(&call, &has, 5000 as u64));
+        const r: !i32 = wait_i32(htc_next_event_async(&call, &has, 5000 as u64));
         const rr: i32 = r catch |_| {
             break;
         };
@@ -3509,7 +3509,7 @@ fn srv_responses_stream(c: &SrvConn, uid: i64, plan: &ChatPlan, cfg: &const Http
         srv_static(c, 502, SRV_JSON_502, c.keep);
         return;
     };
-    const o: !i32 = block_on<i32>(htc_open_async(cfg, &g_up_ctx, &"POST"[0: 4],
+    const o: !i32 = wait_i32(htc_open_async(cfg, &g_up_ctx, &"POST"[0: 4],
         plan.path[0: plan.path_len], plan.payload[0: plan.payload_len], true,
         nowu, nowu +% 10000, &call));
     const orc: i32 = o catch |_| {
@@ -3572,7 +3572,7 @@ fn srv_responses_stream(c: &SrvConn, uid: i64, plan: &ChatPlan, cfg: &const Http
     var tcs: [SrvToolCall: SRV_TC_MAX] = [];
     while events < 4096 && !done && !closed {
         var has: bool = false;
-        const r: !i32 = block_on<i32>(htc_next_event_async(&call, &has, 5000 as u64));
+        const r: !i32 = wait_i32(htc_next_event_async(&call, &has, 5000 as u64));
         const rr: i32 = r catch |_| {
             break;
         };
@@ -4507,7 +4507,11 @@ fn srv_budget(c: &SrvConn, stats: &ServeStats) void {
     const limit: i64 = budget_get(runtime_db(), uid) catch {
         0 as i64;
     };
-    const spent: i64 = budget_month_spent(runtime_db(), uid, now) catch {
+    var bdb: &Db = runtime_db();
+    if shard_active() {
+        bdb = shard_db_for(uid);
+    }
+    const spent: i64 = budget_month_spent(bdb, uid, now) catch {
         0 as i64;
     };
     var over: bool = false;
@@ -4944,11 +4948,16 @@ fn srv_requests(c: &SrvConn, stats: &ServeStats) void {
     };
     var w: JsonW = JsonW{};
     jsonw_init(&w);
+    // B5：分片模式下账本在用户的固定分片；否则在 runtime DB。
+    var ldb: &Db = runtime_db();
+    if shard_active() {
+        ldb = shard_db_for(key.user_id);
+    }
     var rid: [byte: 128] = [0: 128];
     const rn: usize = srv_query_str(&c.path[0], c.path_len, &"id"[0: 2], 2, &rid[0], 128);
     if rn > 0 {
         var row: StoreLedgerRow = StoreLedgerRow{};
-        const found: bool = store_get_ledger(runtime_db(), key.user_id, rid[0: rn], &row) catch {
+        const found: bool = store_get_ledger(ldb, key.user_id, rid[0: rn], &row) catch {
             false;
         };
         if !found {
@@ -4971,7 +4980,7 @@ fn srv_requests(c: &SrvConn, stats: &ServeStats) void {
     }
     var rows: [StoreLedgerRow: 100] = [];
     var n: usize = 0;
-    n = store_list_ledger(runtime_db(), key.user_id, limit, offset, &rows[0], 100) catch {
+    n = store_list_ledger(ldb, key.user_id, limit, offset, &rows[0], 100) catch {
         srv_static(c, 502, SRV_JSON_502, keep);
         return;
     };

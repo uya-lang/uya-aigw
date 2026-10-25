@@ -184,12 +184,52 @@ fn batch_journal_flush(day: i64, data: &[byte], jn: &usize) bool {
     return true;
 }
 
+/// B5：分片模式下按 user_id 选库；否则用配置的单库。
+fn batch_row_db(uid: i64) &Db {
+    if shard_active() {
+        return shard_db_for(uid);
+    }
+    return &g_b_db;
+}
+
+/// 开事务：单库一个；分片模式每片各一个（互不影响）。
+fn batch_begin_all() bool {
+    if !shard_active() {
+        return batch_exec(&g_b_db, "begin immediate" as &const byte);
+    }
+    var k: i32 = 0;
+    while k < SHARD_K {
+        if !batch_exec(shard_db(k), "begin immediate" as &const byte) {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+/// 提交/回滚全部分片（单库模式就是那一个库）。
+fn batch_end_all(sql: &const byte) bool {
+    if !shard_active() {
+        return batch_exec(&g_b_db, sql);
+    }
+    var ok: bool = true;
+    var k: i32 = 0;
+    while k < SHARD_K {
+        if !batch_exec(shard_db(k), sql) {
+            ok = false;
+        }
+        k = k + 1;
+    }
+    return ok;
+}
+
 /// 把队列一次性提交：DB 一个事务 + journal 一批一次 fsync。返回 applied 行数。
 export fn batch_flush() !usize {
     if !g_b_ready || g_b_len == 0 {
         return 0 as usize;
     }
-    if !batch_exec(&g_b_db, "begin immediate" as &const byte) {
+    if !batch_begin_all() {
+        _ = batch_end_all(&"rollback"[0: 8]);
         return error.BatchFailed;
     }
     var applied: usize = 0;
@@ -200,7 +240,8 @@ export fn batch_flush() !usize {
     var i: usize = 0;
     while i < g_b_len && !failed {
         const r: &BatchRow = &g_b_rows[i];
-        const ok: bool = billing_apply_ledger(&g_b_db, r.request_id[0: r.request_id_len],
+        const rdb: &Db = batch_row_db(r.user_id);
+        const ok: bool = billing_apply_ledger(rdb, r.request_id[0: r.request_id_len],
             r.user_id, r.ts, r.model[0: r.model_len], r.provider[0: r.provider_len],
             r.input_tokens, r.output_tokens, r.cache_read_tokens, r.cost_nano,
             r.price_nano, r.period[0: r.period_len], r.rate_version) catch {
@@ -247,11 +288,11 @@ export fn batch_flush() !usize {
         failed = true;
     }
     if failed {
-        _ = batch_exec(&g_b_db, "rollback" as &const byte);
+        _ = batch_end_all(&"rollback"[0: 8]);
         return error.BatchFailed;
     }
-    if !batch_exec(&g_b_db, "commit" as &const byte) {
-        _ = batch_exec(&g_b_db, "rollback" as &const byte);
+    if !batch_end_all(&"commit"[0: 6]) {
+        _ = batch_end_all(&"rollback"[0: 8]);
         return error.BatchFailed;
     }
     g_b_applied = g_b_applied +% (applied as i64);

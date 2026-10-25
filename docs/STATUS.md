@@ -82,12 +82,9 @@
   （initialize/tools/list/tools/call：pricing_get、billing_query、backup_status）。
 - A5（进行中）：`/v1/responses` 非流式 + previous_response_id 续轮 + 流式事件
   （created/delta/completed）已通；reasoning/tools 仍未透传。
-- A4（进行中）：`src/core/json.uya` 有界 JSON DOM + 构造器（44 断言）；
-  schema v4 `providers`/`provider_models` + store CRUD/路由（33 断言）；
-  `src/core/billing.uya` 结算（usage 双风格解析 + 查价 + journal/ledger 幂等，30 断言）；
-  `src/core/chat.uya` 编排（解析/路由/上游请求重写/结算，23 断言）；
-  `httpsrv` 已捕获 `Authorization` 头（chat 鉴权的前置）。
-  下一步把 `ChatPlan` 接到 serve 的 `POST /v1/chat/completions`（含 SSE 透传）。
+- A4（已完成）：JSON DOM/构造器、providers/路由、billing 结算、chat 编排、serve 接线
+  （非流/流式 SSE、tools 透传、失败转移、无 DOM 快路径、512 行/200ms 批量落库）、
+  上游等待事件驱动（`src/core/upwait.uya`，epoll 等 waker fd，不再忙轮询）。
 - B1（已落地）：meta.db + `elect.uya` + controller 控制面（register/heartbeat/
   config/status，`--meta`/`--node-id`，standby 不备份）。
 - B2（进行中）：`uplink.uya` + `--uplink` 已通（node 注册/心跳）；config 快照与
@@ -150,11 +147,8 @@
 2. Phase A：A0 SQLite+money spike、A1 事件循环、A2 schema/认证/备份/journal、A3 插件池、A4 chat … A9 文档/e2e
 3. Phase B：controller/node/edge、lease/epoch、ingest/journal
 4. Phase C：用户端/管理端后台
-5. A4 剩余接线（下轮直接做）：serve 持有 `HtcCtx`（`--ca <pem>` 读入 bundle，
-   默认 `TLSX_MODE_CHAIN`），`ChatPlan → HttppConfig` 映射（host/port/auth_type/secret），
-   收到完整 body 后 `upstream_post` → 成功则 `chat_settle` → 原样回上游 JSON；
-   `stream=true` 时用 `htc_next_event_async` 逐事件 `hsrv_chunk` 透传并在 `[DONE]` 收尾；
-   e2e 复用 `tests/provider_spike.sh` 的 TLS mock（root/inter/leaf）造 `/v1/chat/completions`。
+5. ~~A4 剩余接线~~（已完成：serve 持有 `HtcCtx`、chat/responses 非流+SSE、tools 透传；
+   上游等待改为 `upwait.wait_i32` 事件驱动，chat e2e 带 p99 断言）。
 6. A4 拆解（历史）：① `src/core/json.uya`（有界 DOM 解析 + 字符串转义/构造）；
    ② schema v4 `providers`（base_url/host/port/auth/secret/超时/启用）与 store CRUD；
    ③ `POST /v1/chat/completions`：Bearer 鉴权 → `htc_open_async` 上游 → usage 解析 →
@@ -165,7 +159,8 @@
 
 - spike 只验证 TLS 1.2（`s_server -tls1_2`）；TLS 1.3 待补测
 - 不做 HTTP/2/3、gzip、入站 TLS（建议 nginx/caddy）
-- 上游请求仍走 `block_on`（忙轮询），事件循环内的异步化（A4 p99）待做
+- 单线程事件循环：上游等待已事件驱动（`src/core/upwait.uya`），但同一时刻仍只推进一个上游
+  请求；吞吐靠多 node 水平扩展（与设计一致）
 - controller 每日自动备份只覆盖 runtime DB；usage 分片需用 `aigw backup --db data/usage-<k>.db`
   或外部快照（见 `docs/runbooks/restore.md`）
 
@@ -176,5 +171,6 @@
 | 网关侧 SSE 并发 | `make load-sse` | 1000 条连接 × 20 事件，全部读完且 10s 内判定，实测 ≈0.55s |
 | 集群端到端 | `make cluster-e2e` | 1 controller + 3 node 注册/快照/路由/代理/drain/ingest/spool 全绿 |
 | 请求路径回归 | `make ui-e2e` | OTP→登录→建 Key→chat/responses（含 tools 透传与失败转移）→后台接口全绿 |
+| chat 请求 p99 | `make ui-e2e` | 20 次顺序 chat（TLS mock 上游），avg≈0.375s、p99≈0.379s |
 
-> 说明：A4 的快路径与批量落库已落地；上游异步化与 p99 压测仍未做，上面只是当前实现的并发基线。
+> 说明：A4 已完成（快路径、批量落库、上游事件驱动等待与 p99 回归）；上表为当前实现的本机基线。

@@ -3,8 +3,8 @@
 // 只做「一次非流式 POST → 状态码 + 响应体」；配置（HttppConfig / HtcCtx）由调用方
 // 准备：serve 从 ChatPlan 构造，测试用 provider_spike 的本地 TLS 上游。
 //
-// 注意：`block_on` 目前是忙轮询（TLS-09E 的等待原语限制），在请求路径上是阻塞的；
-// A8/A9 再换成事件循环里的 future。当前先保证鉴权/路由/结算语义正确。
+// 上游等待走 `upwait.wait_i32`（epoll 事件驱动：Pending 时等 waker 登记的 fd，
+// 不再忙轮询烧 CPU）；请求路径上的语义与原来的 block_on 完全一致。
 
 use std.async;
 
@@ -23,7 +23,7 @@ export fn upstream_post(ctx: &HtcCtx, cfg: &const HttppConfig, path: &[byte],
     var call: HtcCall = HtcCall{};
     htc_call_init(&call);
     defer { htc_call_free(&call); }
-    const o: !i32 = block_on<i32>(htc_open_async(cfg, ctx, &"POST"[0: 4], path,
+    const o: !i32 = wait_i32(htc_open_async(cfg, ctx, &"POST"[0: 4], path,
         body, false, now_ms, deadline, &call));
     const rc: i32 = o catch |_| {
         return error.UpstreamFailed;
@@ -32,7 +32,7 @@ export fn upstream_post(ctx: &HtcCtx, cfg: &const HttppConfig, path: &[byte],
         return error.UpstreamFailed;
     }
     var got: usize = 0;
-    const b: !i32 = block_on<i32>(htc_body_async(&call, out, cap, &got));
+    const b: !i32 = wait_i32(htc_body_async(&call, out, cap, &got));
     const br: i32 = b catch |_| {
         return error.UpstreamFailed;
     };

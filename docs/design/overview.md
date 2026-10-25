@@ -71,6 +71,8 @@
 - **单进程、单线程、无锁**：所有 I/O 走 epoll；协程用 `@async_fn` / `Future` / `Waker`。
 - **连接级协程**：每个连接一个 `@frame(conn_serve)` 帧（默认 1024 槽），状态机解析请求、转发上游、写响应。
 - **不阻塞**：DNS、TCP connect、TLS 握手、读写、上游 SSE 全部异步；插件子进程用 `fork+execve` + 非阻塞管道。
+- **上游等待**：`src/core/upwait.uya` 的 `wait_i32` 把 waker 登记的 fd（可读/可写/双向 + eventfd）
+  加进 epoll，Pending 时阻塞等待而不是忙轮询。
 - **背压**：客户端慢时停止读上游；插件池满时请求排队或快速失败。
 - **超时**：连接空闲读 60s；请求总 deadline 30min；上游首字节 60s、流空闲 120s。
 - **优雅停机**：`signalfd` 收到 SIGTERM/SIGINT 后停止 accept、排空在飞请求、回收插件、退出。

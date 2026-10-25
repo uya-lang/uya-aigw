@@ -113,7 +113,7 @@ UYA_ROOT="$UYA_ROOT" "$UYA" build \
   src/core/money.uya src/core/reqlog.uya src/core/dbx.uya src/cluster/meta.uya src/cluster/elect.uya src/cluster/uplink.uya src/cluster/edge.uya src/cluster/spool.uya src/cluster/ingest.uya src/cluster/shard.uya src/net/ui.uya src/net/rsav.uya \
   src/core/schema.uya src/core/store.uya src/core/budget.uya src/core/backup.uya src/core/journal.uya \
   src/core/runtime.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/rollup.uya \
-  src/core/billing.uya src/core/batch.uya src/core/notify.uya src/core/lb.uya src/core/responses.uya src/core/chat.uya src/providers/upstream.uya \
+  src/core/billing.uya src/core/batch.uya src/core/notify.uya src/core/upwait.uya src/core/lb.uya src/core/responses.uya src/core/chat.uya src/providers/upstream.uya \
   src/providers/upstream_cfg.uya \
   src/net/x509min.uya src/net/chainx.uya src/net/urlx.uya src/net/dnsx.uya \
   src/net/tlsx.uya src/net/tlsx_conn.uya src/net/httpc.uya src/net/ssex.uya \
@@ -470,10 +470,31 @@ echo "$I1" | grep -q '"applied":2' || { echo "$I1" >&2; fail "ingest applied"; }
 I2=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer test-admin' --data "$ING" "$BASE/controller/ingest")
 echo "$I2" | grep -q '"duplicate":2' || { echo "$I2" >&2; fail "ingest duplicate"; }
 
+# 4y) A4：上游事件驱动等待下的 p99（20 次顺序 chat；上游是本地 TLS mock）
+LAT="$TMP/lat.txt"
+: > "$LAT"
+for i in $(seq 1 20); do
+  curl -s --max-time 10 -o /dev/null -w '%{time_total}\n' -X POST \
+    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+    --data '{"model":"mock-model","messages":[{"role":"user","content":"ping"}]}' \
+    "$BASE/v1/chat/completions" >> "$LAT"
+done
+P99=$(sort -n "$LAT" | awk '{a[NR]=$1} END{print a[int(NR*0.99)]}')
+AVG=$(awk '{s+=$1} END{printf "%.4f", s/NR}' "$LAT")
+awk -v p="$P99" 'BEGIN{exit !(p>0 && p<1.0)}' || fail "chat p99=$P99"
+echo "CHAT-LAT n=20 avg=${AVG}s p99=${P99}s"
+
 # 5) 停机后查账本
 kill "$SRV_PID" 2>/dev/null || true
 wait "$SRV_PID" 2>/dev/null || true
 SRV_PID=""
-COUNT=$(AIGW_MODE=count AIGW_DB="$SEED_DB" ./build/seed | sed -n 's/^COUNT=//p')
-[ "$COUNT" = "12" ] || fail "usage_ledger count=$COUNT"
+# B5：controller 分片后账本在 usage-<k>.db；逐库求和（不含则不重复计）。
+COUNT=0
+for db in "$SEED_DB" "$TMP/data"/usage-*.db; do
+  [ -f "$db" ] || continue
+  C=$(AIGW_MODE=count AIGW_DB="$db" ./build/seed | sed -n 's/^COUNT=//p')
+  [ -n "$C" ] || fail "count db=$db"
+  COUNT=$((COUNT + C))
+done
+[ "$COUNT" = "32" ] || fail "usage_ledger count=$COUNT"
 echo "CHAT-ALL-OK status=$CODE count=$COUNT"
