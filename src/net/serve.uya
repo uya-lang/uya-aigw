@@ -82,6 +82,7 @@ const ROUTE_RESPONSES: i32 = 14;
 const ROUTE_MCP: i32 = 15;
 const ROUTE_KEY_REVOKE: i32 = 24;
 const ROUTE_CTL_INGEST: i32 = 25;
+const ROUTE_BUDGET: i32 = 30;
 const ROUTE_ESTIMATE: i32 = 29;
 const ROUTE_USAGE_CSV: i32 = 28;
 const ROUTE_UI: i32 = 26;
@@ -590,6 +591,9 @@ fn srv_route_of(req: &HsrvReq) i32 {
     }
     if srv_path_is(req, &"/v1/me"[0: 6]) {
         return ROUTE_ME;
+    }
+    if srv_path_is(req, &"/v1/budget"[0: 10]) {
+        return ROUTE_BUDGET;
     }
     if srv_path_is(req, &"/v1/estimate"[0: 12]) {
         return ROUTE_ESTIMATE;
@@ -1171,6 +1175,10 @@ fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
     }
     if c.route == ROUTE_ME {
         srv_me(c, stats);
+        return;
+    }
+    if c.route == ROUTE_BUDGET {
+        srv_budget(c, stats);
         return;
     }
     if c.route == ROUTE_ESTIMATE {
@@ -3572,6 +3580,66 @@ fn srv_estimate(c: &SrvConn, stats: &ServeStats) void {
     jsonw_i64(&w, res.price_nano -% res.cost_nano);
     jsonw_key(&w, &"rate_version"[0: 12]);
     jsonw_i64(&w, res.rate_version);
+    jsonw_end_obj(&w);
+    srv_static(c, 200, jsonw_span(&w), keep);
+}
+
+
+// C4：预算（GET 读当前额度与当月已用；POST 设置，需会话或 Key）。
+fn srv_budget(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    if !runtime_ready() {
+        srv_static(c, 503, SRV_JSON_503, keep);
+        return;
+    }
+    var uid: i64 = 0;
+    if !srv_bearer_uid(c, &uid) {
+        srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    }
+    const now: i64 = store_now();
+    if !c.is_get {
+        if c.body_overflow {
+            srv_static(c, 413, SRV_JSON_413, keep);
+            return;
+        }
+        var d: JsonDoc = JsonDoc{};
+        json_parse(&d, c.body[0: c.body_len]) catch {
+            srv_static(c, 400, SRV_JSON_400, keep);
+            return;
+        };
+        const v: i64 = json_i64(&d, json_get(&d, json_root(&d), &"monthly_nano"[0: 12]));
+        if v < 0 {
+            srv_static(c, 400, SRV_JSON_400, keep);
+            return;
+        }
+        budget_set(runtime_db(), uid, v, now) catch {
+            srv_static(c, 502, SRV_JSON_502, keep);
+            return;
+        };
+    }
+    const limit: i64 = budget_get(runtime_db(), uid) catch {
+        0 as i64;
+    };
+    const spent: i64 = budget_month_spent(runtime_db(), uid, now) catch {
+        0 as i64;
+    };
+    var over: bool = false;
+    if limit > 0 && spent >= limit {
+        over = true;
+    }
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"user_id"[0: 7]);
+    jsonw_i64(&w, uid);
+    jsonw_key(&w, &"monthly_nano"[0: 12]);
+    jsonw_i64(&w, limit);
+    jsonw_key(&w, &"spent_nano"[0: 10]);
+    jsonw_i64(&w, spent);
+    jsonw_key(&w, &"over_budget"[0: 11]);
+    jsonw_bool(&w, over);
     jsonw_end_obj(&w);
     srv_static(c, 200, jsonw_span(&w), keep);
 }

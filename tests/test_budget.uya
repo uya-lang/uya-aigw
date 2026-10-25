@@ -1,0 +1,70 @@
+// tests/test_budget.uya — C4 月度预算与告警
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_i64;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+const T0: i64 = 1700000000; // 2023-11-14
+
+fn open_db(d: &Db) !void {
+    _ = try schema_open(d, &":memory:"[0: 8]);
+}
+
+fn test_month_range() !void {
+    var to_day: i64 = 0;
+    const from_day: i64 = budget_month(T0, &to_day);
+    // 2023-11-01 = day 19662 ; 2023-11-30 = day 19691
+    try assert_eq_i64(from_day, 19662);
+    try assert_eq_i64(to_day, 19691);
+    // 2 月（2024 闰年）：2024-02-01 = 19754, 2024-02-29 = 19782
+    const feb: i64 = 1706745600; // 2024-02-01
+    const ff: i64 = budget_month(feb, &to_day);
+    try assert_eq_i64(ff, 19754);
+    try assert_eq_i64(to_day, 19782);
+    // 2 月（2023 平年）：2023-02-01 = 19389, 2023-02-28 = 19416
+    const feb23: i64 = 1675209600;
+    const f23: i64 = budget_month(feb23, &to_day);
+    try assert_eq_i64(f23, 19389);
+    try assert_eq_i64(to_day, 19416);
+}
+
+fn test_set_get() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    try assert_eq_i64(try budget_get(&d, 1), 0);
+    try budget_set(&d, 1, 5000, T0);
+    try assert_eq_i64(try budget_get(&d, 1), 5000);
+    try budget_set(&d, 1, 7000, T0 +% 1);
+    try assert_eq_i64(try budget_get(&d, 1), 7000);
+    var bad: bool = false;
+    budget_set(&d, 0, 100, T0) catch |_| {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+}
+
+fn test_spent_and_alert() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    var to_day: i64 = 0;
+    const day: i64 = budget_month(T0, &to_day);
+    var st: DbStmt = dbx_prepare(&d,
+        "insert into usage_daily(day, user_id, model, provider, period, requests, input_tokens, output_tokens, cache_read_tokens, cost_nano, price_nano) values(?, 1, 'm', 'p', '', 1, 10, 5, 0, 60, 100)" as &const byte) catch {
+        return error.BudgetFailed;
+    };
+    dbx_bind_i64(&st, 1, day) catch {};
+    _ = dbx_step(&st);
+    dbx_finalize(&st);
+    try assert_eq_i64(try budget_month_spent(&d, 1, T0), 100);
+    try assert_eq_bool(try budget_exceeded(&d, 1, T0), false);
+    try budget_set(&d, 1, 100, T0);
+    try assert_eq_bool(try budget_exceeded(&d, 1, T0), true);
+    try budget_set(&d, 1, 101, T0);
+    try assert_eq_bool(try budget_exceeded(&d, 1, T0), false);
+}
+
+test "month_range" { run_test("month_range", test_month_range); }
+test "set_get" { run_test("set_get", test_set_get); }
+test "spent_and_alert" { run_test("spent_and_alert", test_spent_and_alert); }

@@ -82,7 +82,7 @@ sleep 0.3
 # 3) 种子夹具 + aigw
 mkdir -p build
 UYA_ROOT="$UYA_ROOT" "$UYA" build \
-  src/core/dbx.uya src/core/schema.uya src/core/store.uya src/core/money.uya \
+  src/core/dbx.uya src/core/schema.uya src/core/store.uya src/core/budget.uya src/core/money.uya \
   src/core/schedule.uya src/core/price.uya tests/seed_main.uya -o build/seed >"$TMP/seedbuild.log" 2>&1 \
   || { cat "$TMP/seedbuild.log" >&2; fail "seed build"; }
 
@@ -93,7 +93,7 @@ AIGW_MODE=seed AIGW_DB="$SEED_DB" AIGW_UPSTREAM_PORT="$MPORT" ./build/seed >/dev
 UYA_ROOT="$UYA_ROOT" "$UYA" build \
   src/foundation/buf.uya src/net/httpsrv.uya src/net/tcpx.uya src/net/serve.uya \
   src/core/money.uya src/core/reqlog.uya src/core/dbx.uya src/cluster/meta.uya src/cluster/elect.uya src/cluster/uplink.uya src/cluster/ingest.uya src/net/ui.uya src/net/rsav.uya \
-  src/core/schema.uya src/core/store.uya src/core/backup.uya src/core/journal.uya \
+  src/core/schema.uya src/core/store.uya src/core/budget.uya src/core/backup.uya src/core/journal.uya \
   src/core/runtime.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/rollup.uya \
   src/core/billing.uya src/core/lb.uya src/core/responses.uya src/core/chat.uya src/providers/upstream.uya \
   src/providers/upstream_cfg.uya \
@@ -258,6 +258,14 @@ kill "$NB_PID" 2>/dev/null || true
 wait "$NB_PID" 2>/dev/null || true
 NB_PID=""
 
+# 4l) C4：预算设置与告警（当月已用来自 usage_daily）
+BG=$(curl -s --max-time 5 -H "Authorization: Bearer $TOKEN" "$BASE/v1/budget")
+echo "$BG" | grep -q '"monthly_nano":0' || { echo "$BG" >&2; fail "budget get"; }
+BS=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $TOKEN" --data '{"monthly_nano":1}' "$BASE/v1/budget")
+echo "$BS" | grep -q '"over_budget":true' || { echo "$BS" >&2; fail "budget over"; }
+BS2=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $TOKEN" --data '{"monthly_nano":100000000}' "$BASE/v1/budget")
+echo "$BS2" | grep -q '"over_budget":false' || { echo "$BS2" >&2; fail "budget under"; }
+
 # 4k) C3：费用估算（价格来自 seed 的 sell 价目）
 EST=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $TOKEN" \
   --data '{"model":"mock-model","provider":"mock","prompt_tokens":1000,"completion_tokens":500}' "$BASE/v1/estimate")
@@ -283,6 +291,10 @@ echo "$UI" | grep -q 'id="overview"' || { echo "$UI" >&2; fail "ui overview"; }
 echo "$UIJS" | grep -q '/v1/usage' || { echo "$UIJS" >&2; fail "ui usage"; }
 echo "$UIJS" | grep -q 'usage-table' || { echo "$UIJS" >&2; fail "ui usage table"; }
 echo "$UI" | grep -q 'id="estimate"' || { echo "$UI" >&2; fail "ui estimate"; }
+echo "$UI" | grep -q 'id="playground"' || { echo "$UI" >&2; fail "ui playground"; }
+echo "$UI" | grep -q 'id="billing"' || { echo "$UI" >&2; fail "ui billing"; }
+echo "$UIJS" | grep -q '/v1/budget' || { echo "$UIJS" >&2; fail "ui budget js"; }
+echo "$UIJS" | grep -q '/v1/chat/completions' || { echo "$UIJS" >&2; fail "ui playground js"; }
 echo "$UIJS" | grep -q '/v1/estimate' || { echo "$UIJS" >&2; fail "ui estimate js"; }
 CT=$(curl -s --max-time 5 -o /dev/null -w '%{content_type}' "$BASE/")
 case "$CT" in text/html*) ;; *) fail "ui content-type=$CT";; esac

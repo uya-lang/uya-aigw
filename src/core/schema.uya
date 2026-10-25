@@ -17,7 +17,7 @@
 //
 // 打开流程（`schema_open`）：open → pragmas → migrate。热路径不该调它。
 
-export const SCHEMA_VERSION: i32 = 7;
+export const SCHEMA_VERSION: i32 = 8;
 
 export error SchemaFailed;
 
@@ -138,6 +138,10 @@ fn schema_v6(d: &Db) !void {
 // v7：responses（A5）
 // ---------------------------------------------------------------
 
+fn schema_v8(d: &Db) !void {
+    try dbx_exec_cstr(d, "create table if not exists budgets (user_id integer primary key, monthly_nano integer not null default 0, updated_at integer not null default 0)" as &const byte);
+}
+
 fn schema_v7(d: &Db) !void {
     try dbx_exec_cstr(d, "create table if not exists responses (id text primary key, user_id integer not null, created_at integer not null, model text not null, previous_id text not null default '', input_text text not null default '', output_text text not null default '', status text not null default 'completed', usage_json text not null default '')" as &const byte);
     try dbx_exec_cstr(d, "create index if not exists idx_responses_user on responses(user_id, created_at)" as &const byte);
@@ -232,6 +236,11 @@ export fn schema_migrate(d: &Db) !i32 {
             applied = true;
         } else if cur == 6 {
             schema_v7(d) catch |_| {
+                failed = true;
+            };
+            applied = true;
+        } else if cur == 7 {
+            schema_v8(d) catch |_| {
                 failed = true;
             };
             applied = true;

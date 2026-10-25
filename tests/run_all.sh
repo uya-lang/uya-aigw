@@ -39,6 +39,7 @@ run src/core/dbx.uya src/core/schema.uya src/core/json.uya src/core/rollup.uya s
 run src/core/dbx.uya src/cluster/meta.uya src/cluster/edge.uya tests/test_edge.uya
 run src/cluster/spool.uya tests/test_spool.uya
 run src/core/dbx.uya src/core/schema.uya src/core/store.uya tests/test_keys.uya
+run src/core/dbx.uya src/core/schema.uya src/core/budget.uya tests/test_budget.uya
 run src/core/dbx.uya src/cluster/meta.uya src/cluster/elect.uya tests/test_elect.uya
 run src/core/dbx.uya src/core/schema.uya src/core/backup.uya tests/test_backup.uya
 run src/core/dbx.uya src/core/schema.uya src/core/backup.uya src/core/journal.uya tests/test_journal.uya

@@ -83,6 +83,9 @@ C2 进度：`/v1/usage.csv` + 概览/明细表 + CSV 导出已落地；请求列
 
 C3 进度：Key 管理（建/列/撤销）+ `POST /v1/estimate` 估算器已落地；模型/价格编辑页待做。
 | C4 | Playground + 账单 + 设置/通知 | SSE 指标正确；预算告警触发 | C2/C3 |
+
+C4 进度：Playground（流式指标）+ 账单预算（schema v8 budgets、`/v1/budget`、超额告警）
+已落地；通知（webhook/邮件）待做。
 | C5 | 管理后台（用户/供应商/模型/定价/分时/节点/备份/审计） | 改价/绑定/节点 drain/备份状态可见 | A7/B3 |
 | C6 | e2e + 安全（CSRF/XSS/CSP/越权）+ 文档 | `make ui-e2e` 全绿 | C1–C5 |
 
