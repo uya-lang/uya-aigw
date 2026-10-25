@@ -37,6 +37,7 @@
   spool 自动消费循环待做。
 - C1（进行中）：静态壳 `/` + `/ui/app.js`（登录/资料/密钥/接入点 + curl 示例）已落地。
 - C2（进行中）：`/v1/usage.csv` + 概览/明细表 + CSV 导出已落地；请求列表/详情待做。
+- C2（已完成）：`/v1/usage`、`/v1/usage.csv`、`/v1/requests`（列表/详情分页）与 UI 概览页。
 - C3（进行中）：Key 管理 + `POST /v1/estimate` 估算器已落地；模型/价格编辑页待做。
 - C4（进行中）：Playground（流式指标）+ 账单预算（schema v8、`/v1/budget`）已落地；
   通知待做。
@@ -90,6 +91,7 @@
   spool 自动消费循环待做。
 - C1（进行中）：静态壳 `/` + `/ui/app.js`（登录/资料/密钥/接入点 + curl 示例）已落地。
 - C2（进行中）：`/v1/usage.csv` + 概览/明细表 + CSV 导出已落地；请求列表/详情待做。
+- C2（已完成）：`/v1/usage`、`/v1/usage.csv`、`/v1/requests`（列表/详情分页）与 UI 概览页。
 - C3（进行中）：Key 管理 + `POST /v1/estimate` 估算器已落地；模型/价格编辑页待做。
 - C4（进行中）：Playground（流式指标）+ 账单预算（schema v8、`/v1/budget`）已落地；
   通知待做。

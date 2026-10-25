@@ -258,6 +258,20 @@ kill "$NB_PID" 2>/dev/null || true
 wait "$NB_PID" 2>/dev/null || true
 NB_PID=""
 
+# 4n) C2：请求列表 / 详情（分页）
+RL=$(curl -s --max-time 5 -H "Authorization: Bearer $TOKEN" "$BASE/v1/requests?limit=5&offset=0")
+echo "$RL" | grep -q '"request_id"' || { echo "$RL" >&2; fail "requests list"; }
+echo "$RL" | grep -q '"limit":5' || { echo "$RL" >&2; fail "requests limit"; }
+RID=$(echo "$RL" | grep -o '"request_id":"[^"]*"' | head -1 | sed 's/.*:"//; s/"$//')
+[ -n "$RID" ] || { echo "$RL" >&2; fail "requests id"; }
+RD=$(curl -s --max-time 5 -H "Authorization: Bearer $TOKEN" "$BASE/v1/requests?id=$RID")
+echo "$RD" | grep -q "\"request_id\":\"$RID\"" || { echo "$RD" >&2; fail "request detail"; }
+echo "$RD" | grep -q '"cost_nano"' || { echo "$RD" >&2; fail "request cost"; }
+R401=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$BASE/v1/requests")
+[ "$R401" = "401" ] || fail "requests unauthorized expected 401 got $R401"
+R404=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$BASE/v1/requests?id=nope")
+[ "$R404" = "404" ] || fail "requests unknown id expected 404 got $R404"
+
 # 4m) C5：管理后台（用户/供应商/节点/定价/备份 + 页面）
 AU=$(curl -s --max-time 5 -H 'Authorization: Bearer test-admin' "$BASE/admin/users")
 echo "$AU" | grep -q 'e2e@example.com' || { echo "$AU" >&2; fail "admin users"; }
@@ -304,6 +318,7 @@ echo "$UIJS" | grep -q '/v1/usage' || { echo "$UIJS" >&2; fail "ui usage"; }
 echo "$UIJS" | grep -q 'usage-table' || { echo "$UIJS" >&2; fail "ui usage table"; }
 echo "$UI" | grep -q 'id="estimate"' || { echo "$UI" >&2; fail "ui estimate"; }
 echo "$UI" | grep -q 'id="playground"' || { echo "$UI" >&2; fail "ui playground"; }
+echo "$UI" | grep -q 'id="req-table"' || { echo "$UI" >&2; fail "ui requests"; }
 echo "$UI" | grep -q 'id="billing"' || { echo "$UI" >&2; fail "ui billing"; }
 echo "$UIJS" | grep -q '/v1/budget' || { echo "$UIJS" >&2; fail "ui budget js"; }
 echo "$UIJS" | grep -q '/v1/chat/completions' || { echo "$UIJS" >&2; fail "ui playground js"; }

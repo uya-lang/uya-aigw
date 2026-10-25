@@ -975,6 +975,95 @@ export fn store_list_users(d: &Db, out: &StoreUserRow, cap: usize) !usize {
     return n;
 }
 
+/// C2：请求列表行（usage_ledger 读模型）。
+export const STORE_LEDGER_ID_MAX: usize = 72;
+export const STORE_LEDGER_TEXT_MAX: usize = 64;
+
+export struct StoreLedgerRow {
+    request_id: [byte: STORE_LEDGER_ID_MAX],
+    request_id_len: usize,
+    ts: i64,
+    model: [byte: STORE_LEDGER_TEXT_MAX],
+    model_len: usize,
+    provider: [byte: STORE_LEDGER_TEXT_MAX],
+    provider_len: usize,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    cost_nano: i64,
+    period: [byte: 32],
+    period_len: usize,
+}
+
+fn store_ledger_row_zero(r: &StoreLedgerRow) void {
+    r.request_id_len = 0;
+    r.ts = 0;
+    r.model_len = 0;
+    r.provider_len = 0;
+    r.input_tokens = 0;
+    r.output_tokens = 0;
+    r.cache_read_tokens = 0;
+    r.cost_nano = 0;
+    r.period_len = 0;
+}
+
+/// 分页列出某用户的请求（按时间倒序）。
+export fn store_list_ledger(d: &Db, user_id: i64, limit: i64, offset: i64,
+    out: &StoreLedgerRow, cap: usize) !usize {
+    var st: DbStmt = dbx_prepare(d,
+        "select request_id, ts, model, provider, input_tokens, output_tokens, cache_read_tokens, cost_nano, period from usage_ledger where user_id = ? order by ts desc, request_id desc limit ? offset ?" as &const byte) catch {
+        return error.StoreFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_i64(&st, 1, user_id) catch { return error.StoreFailed; };
+    dbx_bind_i64(&st, 2, limit) catch { return error.StoreFailed; };
+    dbx_bind_i64(&st, 3, offset) catch { return error.StoreFailed; };
+    var n: usize = 0;
+    while n < cap {
+        if dbx_step(&st) != 1 {
+            break;
+        }
+        store_ledger_row_zero(&out[n]);
+        out[n].request_id_len = dbx_col_text(&st, 0, &out[n].request_id[0], STORE_LEDGER_ID_MAX);
+        out[n].ts = dbx_col_i64(&st, 1);
+        out[n].model_len = dbx_col_text(&st, 2, &out[n].model[0], STORE_LEDGER_TEXT_MAX);
+        out[n].provider_len = dbx_col_text(&st, 3, &out[n].provider[0], STORE_LEDGER_TEXT_MAX);
+        out[n].input_tokens = dbx_col_i64(&st, 4);
+        out[n].output_tokens = dbx_col_i64(&st, 5);
+        out[n].cache_read_tokens = dbx_col_i64(&st, 6);
+        out[n].cost_nano = dbx_col_i64(&st, 7);
+        out[n].period_len = dbx_col_text(&st, 8, &out[n].period[0], 32);
+        n = n + 1;
+    }
+    return n;
+}
+
+/// 取某用户的一条请求详情；不存在返回 false。
+export fn store_get_ledger(d: &Db, user_id: i64, request_id: &[byte],
+    out: &StoreLedgerRow) !bool {
+    var st: DbStmt = dbx_prepare(d,
+        "select request_id, ts, model, provider, input_tokens, output_tokens, cache_read_tokens, cost_nano, period from usage_ledger where user_id = ? and request_id = ? limit 1" as &const byte) catch {
+        return error.StoreFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_i64(&st, 1, user_id) catch { return error.StoreFailed; };
+    dbx_bind_text(&st, 2, request_id) catch { return error.StoreFailed; };
+    if dbx_step(&st) != 1 {
+        return false;
+    }
+    store_ledger_row_zero(out);
+    out.request_id_len = dbx_col_text(&st, 0, &out.request_id[0], STORE_LEDGER_ID_MAX);
+    out.ts = dbx_col_i64(&st, 1);
+    out.model_len = dbx_col_text(&st, 2, &out.model[0], STORE_LEDGER_TEXT_MAX);
+    out.provider_len = dbx_col_text(&st, 3, &out.provider[0], STORE_LEDGER_TEXT_MAX);
+    out.input_tokens = dbx_col_i64(&st, 4);
+    out.output_tokens = dbx_col_i64(&st, 5);
+    out.cache_read_tokens = dbx_col_i64(&st, 6);
+    out.cost_nano = dbx_col_i64(&st, 7);
+    out.period_len = dbx_col_text(&st, 8, &out.period[0], 32);
+    return true;
+}
+
 /// 列出供应商（按 id 升序）。
 export fn store_list_providers(d: &Db, out: &StoreProvider, cap: usize) !usize {
     var st: DbStmt = dbx_prepare(d,

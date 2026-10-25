@@ -91,6 +91,7 @@ const ROUTE_EDGE_FAIL: i32 = 36;
 const ROUTE_NODE_STATUS: i32 = 37;
 const ROUTE_EDGE_PROXY: i32 = 38;
 const ROUTE_NODE_SPOOL: i32 = 39;
+const ROUTE_REQUESTS: i32 = 40;
 const ROUTE_BUDGET: i32 = 30;
 const ROUTE_ESTIMATE: i32 = 29;
 const ROUTE_USAGE_CSV: i32 = 28;
@@ -816,6 +817,9 @@ fn srv_route_of(req: &HsrvReq) i32 {
     if srv_path_is(req, &"/v1/keys/revoke"[0: 15]) {
         return ROUTE_KEY_REVOKE;
     }
+    if srv_path_is(req, &"/v1/requests"[0: 12]) {
+        return ROUTE_REQUESTS;
+    }
     if srv_path_is(req, &"/node/spool"[0: 11]) {
         return ROUTE_NODE_SPOOL;
     }
@@ -1443,6 +1447,10 @@ fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
         srv_me(c, stats);
         return;
     }
+    if c.route == ROUTE_REQUESTS {
+        srv_requests(c, stats);
+        return;
+    }
     if c.route == ROUTE_NODE_SPOOL {
         srv_node_spool(c, stats);
         return;
@@ -1465,6 +1473,10 @@ fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
     }
     if c.route == ROUTE_ADMIN_JS {
         srv_admin_js(c, stats);
+        return;
+    }
+    if c.route == ROUTE_REQUESTS {
+        srv_requests(c, stats);
         return;
     }
     if c.route == ROUTE_NODE_SPOOL {
@@ -4451,4 +4463,97 @@ fn srv_node_spool(c: &SrvConn, stats: &ServeStats) void {
         return;
     }
     srv_static(c, 200, SRV_JSON_OK, keep);
+}
+
+
+/// C2：请求列表（分页）/ 详情（`?id=`）。
+fn srv_requests(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    if !runtime_ready() {
+        srv_static(c, 503, SRV_JSON_503, keep);
+        return;
+    }
+    var tok: [byte: 256] = [0: 256];
+    const tn: usize = chat_bearer_span(&c.auth[0], c.auth_len, &tok[0], 256);
+    if tn == 0 {
+        srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    }
+    var key: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
+    store_verify_key(runtime_db(), tok[0: tn], &key) catch {
+        srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    };
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    var rid: [byte: 128] = [0: 128];
+    const rn: usize = srv_query_str(&c.path[0], c.path_len, &"id"[0: 2], 2, &rid[0], 128);
+    if rn > 0 {
+        var row: StoreLedgerRow = StoreLedgerRow{};
+        const found: bool = store_get_ledger(runtime_db(), key.user_id, rid[0: rn], &row) catch {
+            false;
+        };
+        if !found {
+            srv_static(c, 404, SRV_JSON_404, keep);
+            return;
+        }
+        jsonw_obj(&w);
+        srv_request_json(&w, &row);
+        jsonw_end_obj(&w);
+        srv_static(c, 200, jsonw_span(&w), keep);
+        return;
+    }
+    var limit: i64 = srv_query_day(&c.path[0], c.path_len, &"limit"[0: 5], 5);
+    if limit <= 0 || limit > 100 {
+        limit = 20;
+    }
+    var offset: i64 = srv_query_day(&c.path[0], c.path_len, &"offset"[0: 6], 6);
+    if offset < 0 {
+        offset = 0;
+    }
+    var rows: [StoreLedgerRow: 100] = [];
+    var n: usize = 0;
+    n = store_list_ledger(runtime_db(), key.user_id, limit, offset, &rows[0], 100) catch {
+        srv_static(c, 502, SRV_JSON_502, keep);
+        return;
+    };
+    jsonw_obj(&w);
+    jsonw_key(&w, &"data"[0: 4]);
+    jsonw_arr(&w);
+    var i: usize = 0;
+    while i < n {
+        jsonw_obj(&w);
+        srv_request_json(&w, &rows[i]);
+        jsonw_end_obj(&w);
+        i = i + 1;
+    }
+    jsonw_end_arr(&w);
+    jsonw_key(&w, &"limit"[0: 5]);
+    jsonw_i64(&w, limit);
+    jsonw_key(&w, &"offset"[0: 6]);
+    jsonw_i64(&w, offset);
+    jsonw_end_obj(&w);
+    srv_static(c, 200, jsonw_span(&w), keep);
+}
+
+fn srv_request_json(w: &JsonW, r: &StoreLedgerRow) void {
+    jsonw_key(w, &"request_id"[0: 10]);
+    jsonw_str(w, r.request_id[0: r.request_id_len]);
+    jsonw_key(w, &"ts"[0: 2]);
+    jsonw_i64(w, r.ts);
+    jsonw_key(w, &"model"[0: 5]);
+    jsonw_str(w, r.model[0: r.model_len]);
+    jsonw_key(w, &"provider"[0: 8]);
+    jsonw_str(w, r.provider[0: r.provider_len]);
+    jsonw_key(w, &"input_tokens"[0: 12]);
+    jsonw_i64(w, r.input_tokens);
+    jsonw_key(w, &"output_tokens"[0: 13]);
+    jsonw_i64(w, r.output_tokens);
+    jsonw_key(w, &"cache_read_tokens"[0: 17]);
+    jsonw_i64(w, r.cache_read_tokens);
+    jsonw_key(w, &"cost_nano"[0: 9]);
+    jsonw_i64(w, r.cost_nano);
+    jsonw_key(w, &"period"[0: 6]);
+    jsonw_str(w, r.period[0: r.period_len]);
 }

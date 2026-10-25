@@ -78,7 +78,8 @@ B3（epoch/fencing/drain、421、批量迁移/清零、stale 自动迁移），�
 
 进度（子项完成记录见 `TODO_DONE.md`）：
 - C1：静态壳（`/`、`/ui/app.js`；登录/资料/密钥/接入点 + curl 示例）已落地。
-- C2：`/v1/usage.csv` + 概览/明细表 + CSV 导出已落地；请求列表/详情分页待做。
+- C2：`/v1/usage.csv` + 概览/明细表 + CSV 导出 + 请求列表/详情（`/v1/requests`，limit/offset 分页，
+  UI 可点击看详情）已落地。
 - C3：Key 管理（建/列/撤销）+ `POST /v1/estimate` 估算器已落地；模型/价格编辑页待做。
 - C4：Playground（流式指标）+ 账单预算（schema v8 budgets、`/v1/budget`、超额告警）已落地；通知待做。
 - C5：`/admin` 页 + 用户/供应商列表已落地（含 401 保护）；改价/绑定/审计日志待做。
