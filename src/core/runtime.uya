@@ -68,6 +68,11 @@ fn rt_hour(ts: i64) i64 {
     return secs / (3600 as i64);
 }
 
+/// 最近一次成功备份的 UTC 天序号（0 = 还没备份过）。
+export fn runtime_last_backup_day() i64 {
+    return g_last_backup_day;
+}
+
 export fn runtime_ready() bool {
     return g_ready;
 }

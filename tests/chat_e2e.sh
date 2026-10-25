@@ -102,7 +102,7 @@ UYA_ROOT="$UYA_ROOT" "$UYA" build \
   -o build/aigw >"$TMP/build.log" 2>&1 || { cat "$TMP/build.log" >&2; fail "aigw build"; }
 
 ./build/aigw serve --host 127.0.0.1 --port 0 --db "$SEED_DB" --data-dir "$TMP/data" \
-  --ca "$TMP/root.pem" --dev-otp >"$TMP/serve.log" 2>&1 &
+  --ca "$TMP/root.pem" --dev-otp --admin-key test-admin >"$TMP/serve.log" 2>&1 &
 SRV_PID=$!
 PORT=""
 for _ in $(seq 1 200); do
@@ -157,6 +157,19 @@ UJSON=$(curl -s --max-time 10 -H "Authorization: Bearer $TOKEN" \
 echo "$UJSON" | grep -q '"mock-model"' || { echo "$UJSON" >&2; fail "usage model missing"; }
 echo "$UJSON" | grep -q '"requests":2' || { echo "$UJSON" >&2; fail "usage totals"; }
 echo "$UJSON" | grep -q '"profit_nano":264' || { echo "$UJSON" >&2; fail "usage profit"; }
+
+# 4d) A7 管理 REST（--admin-key）
+AH=$(curl -s --max-time 5 -H 'Authorization: Bearer test-admin' "$BASE/admin/health")
+echo "$AH" | grep -q '"ok":true' || { echo "$AH" >&2; fail "admin health"; }
+AB=$(curl -s --max-time 5 -H 'Authorization: Bearer test-admin' "$BASE/admin/billing?user_id=0&from_day=0&to_day=999999")
+echo "$AB" | grep -q '"mock-model"' || { echo "$AB" >&2; fail "admin billing"; }
+AP=$(curl -s --max-time 5 -H 'Authorization: Bearer test-admin' "$BASE/admin/pricing?model=mock-model&provider=mock&ts=1700000000")
+echo "$AP" | grep -q '"input_nano_per_mtok":1000' || { echo "$AP" >&2; fail "admin pricing sell"; }
+echo "$AP" | grep -q '"input_nano_per_mtok":600' || { echo "$AP" >&2; fail "admin pricing cost"; }
+AK=$(curl -s --max-time 5 -H 'Authorization: Bearer test-admin' "$BASE/admin/backup")
+echo "$AK" | grep -q '"ok":true' || { echo "$AK" >&2; fail "admin backup"; }
+AN=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$BASE/admin/health")
+[ "$AN" = "401" ] || fail "admin without key expected 401, got $AN"
 
 # 5) 停机后查账本
 kill "$SRV_PID" 2>/dev/null || true
