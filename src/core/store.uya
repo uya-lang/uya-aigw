@@ -928,3 +928,71 @@ export fn store_provider_upstream(d: &Db, provider_id: i64, model: &[byte],
     out_len[0] = dbx_col_text(&st, 0, out, cap);
     return;
 }
+
+// ---------------------------------------------------------------
+// C5：管理后台读模型（用户/供应商列表）
+// ---------------------------------------------------------------
+
+export const STORE_EMAIL_MAX: usize = 128;
+
+export struct StoreUserRow {
+    id: i64,
+    email: [byte: STORE_EMAIL_MAX],
+    email_len: usize,
+    status: i32,
+    created_at: i64,
+}
+
+export fn store_user_row_zero(r: &StoreUserRow) void {
+    r.id = 0;
+    r.email_len = 0;
+    r.status = 0;
+    r.created_at = 0;
+}
+
+/// 列出用户（按 id 升序，最多 cap 行）。
+export fn store_list_users(d: &Db, out: &StoreUserRow, cap: usize) !usize {
+    var st: DbStmt = dbx_prepare(d,
+        "select id, email, status, created_at from users order by id limit ?" as &const byte) catch {
+        return error.StoreFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_i64(&st, 1, cap as i64) catch {
+        return error.StoreFailed;
+    };
+    var n: usize = 0;
+    while n < cap {
+        if dbx_step(&st) != 1 {
+            break;
+        }
+        store_user_row_zero(&out[n]);
+        out[n].id = dbx_col_i64(&st, 0);
+        out[n].email_len = dbx_col_text(&st, 1, &out[n].email[0], STORE_EMAIL_MAX);
+        out[n].status = dbx_col_i64(&st, 2) as i32;
+        out[n].created_at = dbx_col_i64(&st, 3);
+        n = n + 1;
+    }
+    return n;
+}
+
+/// 列出供应商（按 id 升序）。
+export fn store_list_providers(d: &Db, out: &StoreProvider, cap: usize) !usize {
+    var st: DbStmt = dbx_prepare(d,
+        "select id, name, kind, scheme, host, port, base_path, auth_type, auth_name, secret, timeout_ms, enabled, priority, weight from providers order by id limit ?" as &const byte) catch {
+        return error.StoreFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_i64(&st, 1, cap as i64) catch {
+        return error.StoreFailed;
+    };
+    var n: usize = 0;
+    while n < cap {
+        if dbx_step(&st) != 1 {
+            break;
+        }
+        store_provider_zero(&out[n]);
+        store_provider_fill(&st, &out[n]);
+        n = n + 1;
+    }
+    return n;
+}

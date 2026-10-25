@@ -76,3 +76,32 @@ export fn ui_app_js(out: &byte, cap: usize) usize {
     n = ui_put(out, cap, n, "show();" as &const byte);
     return n;
 }
+
+/// C5 管理后台页面（用户/供应商/定价/备份，admin key 存 localStorage）。
+export fn admin_page(out: &byte, cap: usize) usize {
+    var n: usize = 0;
+    n = ui_put(out, cap, n, "<!doctype html><html lang=\"zh\"><head><meta charset=\"utf-8\">" as &const byte);
+    n = ui_put(out, cap, n, "<title>aigw 管理后台</title></head><body>" as &const byte);
+    n = ui_put(out, cap, n, "<h1 id=\"admin-title\">aigw 管理后台</h1>" as &const byte);
+    n = ui_put(out, cap, n, "<input id=\"admin-key\" placeholder=\"admin key\" type=\"password\">" as &const byte);
+    n = ui_put(out, cap, n, "<button id=\"admin-load\">加载</button><p id=\"admin-msg\"></p>" as &const byte);
+    n = ui_put(out, cap, n, "<h2>用户</h2><table id=\"admin-users\"><tbody></tbody></table>" as &const byte);
+    n = ui_put(out, cap, n, "<h2>供应商</h2><table id=\"admin-providers\"><tbody></tbody></table>" as &const byte);
+    n = ui_put(out, cap, n, "<h2>节点</h2><table id=\"admin-nodes\"><tbody></tbody></table>" as &const byte);
+    n = ui_put(out, cap, n, "<h2>备份</h2><pre id=\"admin-backup\"></pre>" as &const byte);
+    n = ui_put(out, cap, n, "<h2>定价</h2><pre id=\"admin-pricing\"></pre>" as &const byte);
+    n = ui_put(out, cap, n, "<script src=\"/ui/admin.js\"></script></body></html>" as &const byte);
+    return n;
+}
+
+/// C5 管理后台脚本。
+export fn admin_js(out: &byte, cap: usize) usize {
+    var n: usize = 0;
+    n = ui_put(out, cap, n, "const $=id=>document.getElementById(id);" as &const byte);
+    n = ui_put(out, cap, n, "let k=localStorage.getItem('aigw_admin')||'';" as &const byte);
+    n = ui_put(out, cap, n, "const ag=(p,o)=>fetch(p,Object.assign({headers:{Authorization:'Bearer '+k}},o||{}));" as &const byte);
+    n = ui_put(out, cap, n, "const rows=(tb,arr,cols)=>{tb.innerHTML='';(arr||[]).forEach(x=>{const tr=document.createElement('tr');cols.forEach(c=>{const td=document.createElement('td');td.textContent=x[c];tr.appendChild(td);});tb.appendChild(tr);});};" as &const byte);
+    n = ui_put(out, cap, n, "async function load(){k=$('admin-key').value||k;localStorage.setItem('aigw_admin',k);const u=await ag('/admin/users');if(u.status===401){$('admin-msg').textContent='admin key 无效';return;}$('admin-msg').textContent='已加载';const uj=await u.json();rows(document.querySelector('#admin-users tbody'),uj.data,['id','email','status']);const p=await ag('/admin/providers');const pj=await p.json();rows(document.querySelector('#admin-providers tbody'),pj.data,['id','name','host','port','enabled','priority']);const s=await ag('/controller/status');const sj=await s.json();rows(document.querySelector('#admin-nodes tbody'),sj.nodes,['id','role','status','last_seen']);const b=await ag('/admin/backup');$('admin-backup').textContent=await b.text();const pr=await ag('/admin/pricing');$('admin-pricing').textContent=await pr.text();}" as &const byte);
+    n = ui_put(out, cap, n, "$('admin-load').onclick=load;if(k){$('admin-key').value=k;load();}" as &const byte);
+    return n;
+}

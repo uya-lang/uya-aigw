@@ -1,0 +1,60 @@
+// tests/test_admin_list.uya — C5 管理后台读模型
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+const T0: i64 = 1700000000;
+
+fn open_db(d: &Db) !void {
+    _ = try schema_open(d, &":memory:"[0: 8]);
+}
+
+fn eq(a: &[byte], b: &[byte]) bool {
+    if a.len != b.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < a.len {
+        if a[i] != b[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn test_users() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    var u: StoreUser = StoreUser{ id: 0, status: 0, found: false };
+    try store_create_user(&d, &"a@example.com"[0: 13], &"u0000000001"[0: 11], T0, &u);
+    try store_create_user(&d, &"b@example.com"[0: 13], &"u0000000002"[0: 11], T0 +% 1, &u);
+    var rows: [StoreUserRow: 8] = [];
+    const n: usize = try store_list_users(&d, &rows[0], 8);
+    try assert_eq_i32(n as i32, 2);
+    try assert_eq_bool(eq(rows[0].email[0: rows[0].email_len], &"a@example.com"[0: 13]), true);
+    try assert_eq_bool(eq(rows[1].email[0: rows[1].email_len], &"b@example.com"[0: 13]), true);
+    try assert_eq_i32(rows[0].status, 0);
+}
+
+fn test_providers() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    var p: StoreProvider = StoreProvider{};
+    store_provider_zero(&p);
+    try store_provider_create(&d, &"mock"[0: 4], &"127.0.0.1"[0: 9], 8443, T0, &p);
+    store_provider_zero(&p);
+    try store_provider_create(&d, &"alt"[0: 3], &"127.0.0.1"[0: 9], 8080, T0 +% 1, &p);
+    var rows: [StoreProvider: 8] = [];
+    const n: usize = try store_list_providers(&d, &rows[0], 8);
+    try assert_eq_i32(n as i32, 2);
+    try assert_eq_bool(eq(rows[0].name[0: rows[0].name_len], &"mock"[0: 4]), true);
+    try assert_eq_i32(rows[0].enabled as i32, 1);
+    try assert_eq_i32(rows[0].port, 8443);
+    try assert_eq_i32(rows[1].port, 8080);
+}
+
+test "users" { run_test("users", test_users); }
+test "providers" { run_test("providers", test_providers); }

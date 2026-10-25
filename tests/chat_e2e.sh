@@ -258,6 +258,18 @@ kill "$NB_PID" 2>/dev/null || true
 wait "$NB_PID" 2>/dev/null || true
 NB_PID=""
 
+# 4m) C5：管理后台（用户/供应商/节点/定价/备份 + 页面）
+AU=$(curl -s --max-time 5 -H 'Authorization: Bearer test-admin' "$BASE/admin/users")
+echo "$AU" | grep -q 'e2e@example.com' || { echo "$AU" >&2; fail "admin users"; }
+AP=$(curl -s --max-time 5 -H 'Authorization: Bearer test-admin' "$BASE/admin/providers")
+echo "$AP" | grep -q '"name":"mock"' || { echo "$AP" >&2; fail "admin providers"; }
+AU401=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$BASE/admin/users")
+[ "$AU401" = "401" ] || fail "admin users expected 401, got $AU401"
+ADM=$(curl -s --max-time 5 "$BASE/admin")
+echo "$ADM" | grep -q 'id="admin-users"' || { echo "$ADM" >&2; fail "admin page"; }
+ADMJ=$(curl -s --max-time 5 "$BASE/ui/admin.js")
+echo "$ADMJ" | grep -q '/admin/providers' || { echo "$ADMJ" >&2; fail "admin js"; }
+
 # 4l) C4：预算设置与告警（当月已用来自 usage_daily）
 BG=$(curl -s --max-time 5 -H "Authorization: Bearer $TOKEN" "$BASE/v1/budget")
 echo "$BG" | grep -q '"monthly_nano":0' || { echo "$BG" >&2; fail "budget get"; }

@@ -87,6 +87,8 @@ C3 进度：Key 管理（建/列/撤销）+ `POST /v1/estimate` 估算器已落�
 C4 进度：Playground（流式指标）+ 账单预算（schema v8 budgets、`/v1/budget`、超额告警）
 已落地；通知（webhook/邮件）待做。
 | C5 | 管理后台（用户/供应商/模型/定价/分时/节点/备份/审计） | 改价/绑定/节点 drain/备份状态可见 | A7/B3 |
+
+C5 进度：`/admin` 页 + 用户/供应商列表已落地（含 401 保护）；改价/绑定/审计日志待做。
 | C6 | e2e + 安全（CSRF/XSS/CSP/越权）+ 文档 | `make ui-e2e` 全绿 | C1–C5 |
 
 ---

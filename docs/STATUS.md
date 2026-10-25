@@ -40,6 +40,7 @@
 - C3（进行中）：Key 管理 + `POST /v1/estimate` 估算器已落地；模型/价格编辑页待做。
 - C4（进行中）：Playground（流式指标）+ 账单预算（schema v8、`/v1/budget`）已落地；
   通知待做。
+- C5（进行中）：`/admin` 页 + `/admin/users`、`/admin/providers` 已落地；改价/绑定/审计待做。
 - B4（进行中）：edge 路由核心（slug 归属 + session 亲和 + 失败清缓存，11 断言）；
   HTTP/SSE 代理待做。
 
@@ -80,6 +81,7 @@
 - C3（进行中）：Key 管理 + `POST /v1/estimate` 估算器已落地；模型/价格编辑页待做。
 - C4（进行中）：Playground（流式指标）+ 账单预算（schema v8、`/v1/budget`）已落地；
   通知待做。
+- C5（进行中）：`/admin` 页 + `/admin/users`、`/admin/providers` 已落地；改价/绑定/审计待做。
 - B4（进行中）：edge 路由核心（slug 归属 + session 亲和 + 失败清缓存，11 断言）；
   HTTP/SSE 代理待做。
 

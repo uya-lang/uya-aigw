@@ -82,6 +82,10 @@ const ROUTE_RESPONSES: i32 = 14;
 const ROUTE_MCP: i32 = 15;
 const ROUTE_KEY_REVOKE: i32 = 24;
 const ROUTE_CTL_INGEST: i32 = 25;
+const ROUTE_ADMIN_USERS: i32 = 31;
+const ROUTE_ADMIN_PROVIDERS: i32 = 32;
+const ROUTE_ADMIN_PAGE: i32 = 33;
+const ROUTE_ADMIN_JS: i32 = 34;
 const ROUTE_BUDGET: i32 = 30;
 const ROUTE_ESTIMATE: i32 = 29;
 const ROUTE_USAGE_CSV: i32 = 28;
@@ -585,6 +589,18 @@ fn srv_route_of(req: &HsrvReq) i32 {
     }
     if srv_path_is(req, &"/v1/keys/revoke"[0: 15]) {
         return ROUTE_KEY_REVOKE;
+    }
+    if srv_path_is(req, &"/ui/admin.js"[0: 12]) {
+        return ROUTE_ADMIN_JS;
+    }
+    if srv_path_is(req, &"/admin/users"[0: 12]) {
+        return ROUTE_ADMIN_USERS;
+    }
+    if srv_path_is(req, &"/admin/providers"[0: 16]) {
+        return ROUTE_ADMIN_PROVIDERS;
+    }
+    if srv_path_is(req, &"/admin"[0: 6]) {
+        return ROUTE_ADMIN_PAGE;
     }
     if srv_path_is(req, &"/v1/keys"[0: 8]) {
         return ROUTE_KEYS;
@@ -1175,6 +1191,26 @@ fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
     }
     if c.route == ROUTE_ME {
         srv_me(c, stats);
+        return;
+    }
+    if c.route == ROUTE_ADMIN_JS {
+        srv_admin_js(c, stats);
+        return;
+    }
+    if c.route == ROUTE_ADMIN_JS {
+        srv_admin_js(c, stats);
+        return;
+    }
+    if c.route == ROUTE_ADMIN_USERS {
+        srv_admin_users(c, stats);
+        return;
+    }
+    if c.route == ROUTE_ADMIN_PROVIDERS {
+        srv_admin_providers(c, stats);
+        return;
+    }
+    if c.route == ROUTE_ADMIN_PAGE {
+        srv_admin_page(c, stats);
         return;
     }
     if c.route == ROUTE_BUDGET {
@@ -3642,4 +3678,111 @@ fn srv_budget(c: &SrvConn, stats: &ServeStats) void {
     jsonw_bool(&w, over);
     jsonw_end_obj(&w);
     srv_static(c, 200, jsonw_span(&w), keep);
+}
+
+
+// C5：管理后台（用户/供应商列表 + 静态页）。
+fn srv_admin_users(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    if !runtime_ready() {
+        srv_static(c, 503, SRV_JSON_503, keep);
+        return;
+    }
+    if !srv_admin_ok(c) {
+        srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    }
+    var rows: [StoreUserRow: 64] = [];
+    var n: usize = 0;
+    n = store_list_users(runtime_db(), &rows[0], 64) catch {
+        srv_static(c, 502, SRV_JSON_502, keep);
+        return;
+    };
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"data"[0: 4]);
+    jsonw_arr(&w);
+    var i: usize = 0;
+    while i < n {
+        jsonw_obj(&w);
+        jsonw_key(&w, &"id"[0: 2]);
+        jsonw_i64(&w, rows[i].id);
+        jsonw_key(&w, &"email"[0: 5]);
+        jsonw_str(&w, rows[i].email[0: rows[i].email_len]);
+        jsonw_key(&w, &"status"[0: 6]);
+        jsonw_i64(&w, rows[i].status as i64);
+        jsonw_key(&w, &"created_at"[0: 10]);
+        jsonw_i64(&w, rows[i].created_at);
+        jsonw_end_obj(&w);
+        i = i + 1;
+    }
+    jsonw_end_arr(&w);
+    jsonw_end_obj(&w);
+    srv_static(c, 200, jsonw_span(&w), keep);
+}
+
+fn srv_admin_providers(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    if !runtime_ready() {
+        srv_static(c, 503, SRV_JSON_503, keep);
+        return;
+    }
+    if !srv_admin_ok(c) {
+        srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    }
+    var rows: [StoreProvider: 32] = [];
+    var n: usize = 0;
+    n = store_list_providers(runtime_db(), &rows[0], 32) catch {
+        srv_static(c, 502, SRV_JSON_502, keep);
+        return;
+    };
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"data"[0: 4]);
+    jsonw_arr(&w);
+    var i: usize = 0;
+    while i < n {
+        jsonw_obj(&w);
+        jsonw_key(&w, &"id"[0: 2]);
+        jsonw_i64(&w, rows[i].id);
+        jsonw_key(&w, &"name"[0: 4]);
+        jsonw_str(&w, rows[i].name[0: rows[i].name_len]);
+        jsonw_key(&w, &"host"[0: 4]);
+        jsonw_str(&w, rows[i].host[0: rows[i].host_len]);
+        jsonw_key(&w, &"port"[0: 4]);
+        jsonw_i64(&w, rows[i].port as i64);
+        jsonw_key(&w, &"enabled"[0: 7]);
+        jsonw_bool(&w, rows[i].enabled);
+        jsonw_key(&w, &"priority"[0: 8]);
+        jsonw_i64(&w, rows[i].priority as i64);
+        jsonw_key(&w, &"weight"[0: 6]);
+        jsonw_i64(&w, rows[i].weight as i64);
+        jsonw_end_obj(&w);
+        i = i + 1;
+    }
+    jsonw_end_arr(&w);
+    jsonw_end_obj(&w);
+    srv_static(c, 200, jsonw_span(&w), keep);
+}
+
+fn srv_admin_page(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    var buf: [byte: 16384] = [0: 16384];
+    const n: usize = admin_page(&buf[0], 16384);
+    srv_static_ct(c, 200, buf[0: n], keep, SRV_CTYPE_HTML[0: 23], 23);
+}
+
+
+fn srv_admin_js(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    var buf: [byte: 16384] = [0: 16384];
+    const n: usize = admin_js(&buf[0], 16384);
+    srv_static_ct(c, 200, buf[0: n], keep, SRV_CTYPE_JS[0: 22], 22);
 }
