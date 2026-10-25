@@ -58,6 +58,9 @@ B1 已完成（见 `TODO_DONE.md`）：meta.db、A/S 选主、controller 控制�
 B2 进度：`uplink.uya` + `--uplink` 已通（node 注册/心跳，e2e 断言 controller status 出现 node-b）；
 config 快照拉取、slug 归属校验待做。
 
+B3 进度：epoch 自增/绑定 fencing/drain 状态已落地（17 断言）；
+再平衡、stale epoch 的 HTTP 421、杀节点 3s 重分配待做。
+
 ---
 
 ## Phase C：后台

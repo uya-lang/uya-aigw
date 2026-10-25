@@ -3,7 +3,7 @@
 // 独立的 meta 数据库：与数据面 aigw.db 分离，controller 独占写入。
 // 表结构用 `user_version` 标记版本（当前 1），后续迁移按版本台阶追加。
 
-export const META_VERSION: i32 = 1;
+export const META_VERSION: i32 = 2;
 export const META_ID_MAX: usize = 64;
 export const META_ROLE_MAX: usize = 16;
 export const META_ADDR_MAX: usize = 256;
@@ -11,6 +11,7 @@ export const META_PAYLOAD_MAX: usize = 4096;
 
 export error MetaFailed;
 export error MetaNodeNotFound;
+export error StaleEpoch;
 
 export struct MetaNode {
     id: [byte: META_ID_MAX],
@@ -40,8 +41,10 @@ export fn meta_open(d: &Db, path: &[byte]) !void {
     try dbx_exec_cstr(d, "create table if not exists meta_nodes (id text primary key, role text not null default 'edge', addr text not null default '', status text not null default 'active', last_seen integer not null default 0, created_at integer not null default 0, updated_at integer not null default 0)" as &const byte);
     try dbx_exec_cstr(d, "create table if not exists meta_config (version integer primary key autoincrement, payload text not null, created_at integer not null)" as &const byte);
     try dbx_exec_cstr(d, "create table if not exists meta_leases (name text primary key, holder text not null, expires_at integer not null, updated_at integer not null)" as &const byte);
+    try dbx_exec_cstr(d, "create table if not exists meta_epochs (node_id text primary key, epoch integer not null default 0, updated_at integer not null default 0)" as &const byte);
+    try dbx_exec_cstr(d, "create table if not exists meta_assignments (slug text primary key, node_id text not null, epoch integer not null, updated_at integer not null default 0)" as &const byte);
     try dbx_exec_cstr(d, "create table if not exists meta_journal_index (node_id text not null, day integer not null, entries integer not null default 0, updated_at integer not null default 0, primary key(node_id, day))" as &const byte);
-    _ = dbx_exec_cstr(d, &"pragma user_version = 1"[0: 23]);
+    _ = dbx_exec_cstr(d, &"pragma user_version = 2"[0: 23]);
     return;
 }
 
@@ -265,4 +268,100 @@ export fn meta_journal_index_get(d: &Db, node_id: &[byte], day: i64) !i64 {
         return 0 as i64;
     }
     return dbx_col_i64(&st, 0);
+}
+
+
+// ---------------------------------------------------------------
+// B3：epoch + fencing（slug 归属）
+// ---------------------------------------------------------------
+
+/// 节点 epoch 自增，返回新值（首次为 1）。
+export fn meta_epoch_bump(d: &Db, node_id: &[byte], now: i64) !i64 {
+    var st: DbStmt = dbx_prepare(d,
+        "insert into meta_epochs(node_id, epoch, updated_at) values(?, 1, ?) on conflict(node_id) do update set epoch = epoch + 1, updated_at = excluded.updated_at" as &const byte) catch {
+        return error.MetaFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, node_id) catch { return error.MetaFailed; };
+    dbx_bind_i64(&st, 2, now) catch { return error.MetaFailed; };
+    if dbx_step(&st) != 0 {
+        return error.MetaFailed;
+    }
+    return meta_epoch_get(d, node_id);
+}
+
+export fn meta_epoch_get(d: &Db, node_id: &[byte]) !i64 {
+    var st: DbStmt = dbx_prepare(d,
+        "select epoch from meta_epochs where node_id = ?" as &const byte) catch {
+        return error.MetaFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, node_id) catch { return error.MetaFailed; };
+    if dbx_step(&st) != 1 {
+        return 0 as i64;
+    }
+    return dbx_col_i64(&st, 0);
+}
+
+/// 写 slug 归属：epoch 必须是该节点当前 epoch，且不小于已有归属 epoch（fencing）。
+export fn meta_assign(d: &Db, slug: &[byte], node_id: &[byte], epoch: i64, now: i64) !void {
+    if slug.len == 0 || node_id.len == 0 || epoch <= 0 {
+        return error.StaleEpoch;
+    }
+    const cur: i64 = try meta_epoch_get(d, node_id);
+    if cur != epoch {
+        return error.StaleEpoch;
+    }
+    var st: DbStmt = dbx_prepare(d,
+        "insert into meta_assignments(slug, node_id, epoch, updated_at) values(?, ?, ?, ?) on conflict(slug) do update set node_id = excluded.node_id, epoch = excluded.epoch, updated_at = excluded.updated_at where excluded.epoch >= meta_assignments.epoch" as &const byte) catch {
+        return error.MetaFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, slug) catch { return error.MetaFailed; };
+    dbx_bind_text(&st, 2, node_id) catch { return error.MetaFailed; };
+    dbx_bind_i64(&st, 3, epoch) catch { return error.MetaFailed; };
+    dbx_bind_i64(&st, 4, now) catch { return error.MetaFailed; };
+    if dbx_step(&st) != 0 {
+        return error.MetaFailed;
+    }
+    if dbx_changes(d) == 0 {
+        return error.StaleEpoch;
+    }
+    return;
+}
+
+/// 查 slug 归属：返回 node_id 长度并写 epoch；无归属返回 0。
+export fn meta_assign_get(d: &Db, slug: &[byte], out: &byte, cap: usize,
+    out_epoch: &i64) !usize {
+    out_epoch[0] = 0;
+    var st: DbStmt = dbx_prepare(d,
+        "select node_id, epoch from meta_assignments where slug = ?" as &const byte) catch {
+        return error.MetaFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, slug) catch { return error.MetaFailed; };
+    if dbx_step(&st) != 1 {
+        return 0 as usize;
+    }
+    out_epoch[0] = dbx_col_i64(&st, 1);
+    return dbx_col_text(&st, 0, out, cap);
+}
+
+/// 节点状态（active/draining/stale）。
+export fn meta_node_set_status(d: &Db, node_id: &[byte], status: &[byte], now: i64) !void {
+    var st: DbStmt = dbx_prepare(d,
+        "update meta_nodes set status = ?, updated_at = ? where id = ?" as &const byte) catch {
+        return error.MetaFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, status) catch { return error.MetaFailed; };
+    dbx_bind_i64(&st, 2, now) catch { return error.MetaFailed; };
+    dbx_bind_text(&st, 3, node_id) catch { return error.MetaFailed; };
+    if dbx_step(&st) != 0 {
+        return error.MetaFailed;
+    }
+    if dbx_changes(d) == 0 {
+        return error.MetaNodeNotFound;
+    }
+    return;
 }

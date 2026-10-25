@@ -28,7 +28,7 @@ fn test_nodes() !void {
     var d: Db = Db{ h: null };
     defer { dbx_close(&d); }
     try open_meta(&d);
-    try assert_eq_i32(meta_version(&d), 1);
+    try assert_eq_i32(meta_version(&d), 2);
     try meta_node_register(&d, &"edge-1"[0: 6], &"edge"[0: 4], &"10.0.0.1:8080"[0: 13], T0);
     try meta_node_register(&d, &"ctrl-1"[0: 6], &"coordinator"[0: 11], &"10.0.0.2:9000"[0: 13], T0);
     var nodes: [MetaNode: 8] = [];

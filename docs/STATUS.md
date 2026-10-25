@@ -30,6 +30,8 @@
   config/status，`--meta`/`--node-id`，standby 不备份）。
 - B2（进行中）：`uplink.uya` + `--uplink` 已通（node 注册/心跳）；config 快照与
   slug 归属待做。
+- B3（进行中）：epoch 自增/assignment fencing/drain 状态已落地（17 断言）；
+  再平衡与 HTTP 421 待做。
 
 ## 开发命令（A9）
 
@@ -58,6 +60,8 @@
   config/status，`--meta`/`--node-id`，standby 不备份）。
 - B2（进行中）：`uplink.uya` + `--uplink` 已通（node 注册/心跳）；config 快照与
   slug 归属待做。
+- B3（进行中）：epoch 自增/assignment fencing/drain 状态已落地（17 断言）；
+  再平衡与 HTTP 421 待做。
 
 ## 开发命令（A9）
 
