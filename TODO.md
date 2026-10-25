@@ -55,6 +55,9 @@ A4/A5/A8 进度（子项已完成记录见 `TODO_DONE.md`）：
 
 B1 已完成（见 `TODO_DONE.md`）：meta.db、A/S 选主、controller 控制面与 standby 不备份。
 
+B2 进度：`uplink.uya` + `--uplink` 已通（node 注册/心跳，e2e 断言 controller status 出现 node-b）；
+config 快照拉取、slug 归属校验待做。
+
 ---
 
 ## Phase C：后台

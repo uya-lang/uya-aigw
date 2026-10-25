@@ -193,6 +193,54 @@ fn srv_node_copy(out: &byte, cap: usize) usize {
     return i;
 }
 
+/// B2：node → controller 的 uplink（--uplink ip:port）。
+var g_uplink_ready: bool = false;
+var g_uplink_ip: [byte: 64] = [0: 64];
+var g_uplink_ip_len: usize = 0;
+var g_uplink_port: u16 = 0;
+var g_uplink_last_ms: u64 = 0;
+
+fn srv_uplink_setup(spec: &[byte]) void {
+    g_uplink_ready = false;
+    g_uplink_port = 0;
+    g_uplink_ip_len = 0;
+    var i: usize = 0;
+    while i < spec.len && spec[i] != (58 as byte) && i < 64 {
+        g_uplink_ip[i] = spec[i];
+        i = i + 1;
+    }
+    g_uplink_ip_len = i;
+    if i >= spec.len || spec[i] != (58 as byte) {
+        return;
+    }
+    i = i + 1;
+    var port: u16 = 0;
+    var digits: usize = 0;
+    while i < spec.len {
+        const c: byte = spec[i];
+        if c < ('0' as byte) || c > ('9' as byte) {
+            break;
+        }
+        port = port *% (10 as u16) +% ((c as u16) -% 48);
+        digits = digits + 1;
+        i = i + 1;
+    }
+    if digits == 0 || port == 0 || g_uplink_ip_len == 0 {
+        return;
+    }
+    g_uplink_port = port;
+    g_uplink_ready = true;
+}
+
+fn srv_uplink_copy(out: &byte, cap: usize) usize {
+    var i: usize = 0;
+    while i < g_uplink_ip_len && i < cap {
+        out[i] = g_uplink_ip[i];
+        i = i + 1;
+    }
+    return i;
+}
+
 /// A4 上游 TLS 上下文（serve 启动时初始化；bundle 由 --ca 注入）。
 var g_up_ctx: HtcCtx = HtcCtx{};
 
@@ -1573,6 +1621,19 @@ export fn serve_run(lfd: i32, stats: &ServeStats) !i32 {
         const role: i32 = elect_tick_or(&g_meta, nb[0: nn], mnow, 30);
         runtime_set_backup_allowed(elect_may_backup(role));
         meta_node_heartbeat(&g_meta, nb[0: nn], mnow) catch {};
+    }
+    if g_uplink_ready {
+        const ums: u64 = srv_now_ms();
+        if ums > g_uplink_last_ms +% 5000 {
+            g_uplink_last_ms = ums;
+            var ipb: [byte: 64] = [0: 64];
+            const ipn: usize = srv_uplink_copy(&ipb[0], 64);
+            var nb: [byte: 64] = [0: 64];
+            const nn: usize = srv_node_copy(&nb[0], 64);
+            uplink_register(ipb[0: ipn], g_uplink_port, nb[0: nn],
+                &"edge"[0: 4], &""[0: 0], 2000) catch {};
+            uplink_heartbeat(ipb[0: ipn], g_uplink_port, nb[0: nn], 0, 0, 2000) catch {};
+        }
     }
     runtime_tick();
         if srv_stop_requested() != 0 && stopping == 0 {

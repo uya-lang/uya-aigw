@@ -1,0 +1,195 @@
+// src/cluster/uplink.uya — B2 node → controller 的明文 HTTP 客户端（IP 直连）
+//
+// 控制面只在内网直连（IP:port），不做 DNS/TLS；用 tcpx 建连后切阻塞读写。
+// Connection: close：读到 EOF 即完成，响应体按 Content-Length/剩余字节取。
+
+use std.async;
+use libc.syscall;
+
+export error UplinkFailed;
+
+fn up_send_all(fd: i32, data: &[byte]) bool {
+    var off: usize = 0;
+    while off < data.len {
+        const r: !isize = sys_write(fd, &data.ptr[off], data.len - off);
+        const n: isize = r catch |_| {
+            return false;
+        };
+        if n <= 0 {
+            return false;
+        }
+        off = off +% (n as usize);
+    }
+    return true;
+}
+
+fn up_find(hay: &[byte], needle: &[byte], from: usize) usize {
+    if needle.len == 0 || hay.len < needle.len {
+        return hay.len;
+    }
+    var i: usize = from;
+    while i + needle.len <= hay.len {
+        var j: usize = 0;
+        var same: bool = true;
+        while j < needle.len {
+            if hay[i + j] != needle[j] {
+                same = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if same {
+            return i;
+        }
+        i = i + 1;
+    }
+    return hay.len;
+}
+
+/// 发一个请求并读完整响应；返回 HTTP 状态码，响应体拷到 out。
+export fn uplink_request(ip: &[byte], port: u16, method: &[byte], path: &[byte],
+    body: &[byte], timeout_ms: u32, out: &byte, cap: usize, out_len: &usize) !i32 {
+    out_len[0] = 0;
+    if ip.len == 0 || port == 0 {
+        return error.UplinkFailed;
+    }
+    const fd: i32 = tcpx_connect_v4(ip, port, timeout_ms) catch {
+        return error.UplinkFailed;
+    };
+    defer { tcpx_close(fd); }
+    const fl: !i32 = sys_fcntl(fd, 3, 0);
+    const flags: i32 = fl catch {
+        0;
+    };
+    if flags != 0 {
+        _ = sys_fcntl(fd, 4, flags & (0 -% 2049)) catch {};
+    }
+    var req: Buf = buf_new(2048 +% body.len);
+    defer { buf_free(&req); }
+    if !buf_valid(&req) {
+        return error.UplinkFailed;
+    }
+    if !buf_append_slice(&req, method) {
+        return error.UplinkFailed;
+    }
+    if !buf_append_cstr(&req, " " as &const byte) {
+        return error.UplinkFailed;
+    }
+    if !buf_append_slice(&req, path) {
+        return error.UplinkFailed;
+    }
+    if !buf_append_cstr(&req, " HTTP/1.1\r\nHost: " as &const byte) {
+        return error.UplinkFailed;
+    }
+    if !buf_append_slice(&req, ip) {
+        return error.UplinkFailed;
+    }
+    if !buf_append_cstr(&req, "\r\nContent-Type: application/json\r\nContent-Length: " as &const byte) {
+        return error.UplinkFailed;
+    }
+    if !buf_append_u64(&req, body.len as u64) {
+        return error.UplinkFailed;
+    }
+    if !buf_append_cstr(&req, "\r\nConnection: close\r\n\r\n" as &const byte) {
+        return error.UplinkFailed;
+    }
+    if body.len > 0 && !buf_append_slice(&req, body) {
+        return error.UplinkFailed;
+    }
+    if !up_send_all(fd, req.ptr[0: req.len]) {
+        return error.UplinkFailed;
+    }
+    var resp: [byte: 16384] = [0: 16384];
+    var rn: usize = 0;
+    while rn < 16384 {
+        const r: !isize = sys_read(fd, &resp[rn], 16384 - rn);
+        const n: isize = r catch |_| {
+            break;
+        };
+        if n <= 0 {
+            break;
+        }
+        rn = rn +% (n as usize);
+    }
+    if rn == 0 {
+        return error.UplinkFailed;
+    }
+    const all: &[byte] = resp[0: rn];
+    // 状态行 HTTP/1.1 200 OK
+    const sp: usize = up_find(all, &" "[0: 1], 0);
+    if sp >= all.len {
+        return error.UplinkFailed;
+    }
+    var status: i32 = 0;
+    var i: usize = sp + 1;
+    var digits: usize = 0;
+    while i < all.len {
+        const c: byte = all[i];
+        if c < ('0' as byte) || c > ('9' as byte) {
+            break;
+        }
+        status = status *% 10 +% ((c as i32) -% 48);
+        digits = digits + 1;
+        i = i + 1;
+    }
+    if digits == 0 {
+        return error.UplinkFailed;
+    }
+    const he: usize = up_find(all, &"\r\n\r\n"[0: 4], 0);
+    var bs: usize = 0;
+    if he < all.len {
+        bs = he + 4;
+    }
+    var w: usize = 0;
+    while bs + w < all.len && w < cap {
+        out[w] = all[bs + w];
+        w = w + 1;
+    }
+    out_len[0] = w;
+    return status;
+}
+
+/// POST /controller/register。
+export fn uplink_register(ip: &[byte], port: u16, node_id: &[byte], role: &[byte],
+    addr: &[byte], timeout_ms: u32) !i32 {
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"id"[0: 2]);
+    jsonw_str(&w, node_id);
+    jsonw_key(&w, &"role"[0: 4]);
+    jsonw_str(&w, role);
+    jsonw_key(&w, &"addr"[0: 4]);
+    jsonw_str(&w, addr);
+    jsonw_end_obj(&w);
+    var out: [byte: 1024] = [0: 1024];
+    var on: usize = 0;
+    return uplink_request(ip, port, &"POST"[0: 4], &"/controller/register"[0: 20],
+        jsonw_span(&w), timeout_ms, &out[0], 1024, &on);
+}
+
+/// POST /controller/heartbeat。
+export fn uplink_heartbeat(ip: &[byte], port: u16, node_id: &[byte],
+    journal_day: i64, entries: i64, timeout_ms: u32) !i32 {
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"id"[0: 2]);
+    jsonw_str(&w, node_id);
+    jsonw_key(&w, &"journal_day"[0: 11]);
+    jsonw_i64(&w, journal_day);
+    jsonw_key(&w, &"entries"[0: 7]);
+    jsonw_i64(&w, entries);
+    jsonw_end_obj(&w);
+    var out: [byte: 1024] = [0: 1024];
+    var on: usize = 0;
+    return uplink_request(ip, port, &"POST"[0: 4], &"/controller/heartbeat"[0: 21],
+        jsonw_span(&w), timeout_ms, &out[0], 1024, &on);
+}
+
+/// GET /controller/config，返回状态码，响应体写 out。
+export fn uplink_config(ip: &[byte], port: u16, timeout_ms: u32,
+    out: &byte, cap: usize, out_len: &usize) !i32 {
+    return uplink_request(ip, port, &"GET"[0: 3], &"/controller/config"[0: 18],
+        &""[0: 0], timeout_ms, out, cap, out_len);
+}

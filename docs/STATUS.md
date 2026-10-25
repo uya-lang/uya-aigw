@@ -28,7 +28,8 @@
   与按行分帧。`tests/test_pool.uya` 24 断言（`tests/plugin_echo.py` 作最小插件）。
 - B1（已落地）：meta.db + `elect.uya` + controller 控制面（register/heartbeat/
   config/status，`--meta`/`--node-id`，standby 不备份）。
-- B2 待做：node uplink/注册轮询/slug 归属。
+- B2（进行中）：`uplink.uya` + `--uplink` 已通（node 注册/心跳）；config 快照与
+  slug 归属待做。
 
 ## 开发命令（A9）
 
@@ -55,7 +56,8 @@
   下一步把 `ChatPlan` 接到 serve 的 `POST /v1/chat/completions`（含 SSE 透传）。
 - B1（已落地）：meta.db + `elect.uya` + controller 控制面（register/heartbeat/
   config/status，`--meta`/`--node-id`，standby 不备份）。
-- B2 待做：node uplink/注册轮询/slug 归属。
+- B2（进行中）：`uplink.uya` + `--uplink` 已通（node 注册/心跳）；config 快照与
+  slug 归属待做。
 
 ## 开发命令（A9）
 

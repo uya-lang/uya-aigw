@@ -8,10 +8,12 @@ UYA_ROOT=${UYA_ROOT:-/home/winger/uya/uya/lib}
 TMP=$(mktemp -d)
 SRV_PID=""
 MOCK_PID=""
+NB_PID=""
 
 cleanup() {
   [ -n "$SRV_PID" ] && { kill "$SRV_PID" 2>/dev/null || true; wait "$SRV_PID" 2>/dev/null || true; }
   [ -n "$MOCK_PID" ] && { kill "$MOCK_PID" 2>/dev/null || true; wait "$MOCK_PID" 2>/dev/null || true; }
+  [ -n "$NB_PID" ] && { kill "$NB_PID" 2>/dev/null || true; wait "$NB_PID" 2>/dev/null || true; }
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -80,7 +82,7 @@ sleep 0.3
 # 3) 种子夹具 + aigw
 mkdir -p build
 UYA_ROOT="$UYA_ROOT" "$UYA" build \
-  src/core/dbx.uya src/cluster/meta.uya src/cluster/elect.uya src/core/schema.uya src/core/store.uya src/core/money.uya \
+  src/core/dbx.uya src/core/schema.uya src/core/store.uya src/core/money.uya \
   src/core/schedule.uya src/core/price.uya tests/seed_main.uya -o build/seed >"$TMP/seedbuild.log" 2>&1 \
   || { cat "$TMP/seedbuild.log" >&2; fail "seed build"; }
 
@@ -90,7 +92,7 @@ AIGW_MODE=seed AIGW_DB="$SEED_DB" AIGW_UPSTREAM_PORT="$MPORT" ./build/seed >/dev
 
 UYA_ROOT="$UYA_ROOT" "$UYA" build \
   src/foundation/buf.uya src/net/httpsrv.uya src/net/tcpx.uya src/net/serve.uya \
-  src/core/money.uya src/core/reqlog.uya src/core/dbx.uya src/cluster/meta.uya src/cluster/elect.uya src/net/rsav.uya \
+  src/core/money.uya src/core/reqlog.uya src/core/dbx.uya src/cluster/meta.uya src/cluster/elect.uya src/cluster/uplink.uya src/net/rsav.uya \
   src/core/schema.uya src/core/store.uya src/core/backup.uya src/core/journal.uya \
   src/core/runtime.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/rollup.uya \
   src/core/billing.uya src/core/lb.uya src/core/responses.uya src/core/chat.uya src/providers/upstream.uya \
@@ -219,6 +221,23 @@ CST=$(curl -s --max-time 5 -H 'Authorization: Bearer test-admin' "$BASE/controll
 echo "$CST" | grep -q '"node-a"' || { echo "$CST" >&2; fail "controller status a"; }
 echo "$CST" | grep -q '"node-b"' || { echo "$CST" >&2; fail "controller status b"; }
 echo "$CST" | grep -q '"leader":"node-a"' || { echo "$CST" >&2; fail "controller leader"; }
+
+# 4g) B2：node-b 通过 uplink 注册到 controller
+mkdir -p "$TMP/nodeb"
+./build/aigw serve --host 127.0.0.1 --port 0 --db "$TMP/nodeb/aigw.db" \
+  --data-dir "$TMP/nodeb" --uplink "127.0.0.1:$PORT" --node-id node-b \
+  >"$TMP/nodeb.log" 2>&1 &
+NB_PID=$!
+CST2=""
+for _ in $(seq 1 50); do
+  CST2=$(curl -s --max-time 5 -H 'Authorization: Bearer test-admin' "$BASE/controller/status")
+  echo "$CST2" | grep -q '"node-b"' && break
+  sleep 0.1
+done
+echo "$CST2" | grep -q '"node-b"' || { cat "$TMP/nodeb.log" >&2; echo "$CST2" >&2; fail "uplink register"; }
+kill "$NB_PID" 2>/dev/null || true
+wait "$NB_PID" 2>/dev/null || true
+NB_PID=""
 
 # 5) 停机后查账本
 kill "$SRV_PID" 2>/dev/null || true

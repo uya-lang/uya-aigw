@@ -36,7 +36,7 @@ fn usage() i32 {
 /// `--port 0` 让内核挑端口（回归脚本靠这条读取真实端口）。
 fn serve_main(host: &[byte], port: u16, db_path: &[byte], data_dir: &[byte],
     ca_path: &[byte], dev_otp: bool, admin_key: &[byte], meta_path: &[byte],
-    node_id: &[byte]) i32 {
+    node_id: &[byte], uplink: &[byte]) i32 {
     runtime_setup(db_path, data_dir) catch |_| {
         printf("runtime init failed\n" as *byte);
         return 1;
@@ -45,6 +45,7 @@ fn serve_main(host: &[byte], port: u16, db_path: &[byte], data_dir: &[byte],
     g_dev_otp = dev_otp;
     srv_admin_set(admin_key);
     srv_meta_setup(meta_path, node_id);
+    srv_uplink_setup(uplink);
     htc_ctx_init(&g_up_ctx, TLSX_MODE_CHAIN);
     g_up_ctx.allow_private = true;
     if ca_path.len > 0 {
@@ -112,6 +113,8 @@ export fn main() i32 {
         var metalen: usize = 0;
         var nid: [byte: 64] = [0: 64];
         var nidlen: usize = 0;
+        var upl: [byte: 80] = [0: 80];
+        var upllen: usize = 0;
         var dat: [byte: 512] = [0: 512];
         dat[0] = 'd';
         dat[1] = 'a';
@@ -150,6 +153,14 @@ export fn main() i32 {
                     m = m + 1;
                 }
                 metalen = m;
+            } else if arg_eq(f, "--uplink" as &const byte) {
+                const vn: usize = arg_len(v);
+                var m: usize = 0;
+                while m < vn && m < 80 {
+                    upl[m] = v[m];
+                    m = m + 1;
+                }
+                upllen = m;
             } else if arg_eq(f, "--node-id" as &const byte) {
                 const vn: usize = arg_len(v);
                 var m: usize = 0;
@@ -194,7 +205,8 @@ export fn main() i32 {
             k = k + 2;
         }
         return serve_main(host[0: host_len], port, dbf[0: dblen], dat[0: datlen],
-            ca[0: calen], dev_otp, adm[0: admlen], meta[0: metalen], nid[0: nidlen]);
+            ca[0: calen], dev_otp, adm[0: admlen], meta[0: metalen], nid[0: nidlen],
+            upl[0: upllen]);
     }
 
     if argc < 4 {
