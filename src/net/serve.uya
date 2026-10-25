@@ -554,6 +554,20 @@ fn srv_batch_sync() void {
     };
 }
 
+/// D3：退避睡眠。单线程事件循环里是阻塞的，所以基数 100ms、上限 30s。
+fn srv_sleep_ms(ms: u32) void {
+    if ms == 0 {
+        return;
+    }
+    const sec: i64 = (ms / (1000 as u32)) as i64;
+    const ns: i64 = ((ms % (1000 as u32)) as i64) *% (1000000 as i64);
+    var nap: TimeSpec = TimeSpec{ tv_sec: sec, tv_nsec: ns };
+    var rem: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+    _ = sys_nanosleep(&nap, &rem) catch {
+        0;
+    };
+}
+
 export fn srv_now_ms() u64 {
     var ts: TimeSpec = TimeSpec{};
     const r: !i32 = sys_clock_gettime(SRV_CLOCK_MONOTONIC, &ts);
@@ -994,6 +1008,10 @@ fn srv_static(c: &SrvConn, status: i32, body: &[byte], keep: bool) void {
 // ---------------------------------------------------------------
 // A4：每请求日志（reqlog 一行追加到 <data_dir>/requests.log）
 // ---------------------------------------------------------------
+
+/// D3：HTTP 级重试（429/5xx）与退避。
+const SRV_HTTP_RETRY_MAX: i32 = 3;
+const SRV_BACKOFF_BASE_MS: u32 = 100;
 
 const SRV_REQLOG_MAX: usize = 4096;
 const SRV_REQLOG_PATH_MAX: usize = 768;
@@ -1576,6 +1594,7 @@ fn srv_chat(c: &SrvConn, stats: &ServeStats) void {
     };
     srv_log_plan(&lg, &plan);
     var attempts: i32 = 0;
+    var http_tries: i32 = 0;
     while true {
         var cfg: HttppConfig = httpp_empty();
         if !upstream_config(&plan.host[0], plan.host_len, plan.port, plan.auth_type,
@@ -1596,10 +1615,11 @@ fn srv_chat(c: &SrvConn, stats: &ServeStats) void {
         var resp: [byte: 8192] = [0: 8192];
         var st: i32 = 0;
         var rn: usize = 0;
+        var retry_after: u32 = 0;
         var failed: bool = false;
         upstream_post(&g_up_ctx, &cfg, plan.path[0: plan.path_len],
             plan.payload[0: plan.payload_len], nowu, nowu +% 60000,
-            &resp[0], 8192, &st, &rn) catch {
+            &resp[0], 8192, &st, &rn, &retry_after) catch {
             failed = true;
         };
         if failed {
@@ -1623,6 +1643,14 @@ fn srv_chat(c: &SrvConn, stats: &ServeStats) void {
         }
         lb_report(plan.provider_id, true, store_now());
         if st != 200 {
+            // D3：429/5xx 按 Retry-After 或指数退避重试同一家（已输出前不重试）。
+            if httpc_status_retryable(st) && http_tries < SRV_HTTP_RETRY_MAX {
+                const wait_ms: u32 = httpc_backoff_ms(http_tries, SRV_BACKOFF_BASE_MS,
+                    retry_after);
+                http_tries = http_tries +% 1;
+                srv_sleep_ms(wait_ms);
+                continue;
+            }
             lg.status = st;
             srv_static(c, st, resp[0: rn], keep);
             return;
@@ -3184,12 +3212,26 @@ fn srv_responses(c: &SrvConn, stats: &ServeStats) void {
     var resp: [byte: 8192] = [0: 8192];
     var st: i32 = 0;
     var rn: usize = 0;
+    var retry_after: u32 = 0;
     var failed: bool = false;
-    upstream_post(&g_up_ctx, &cfg, plan.path[0: plan.path_len],
-        plan.payload[0: plan.payload_len], nowu, nowu +% 60000,
-        &resp[0], 8192, &st, &rn) catch {
-        failed = true;
-    };
+    var http_tries: i32 = 0;
+    while true {
+        retry_after = 0;
+        failed = false;
+        upstream_post(&g_up_ctx, &cfg, plan.path[0: plan.path_len],
+            plan.payload[0: plan.payload_len], nowu, nowu +% 60000,
+            &resp[0], 8192, &st, &rn, &retry_after) catch {
+            failed = true;
+        };
+        if !failed && st != 200 && httpc_status_retryable(st) && http_tries < SRV_HTTP_RETRY_MAX {
+            const wait_ms: u32 = httpc_backoff_ms(http_tries, SRV_BACKOFF_BASE_MS,
+                retry_after);
+            http_tries = http_tries +% 1;
+            srv_sleep_ms(wait_ms);
+            continue;
+        }
+        break;
+    }
     if failed {
         lb_report(plan.provider_id, false, store_now());
         lg.status = 502;

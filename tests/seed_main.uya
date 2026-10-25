@@ -90,6 +90,10 @@ export fn main() i32 {
     store_provider_model_put(&d, p.id, &"failover-model"[0: 14], &"upstream-model"[0: 14], now) catch {
         return 25;
     };
+    // D3：HTTP 级重试（mock 对 retry-upstream 先回 503 两次）
+    store_provider_model_put(&d, p.id, &"retry-model"[0: 11], &"retry-upstream"[0: 14], now) catch {
+        return 31;
+    };
     var sell: PriceCard = PriceCard{ id: 0, kind: 0, version: 0, effective_from: 0, found: false };
     price_card_create(&d, PRICE_KIND_SELL, 1, 0, now, &"v1"[0: 2], &sell) catch {
         return 8;
@@ -97,12 +101,18 @@ export fn main() i32 {
     price_entry_put(&d, sell.id, &""[0: 0], &"mock-model"[0: 10], 0, 1000, 2000, 500, 100, &""[0: 0]) catch {
         return 9;
     };
+    price_entry_put(&d, sell.id, &""[0: 0], &"retry-model"[0: 11], 0, 1000, 2000, 500, 100, &""[0: 0]) catch {
+        return 32;
+    };
     var cost: PriceCard = PriceCard{ id: 0, kind: 0, version: 0, effective_from: 0, found: false };
     price_card_create(&d, PRICE_KIND_COST, 1, 0, now, &"v1"[0: 2], &cost) catch {
         return 10;
     };
     price_entry_put(&d, cost.id, &"mock"[0: 4], &"mock-model"[0: 10], 0, 600, 1200, 300, 50, &""[0: 0]) catch {
         return 11;
+    };
+    price_entry_put(&d, cost.id, &"mock"[0: 4], &"retry-model"[0: 11], 0, 600, 1200, 300, 50, &""[0: 0]) catch {
+        return 33;
     };
     price_entry_put(&d, sell.id, &""[0: 0], &"failover-model"[0: 14], 0, 1000, 2000, 500, 100, &""[0: 0]) catch {
         return 26;

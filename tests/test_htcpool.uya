@@ -113,8 +113,31 @@ fn test_reusable_rules() !void {
     try assert_eq_bool(htc_call_reusable(&call), false);
 }
 
+fn test_retry_after() !void {
+    var call: HtcCall = HtcCall{};
+    htc_call_init(&call);
+    defer { htc_call_free(&call); }
+    // 头名/值都是 body 缓冲里的偏移
+    const raw: &[byte] = &"retry-after: 7\r\nX: y\r\n"[0: 22];
+    _ = buf_append(&call.body, raw.ptr, raw.len);
+    call.header_count = 1;
+    call.headers[0].name_off = 0;
+    call.headers[0].name_len = 11;
+    call.headers[0].val_off = 13;
+    call.headers[0].val_len = 1;
+    try assert_eq_i32(htc_retry_after_s(&call) as i32, 7);
+    // 非数字 → 0
+    call.headers[0].val_off = 21;
+    call.headers[0].val_len = 1;
+    try assert_eq_i32(htc_retry_after_s(&call) as i32, 0);
+    // 没有该头 → 0
+    call.header_count = 0;
+    try assert_eq_i32(htc_retry_after_s(&call) as i32, 0);
+}
+
 test "put_take" { run_test("put_take", test_put_take); }
 test "key_isolation" { run_test("key_isolation", test_key_isolation); }
 test "ttl_and_prune" { run_test("ttl_and_prune", test_ttl_and_prune); }
 test "lru_evict" { run_test("lru_evict", test_lru_evict); }
 test "reusable_rules" { run_test("reusable_rules", test_reusable_rules); }
+test "retry_after" { run_test("retry_after", test_retry_after); }

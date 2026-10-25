@@ -38,8 +38,9 @@ PY
 )
 cat > "$TMP/mock.py" <<'PY'
 import http.server, ssl, sys
-port, cert, key, reqfile, connfile = (int(sys.argv[1]), sys.argv[2], sys.argv[3],
-                                     sys.argv[4], sys.argv[5])
+port, cert, key, reqfile, connfile, reretryfile = (int(sys.argv[1]), sys.argv[2],
+                                                  sys.argv[3], sys.argv[4],
+                                                  sys.argv[5], sys.argv[6])
 BODY = (b'{"id":"chatcmpl-e2e","object":"chat.completion",'
         b'"choices":[{"message":{"role":"assistant","content":"hello-from-mock"}}],'
         b'"usage":{"prompt_tokens":100000,"completion_tokens":50000,'
@@ -68,6 +69,25 @@ class H(http.server.BaseHTTPRequestHandler):
         data = self.rfile.read(n)
         with open(reqfile, "wb") as f:
             f.write(data)
+        # D3：retry-upstream 前两次回 503，用于验证网关按退避重试同一家
+        if b'"retry-upstream"' in data:
+            cnt = 0
+            try:
+                with open(reretryfile) as f:
+                    cnt = int((f.read().strip() or "0"))
+            except Exception:
+                cnt = 0
+            cnt += 1
+            with open(reretryfile, "w") as f:
+                f.write(str(cnt))
+            if cnt <= 2:
+                eb = b'{"error":"rate limited"}'
+                self.send_response(503)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(eb)))
+                self.end_headers()
+                self.wfile.write(eb); self.wfile.flush()
+                return
         if "text/event-stream" in (self.headers.get("Accept") or ""):
             data = SSE_TOOL if b'"tools"' in data else SSE
             self.send_response(200)
@@ -102,7 +122,7 @@ sctx.load_cert_chain(cert, key)
 srv.socket = sctx.wrap_socket(srv.socket, server_side=True)
 srv.serve_forever()
 PY
-python3 "$TMP/mock.py" "$MPORT" "$TMP/leaf.pem" "$TMP/leaf.key" "$TMP/req.json" "$TMP/conns.txt" >"$TMP/mock.log" 2>&1 &
+python3 "$TMP/mock.py" "$MPORT" "$TMP/leaf.pem" "$TMP/leaf.key" "$TMP/req.json" "$TMP/conns.txt" "$TMP/retry.txt" >"$TMP/mock.log" 2>&1 &
 MOCK_PID=$!
 sleep 0.3
 
@@ -307,6 +327,18 @@ echo "$FO" | grep -q 'hello-from-mock' || { echo "$FO" >&2; fail "failover"; }
 FD=$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   --data '{"model":"fail-model","messages":[{"role":"user","content":"hi"}]}' "$BASE/v1/chat/completions")
 [ "$FD" = "400" ] || [ "$FD" = "502" ] || [ "$FD" = "503" ] || fail "all-dead unexpected $FD"
+# 4q2) D3：HTTP 级重试——mock 先回 503 两次，网关按退避重试同一家后成功
+RT0=$(date +%s%N)
+RT=$(curl -s --max-time 20 -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  --data '{"model":"retry-model","messages":[{"role":"user","content":"hi"}]}' \
+  "$BASE/v1/chat/completions")
+RT1=$(date +%s%N)
+echo "$RT" | grep -q 'hello-from-mock' || { echo "$RT" >&2; fail "retry-model"; }
+RETRIES=$(cat "$TMP/retry.txt" 2>/dev/null || echo 0)
+[ "$RETRIES" = "3" ] || fail "expected 3 upstream attempts, got $RETRIES"
+ELAPSED_MS=$(( (RT1 - RT0) / 1000000 ))
+[ "$ELAPSED_MS" -ge 200 ] || fail "backoff too fast: ${ELAPSED_MS}ms"
+echo "CHAT-RETRY attempts=$RETRIES elapsed=${ELAPSED_MS}ms"
 # 熔断不影响其他模型
 MC=$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   --data '{"model":"mock-model","messages":[{"role":"user","content":"hi"}]}' "$BASE/v1/chat/completions")
@@ -526,5 +558,6 @@ for db in "$SEED_DB" "$TMP/data"/usage-*.db; do
   [ -n "$C" ] || fail "count db=$db"
   COUNT=$((COUNT + C))
 done
-[ "$COUNT" = "32" ] || fail "usage_ledger count=$COUNT"
+# D3 的 retry-model 请求也会落一条（32 + 1）
+[ "$COUNT" = "33" ] || fail "usage_ledger count=$COUNT"
 echo "CHAT-ALL-OK status=$CODE count=$COUNT"

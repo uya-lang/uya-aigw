@@ -302,6 +302,34 @@ fn htc_call_reset(call: &HtcCall) void {
     sse_init(&call.sse);
 }
 
+/// D3：响应头里的 `Retry-After`（秒）。缺失/非数字返回 0；上限 600s。
+export fn htc_retry_after_s(call: &const HtcCall) u32 {
+    var vo: usize = 0;
+    var vl: usize = 0;
+    if !httpc_header_find(&call.headers[0], call.header_count, call.body.ptr,
+        &"retry-after"[0: 11], 11, &vo, &vl) {
+        return 0;
+    }
+    var v: u32 = 0;
+    var i: usize = 0;
+    while i < vl {
+        const c: byte = call.body.ptr[vo + i];
+        if c < ('0' as byte) || c > ('9' as byte) {
+            return 0;
+        }
+        const nv: u32 = v *% (10 as u32) +% ((c -% (48 as byte)) as u32);
+        if nv < v {
+            return 600;
+        }
+        v = nv;
+        i = i + 1;
+    }
+    if v > (600 as u32) {
+        v = 600;
+    }
+    return v;
+}
+
 /// D2：这条连接能不能留给下一次请求。
 /// 条件：非流式、已读完、上游没写 `Connection: close`、没有多余字节（否则会串响应）。
 export fn htc_call_reusable(call: &const HtcCall) bool {
