@@ -1,0 +1,268 @@
+// src/cluster/meta.uya — B1 控制面 meta.db（节点/配置/租约/journal 索引）
+//
+// 独立的 meta 数据库：与数据面 aigw.db 分离，controller 独占写入。
+// 表结构用 `user_version` 标记版本（当前 1），后续迁移按版本台阶追加。
+
+export const META_VERSION: i32 = 1;
+export const META_ID_MAX: usize = 64;
+export const META_ROLE_MAX: usize = 16;
+export const META_ADDR_MAX: usize = 256;
+export const META_PAYLOAD_MAX: usize = 4096;
+
+export error MetaFailed;
+export error MetaNodeNotFound;
+
+export struct MetaNode {
+    id: [byte: META_ID_MAX],
+    id_len: usize,
+    role: [byte: META_ROLE_MAX],
+    role_len: usize,
+    addr: [byte: META_ADDR_MAX],
+    addr_len: usize,
+    last_seen: i64,
+    status: [byte: META_ROLE_MAX],
+    status_len: usize,
+    found: bool,
+}
+
+export fn meta_node_zero(n: &MetaNode) void {
+    n.id_len = 0;
+    n.role_len = 0;
+    n.addr_len = 0;
+    n.last_seen = 0;
+    n.status_len = 0;
+    n.found = false;
+}
+
+/// 打开/初始化 meta.db（不存在则建表）。
+export fn meta_open(d: &Db, path: &[byte]) !void {
+    try dbx_open(d, path);
+    try dbx_exec_cstr(d, "create table if not exists meta_nodes (id text primary key, role text not null default 'edge', addr text not null default '', status text not null default 'active', last_seen integer not null default 0, created_at integer not null default 0, updated_at integer not null default 0)" as &const byte);
+    try dbx_exec_cstr(d, "create table if not exists meta_config (version integer primary key autoincrement, payload text not null, created_at integer not null)" as &const byte);
+    try dbx_exec_cstr(d, "create table if not exists meta_leases (name text primary key, holder text not null, expires_at integer not null, updated_at integer not null)" as &const byte);
+    try dbx_exec_cstr(d, "create table if not exists meta_journal_index (node_id text not null, day integer not null, entries integer not null default 0, updated_at integer not null default 0, primary key(node_id, day))" as &const byte);
+    _ = dbx_exec_cstr(d, &"pragma user_version = 1"[0: 23]);
+    return;
+}
+
+export fn meta_version(d: &Db) i32 {
+    var v: i64 = 0;
+    _ = dbx_scalar_i64(d, &"pragma user_version"[0: 19], &v);
+    return v as i32;
+}
+
+/// 注册或更新节点（重启后 register 会刷新 addr/role）。
+export fn meta_node_register(d: &Db, id: &[byte], role: &[byte], addr: &[byte],
+    now: i64) !void {
+    var st: DbStmt = dbx_prepare(d,
+        "insert into meta_nodes(id, role, addr, status, last_seen, created_at, updated_at) values(?, ?, ?, 'active', ?, ?, ?) on conflict(id) do update set role = excluded.role, addr = excluded.addr, status = 'active', last_seen = excluded.last_seen, updated_at = excluded.updated_at" as &const byte) catch {
+        return error.MetaFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, id) catch { return error.MetaFailed; };
+    dbx_bind_text(&st, 2, role) catch { return error.MetaFailed; };
+    dbx_bind_text(&st, 3, addr) catch { return error.MetaFailed; };
+    dbx_bind_i64(&st, 4, now) catch { return error.MetaFailed; };
+    dbx_bind_i64(&st, 5, now) catch { return error.MetaFailed; };
+    dbx_bind_i64(&st, 6, now) catch { return error.MetaFailed; };
+    if dbx_step(&st) != 0 {
+        return error.MetaFailed;
+    }
+    return;
+}
+
+export fn meta_node_heartbeat(d: &Db, id: &[byte], now: i64) !void {
+    var st: DbStmt = dbx_prepare(d,
+        "update meta_nodes set last_seen = ?, status = 'active', updated_at = ? where id = ?" as &const byte) catch {
+        return error.MetaFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_i64(&st, 1, now) catch { return error.MetaFailed; };
+    dbx_bind_i64(&st, 2, now) catch { return error.MetaFailed; };
+    dbx_bind_text(&st, 3, id) catch { return error.MetaFailed; };
+    if dbx_step(&st) != 0 {
+        return error.MetaFailed;
+    }
+    if dbx_changes(d) == 0 {
+        return error.MetaNodeNotFound;
+    }
+    return;
+}
+
+/// 超过 ttl 没心跳的 active 节点标 stale，返回受影响行数。
+export fn meta_node_expire(d: &Db, now: i64, ttl: i64) !i64 {
+    if ttl <= 0 {
+        return 0 as i64;
+    }
+    const cutoff: i64 = now -% ttl;
+    var st: DbStmt = dbx_prepare(d,
+        "update meta_nodes set status = 'stale', updated_at = ? where status = 'active' and last_seen < ?" as &const byte) catch {
+        return error.MetaFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_i64(&st, 1, now) catch { return error.MetaFailed; };
+    dbx_bind_i64(&st, 2, cutoff) catch { return error.MetaFailed; };
+    if dbx_step(&st) != 0 {
+        return error.MetaFailed;
+    }
+    return dbx_changes(d) as i64;
+}
+
+export fn meta_node_list(d: &Db, out: &MetaNode, cap: usize) !usize {
+    var st: DbStmt = dbx_prepare(d,
+        "select id, role, addr, last_seen, status from meta_nodes order by id limit ?" as &const byte) catch {
+        return error.MetaFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_i64(&st, 1, cap as i64) catch { return error.MetaFailed; };
+    var n: usize = 0;
+    while n < cap {
+        if dbx_step(&st) != 1 {
+            break;
+        }
+        meta_node_zero(&out[n]);
+        out[n].id_len = dbx_col_text(&st, 0, &out[n].id[0], META_ID_MAX);
+        out[n].role_len = dbx_col_text(&st, 1, &out[n].role[0], META_ROLE_MAX);
+        out[n].addr_len = dbx_col_text(&st, 2, &out[n].addr[0], META_ADDR_MAX);
+        out[n].last_seen = dbx_col_i64(&st, 3);
+        out[n].status_len = dbx_col_text(&st, 4, &out[n].status[0], META_ROLE_MAX);
+        out[n].found = true;
+        n = n + 1;
+    }
+    return n;
+}
+
+/// 写一版配置，返回递增版本号。
+export fn meta_config_put(d: &Db, payload: &[byte], now: i64) !i64 {
+    var st: DbStmt = dbx_prepare(d,
+        "insert into meta_config(payload, created_at) values(?, ?)" as &const byte) catch {
+        return error.MetaFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, payload) catch { return error.MetaFailed; };
+    dbx_bind_i64(&st, 2, now) catch { return error.MetaFailed; };
+    if dbx_step(&st) != 0 {
+        return error.MetaFailed;
+    }
+    var v: i64 = 0;
+    if dbx_scalar_i64(d, &"select last_insert_rowid()"[0: 26], &v) != 0 {
+        return error.MetaFailed;
+    }
+    return v;
+}
+
+/// 读最新配置；返回版本号（0 = 没有配置）。
+export fn meta_config_get(d: &Db, out: &byte, cap: usize, out_len: &usize) !i64 {
+    out_len[0] = 0;
+    var st: DbStmt = dbx_prepare(d,
+        "select version, payload from meta_config order by version desc limit 1" as &const byte) catch {
+        return error.MetaFailed;
+    };
+    defer { dbx_finalize(&st); }
+    if dbx_step(&st) != 1 {
+        return 0 as i64;
+    }
+    const v: i64 = dbx_col_i64(&st, 0);
+    out_len[0] = dbx_col_text(&st, 1, out, cap);
+    return v;
+}
+
+/// 抢/续租约：已有未过期且 holder 不同则失败。
+export fn meta_lease_acquire(d: &Db, name: &[byte], holder: &[byte], ttl: i64,
+    now: i64) !bool {
+    if ttl <= 0 {
+        return false;
+    }
+    const expires: i64 = now +% ttl;
+    var up: DbStmt = dbx_prepare(d,
+        "update meta_leases set holder = ?, expires_at = ?, updated_at = ? where name = ? and (holder = ? or expires_at <= ?)" as &const byte) catch {
+        return error.MetaFailed;
+    };
+    defer { dbx_finalize(&up); }
+    dbx_bind_text(&up, 1, holder) catch { return error.MetaFailed; };
+    dbx_bind_i64(&up, 2, expires) catch { return error.MetaFailed; };
+    dbx_bind_i64(&up, 3, now) catch { return error.MetaFailed; };
+    dbx_bind_text(&up, 4, name) catch { return error.MetaFailed; };
+    dbx_bind_text(&up, 5, holder) catch { return error.MetaFailed; };
+    dbx_bind_i64(&up, 6, now) catch { return error.MetaFailed; };
+    if dbx_step(&up) != 0 {
+        return error.MetaFailed;
+    }
+    if dbx_changes(d) == 1 {
+        return true;
+    }
+    var ins: DbStmt = dbx_prepare(d,
+        "insert or ignore into meta_leases(name, holder, expires_at, updated_at) values(?, ?, ?, ?)" as &const byte) catch {
+        return error.MetaFailed;
+    };
+    defer { dbx_finalize(&ins); }
+    dbx_bind_text(&ins, 1, name) catch { return error.MetaFailed; };
+    dbx_bind_text(&ins, 2, holder) catch { return error.MetaFailed; };
+    dbx_bind_i64(&ins, 3, expires) catch { return error.MetaFailed; };
+    dbx_bind_i64(&ins, 4, now) catch { return error.MetaFailed; };
+    if dbx_step(&ins) != 0 {
+        return error.MetaFailed;
+    }
+    return dbx_changes(d) == 1;
+}
+
+export fn meta_lease_release(d: &Db, name: &[byte], holder: &[byte]) !bool {
+    var st: DbStmt = dbx_prepare(d,
+        "delete from meta_leases where name = ? and holder = ?" as &const byte) catch {
+        return error.MetaFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, name) catch { return error.MetaFailed; };
+    dbx_bind_text(&st, 2, holder) catch { return error.MetaFailed; };
+    if dbx_step(&st) != 0 {
+        return error.MetaFailed;
+    }
+    return dbx_changes(d) == 1;
+}
+
+/// 当前持租人；过期视为无人（返回 0 长度）。
+export fn meta_lease_holder(d: &Db, name: &[byte], now: i64, out: &byte, cap: usize) !usize {
+    var st: DbStmt = dbx_prepare(d,
+        "select holder from meta_leases where name = ? and expires_at > ?" as &const byte) catch {
+        return error.MetaFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, name) catch { return error.MetaFailed; };
+    dbx_bind_i64(&st, 2, now) catch { return error.MetaFailed; };
+    if dbx_step(&st) != 1 {
+        return 0 as usize;
+    }
+    return dbx_col_text(&st, 0, out, cap);
+}
+
+/// journal 索引：某节点某分片的 entry 数（心跳时更新）。
+export fn meta_journal_index_put(d: &Db, node_id: &[byte], day: i64, entries: i64,
+    now: i64) !void {
+    var st: DbStmt = dbx_prepare(d,
+        "insert into meta_journal_index(node_id, day, entries, updated_at) values(?, ?, ?, ?) on conflict(node_id, day) do update set entries = excluded.entries, updated_at = excluded.updated_at" as &const byte) catch {
+        return error.MetaFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, node_id) catch { return error.MetaFailed; };
+    dbx_bind_i64(&st, 2, day) catch { return error.MetaFailed; };
+    dbx_bind_i64(&st, 3, entries) catch { return error.MetaFailed; };
+    dbx_bind_i64(&st, 4, now) catch { return error.MetaFailed; };
+    if dbx_step(&st) != 0 {
+        return error.MetaFailed;
+    }
+    return;
+}
+
+export fn meta_journal_index_get(d: &Db, node_id: &[byte], day: i64) !i64 {
+    var st: DbStmt = dbx_prepare(d,
+        "select entries from meta_journal_index where node_id = ? and day = ?" as &const byte) catch {
+        return error.MetaFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, node_id) catch { return error.MetaFailed; };
+    dbx_bind_i64(&st, 2, day) catch { return error.MetaFailed; };
+    if dbx_step(&st) != 1 {
+        return 0 as i64;
+    }
+    return dbx_col_i64(&st, 0);
+}

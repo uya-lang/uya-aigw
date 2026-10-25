@@ -1,0 +1,102 @@
+// tests/test_meta.uya — B1 meta.db：节点/配置/租约/journal 索引
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_i64;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+const T0: i64 = 1700000000;
+
+fn open_meta(d: &Db) !void {
+    try meta_open(d, &":memory:"[0: 8]);
+}
+
+fn eq(a: &[byte], b: &[byte]) bool {
+    if a.len != b.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < a.len {
+        if a[i] != b[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn test_nodes() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_meta(&d);
+    try assert_eq_i32(meta_version(&d), 1);
+    try meta_node_register(&d, &"edge-1"[0: 6], &"edge"[0: 4], &"10.0.0.1:8080"[0: 13], T0);
+    try meta_node_register(&d, &"ctrl-1"[0: 6], &"coordinator"[0: 11], &"10.0.0.2:9000"[0: 13], T0);
+    var nodes: [MetaNode: 8] = [];
+    var n: usize = try meta_node_list(&d, &nodes[0], 8);
+    try assert_eq_i32(n as i32, 2);
+    try assert_eq_bool(nodes[0].found, true);
+    try assert_eq_bool(eq(nodes[0].id[0: nodes[0].id_len], &"ctrl-1"[0: 6]), true);
+    try assert_eq_bool(eq(nodes[1].role[0: nodes[1].role_len], &"edge"[0: 4]), true);
+    // 心跳 b，过度老化的 a 变 stale
+    try meta_node_heartbeat(&d, &"ctrl-1"[0: 6], T0 +% 80);
+    const stale: i64 = try meta_node_expire(&d, T0 +% 100, 50);
+    try assert_eq_i64(stale, 1);
+    n = try meta_node_list(&d, &nodes[0], 8);
+    try assert_eq_bool(eq(nodes[0].status[0: nodes[0].status_len], &"active"[0: 6]), true);
+    try assert_eq_bool(eq(nodes[1].status[0: nodes[1].status_len], &"stale"[0: 5]), true);
+    // 未知节点心跳
+    var missing: bool = false;
+    meta_node_heartbeat(&d, &"nope"[0: 4], T0) catch |_| {
+        missing = true;
+    };
+    try assert_eq_bool(missing, true);
+}
+
+fn test_config() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_meta(&d);
+    var buf: [byte: 64] = [0: 64];
+    var len: usize = 0;
+    try assert_eq_i64(try meta_config_get(&d, &buf[0], 64, &len), 0);
+    try assert_eq_i32(len as i32, 0);
+    try assert_eq_i64(try meta_config_put(&d, &"v1"[0: 2], T0), 1);
+    try assert_eq_i64(try meta_config_put(&d, &"v2"[0: 2], T0 +% 1), 2);
+    const v: i64 = try meta_config_get(&d, &buf[0], 64, &len);
+    try assert_eq_i64(v, 2);
+    try assert_eq_bool(eq(buf[0: len], &"v2"[0: 2]), true);
+}
+
+fn test_lease() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_meta(&d);
+    try assert_eq_bool(try meta_lease_acquire(&d, &"leader"[0: 6], &"a"[0: 1], 50, T0), true);
+    try assert_eq_bool(try meta_lease_acquire(&d, &"leader"[0: 6], &"b"[0: 1], 50, T0), false);
+    var hb: [byte: 16] = [0: 16];
+    var hn: usize = try meta_lease_holder(&d, &"leader"[0: 6], T0, &hb[0], 16);
+    try assert_eq_bool(eq(hb[0: hn], &"a"[0: 1]), true);
+    try assert_eq_bool(try meta_lease_release(&d, &"leader"[0: 6], &"b"[0: 1]), false);
+    try assert_eq_bool(try meta_lease_release(&d, &"leader"[0: 6], &"a"[0: 1]), true);
+    try assert_eq_bool(try meta_lease_acquire(&d, &"leader"[0: 6], &"b"[0: 1], 50, T0 +% 10), true);
+    // 过期后可被 a 抢走
+    try assert_eq_bool(try meta_lease_acquire(&d, &"leader"[0: 6], &"a"[0: 1], 50, T0 +% 100), true);
+    hn = try meta_lease_holder(&d, &"leader"[0: 6], T0 +% 100, &hb[0], 16);
+    try assert_eq_bool(eq(hb[0: hn], &"a"[0: 1]), true);
+}
+
+fn test_journal_index() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_meta(&d);
+    try meta_journal_index_put(&d, &"edge-1"[0: 6], 19700, 5, T0);
+    try assert_eq_i64(try meta_journal_index_get(&d, &"edge-1"[0: 6], 19700), 5);
+    try meta_journal_index_put(&d, &"edge-1"[0: 6], 19700, 9, T0 +% 1);
+    try assert_eq_i64(try meta_journal_index_get(&d, &"edge-1"[0: 6], 19700), 9);
+    try assert_eq_i64(try meta_journal_index_get(&d, &"edge-1"[0: 6], 19701), 0);
+}
+
+test "nodes" { run_test("nodes", test_nodes); }
+test "config" { run_test("config", test_config); }
+test "lease" { run_test("lease", test_lease); }
+test "journal_index" { run_test("journal_index", test_journal_index); }

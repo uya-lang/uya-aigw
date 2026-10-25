@@ -34,6 +34,13 @@ Phase A0 (SQLite spike) 可与 Phase T 并行 ─────┘
 | A5 | responses：`previous_response_id`、reasoning、工具、事件序列 | 事件顺序正确；续轮 | A4 |
 | A8 | session 亲和 + priority/加权/熔断/首 token 前转移 | 同 session 固定 provider；杀插件重绑 | A3/A4 |
 
+A4/A5/A8 进度（子项已完成记录见 `TODO_DONE.md`）：
+- A4：chat 非流/流式、鉴权→路由→上游 TLS→分时价→journal/ledger、SSE、金额 e2e 已落地；
+  剩余：快路径、批量落库、上游异步化（p99）。
+- A5：`/v1/responses` 非流式 + `previous_response_id` 续轮 + 流式
+  `response.created/output_text.delta/completed` 已落地；剩余：reasoning/tools 透传。
+- A8：priority/weight/会话亲和/熔断 + 失败换 provider 重试已落地；剩余：插件级重绑。
+
 ---
 
 ## Phase B：集群
@@ -46,6 +53,9 @@ Phase A0 (SQLite spike) 可与 Phase T 并行 ─────┘
 | B4 | edge：路径/子域、节点代理、SSE 转发、失败重试、session→node | 1k 并发流；故障自动重试 | B2 |
 | B5 | ingest 幂等 + 金额/时段重算 + usage 分片 + spool + 吊销 + journal 重放 | 断网 30s 不丢不重；恢复对账一致 | B1/B3 |
 | B6 | 集群 e2e + 部署（1 controller + 3 node + 2 edge + nginx） | `cluster_e2e.sh` 全绿 | B1–B5 |
+
+B1 进度：`src/cluster/meta.uya`（meta.db 节点/配置/租约/journal 索引，21 断言）已完成；
+controller 进程、config 长轮询、A/S 选主、journal 摄取待做（见 `TODO_DONE.md`）。
 
 ---
 
@@ -68,7 +78,7 @@ Phase A0 (SQLite spike) 可与 Phase T 并行 ─────┘
 2. 并行：A0 spike（SQLite + money）
 3. TLS-06 → TLS-07 → TLS-08 → TLS-09 → TLS-10 → TLS-11
 4. ~~A1 → A2 → A3 → A6 → A7 → A9~~ → A4/A5/A8 收尾
-5. B1 → B2 → B3 → B4 → B5 → B6
+5. B1（meta.db 已完成，controller/选主待做）→ B2 → B3 → B4 → B5 → B6
 6. C1 → C2 → C3 → C4 → C5 → C6
 
 ---
