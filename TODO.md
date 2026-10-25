@@ -46,9 +46,23 @@ ingest 幂等 + usage 分片 `hash(user_id)%4`、spool、journal 重放、集群
 
 ---
 
+## Phase D：接线补完（2026-10-26 核对发现）
+
+> C 之后核对「模块 + 单测已完成」与「serve 生产请求路径实际调用」，发现以下功能未接线。
+> 按顺序逐项补，每项一次提交。
+
+- D2 连接池：`src/net/httpc_pool.uya` 的 `ConnPool` 接入出站（复用命中、idle TTL/LRU）。
+- D3 HTTP 重试/退避：`httpc_status_retryable`/`httpc_backoff_ms` 接入 serve（429/5xx、`Retry-After`）。
+- D4 代理 CONNECT：`src/net/proxyx.uya` 接入出站（`HTTPS_PROXY` + `no_proxy`）。
+- D5 插件供应商：`providers.kind=stdio` 接 `src/plugins/pool.uya`（与内置 HTTP 二选一）。
+
+（D1 每请求日志已落地，见 `TODO_DONE.md`。）
+
+---
+
 ## 当前建议顺序
 
-全部阶段（T / A / B / C）已完成，逐项记录与提交提示见 `TODO_DONE.md`。
+全部阶段（T / A / B / C / D1）已完成；D2→D5 按上面顺序补接线。
 
 ---
 

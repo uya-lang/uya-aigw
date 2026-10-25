@@ -488,6 +488,19 @@ echo "CHAT-LAT n=20 avg=${AVG}s p99=${P99}s"
 kill "$SRV_PID" 2>/dev/null || true
 wait "$SRV_PID" 2>/dev/null || true
 SRV_PID=""
+# A4：逐请求日志（reqlog 行追加到 <data_dir>/requests.log）
+REQLOG="$TMP/data/requests.log"
+[ -f "$REQLOG" ] || fail "reqlog missing"
+grep -q 'endpoint=/v1/chat/completions' "$REQLOG" || { head -3 "$REQLOG" >&2; fail "reqlog endpoint"; }
+grep -q 'endpoint=/v1/responses' "$REQLOG" || fail "reqlog responses endpoint"
+grep -q 'model=mock-model' "$REQLOG" || fail "reqlog model"
+grep -q 'provider=mock' "$REQLOG" || fail "reqlog provider"
+grep -q 'status=200' "$REQLOG" || fail "reqlog status"
+grep -q 'email=http@example.com' "$REQLOG" || fail "reqlog email"
+grep -q 'stream=1' "$REQLOG" || fail "reqlog stream"
+grep -q 'ua=curl' "$REQLOG" || fail "reqlog ua"
+grep -q 'toks_x100=' "$REQLOG" || fail "reqlog toks"
+echo "CHAT-REQLOG lines=$(wc -l < "$REQLOG")"
 # B5：controller 分片后账本在 usage-<k>.db；逐库求和（不含则不重复计）。
 COUNT=0
 for db in "$SEED_DB" "$TMP/data"/usage-*.db; do

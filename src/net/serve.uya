@@ -160,6 +160,12 @@ struct SrvConn {
     keep: bool,
     is_head_req: bool,
     is_get: bool,
+    // reqlog：请求行/头摘要（UA、HTTP 版本、method）
+    method: [byte: HSRV_METHOD_MAX],
+    method_len: usize,
+    ua: [byte: HSRV_UA_MAX],
+    ua_len: usize,
+    minor: i32,
     // chat：Authorization 头 + 请求体（仅 ROUTE_CHAT 采集，其他路由只排空）
     auth: [byte: 256],
     auth_len: usize,
@@ -985,6 +991,150 @@ fn srv_static(c: &SrvConn, status: i32, body: &[byte], keep: bool) void {
     srv_static_ct(c, status, body, keep, SRV_CTYPE_JSON[0: 16], 16);
 }
 
+// ---------------------------------------------------------------
+// A4：每请求日志（reqlog 一行追加到 <data_dir>/requests.log）
+// ---------------------------------------------------------------
+
+const SRV_REQLOG_MAX: usize = 4096;
+const SRV_REQLOG_PATH_MAX: usize = 768;
+const SRV_REQLOG_SUFFIX: &[byte] = &"/requests.log"[0: 13];
+
+struct SrvReqLog {
+    start_ms: u64,
+    ttft_ms: u64,
+    status: i32,
+    stream: bool,
+    rid: [byte: 32],
+    rid_len: usize,
+    uid: i64,
+    email: [byte: STORE_EMAIL_MAX],
+    email_len: usize,
+    method: [byte: HSRV_METHOD_MAX],
+    method_len: usize,
+    endpoint: [byte: 256],
+    endpoint_len: usize,
+    product: [byte: 16],
+    product_len: usize,
+    protocol: [byte: 8],
+    protocol_len: usize,
+    ua: [byte: HSRV_UA_MAX],
+    ua_len: usize,
+    model: [byte: CHAT_MODEL_MAX],
+    model_len: usize,
+    provider: [byte: STORE_PROVIDER_NAME_MAX],
+    provider_len: usize,
+    in_tokens: i64,
+    out_tokens: i64,
+    cache_tokens: i64,
+    cost_nano: i64,
+}
+
+fn srv_log_copy(dst: &byte, cap: usize, src: &const byte, n: usize) usize {
+    var i: usize = 0;
+    while i < n && i < cap {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+    return i;
+}
+
+fn srv_log_init(lg: &SrvReqLog, c: &const SrvConn, product: &[byte]) void {
+    lg.start_ms = srv_now_ms();
+    lg.ttft_ms = 0;
+    lg.status = 200;
+    lg.stream = false;
+    lg.rid_len = store_new_slug(&lg.rid[0], 32) catch {
+        0 as usize;
+    };
+    lg.uid = 0;
+    lg.email_len = 0;
+    lg.method_len = srv_log_copy(&lg.method[0], HSRV_METHOD_MAX, &c.method[0], c.method_len);
+    lg.endpoint_len = srv_log_copy(&lg.endpoint[0], 256, &c.path[0], c.path_len);
+    lg.product_len = srv_log_copy(&lg.product[0], 16, &product[0], product.len);
+    if c.minor == 0 {
+        lg.protocol_len = srv_log_copy(&lg.protocol[0], 8, &"http/1.0"[0: 8], 8);
+    } else {
+        lg.protocol_len = srv_log_copy(&lg.protocol[0], 8, &"http/1.1"[0: 8], 8);
+    }
+    lg.ua_len = srv_log_copy(&lg.ua[0], HSRV_UA_MAX, &c.ua[0], c.ua_len);
+    lg.model_len = 0;
+    lg.provider_len = 0;
+    lg.in_tokens = 0;
+    lg.out_tokens = 0;
+    lg.cache_tokens = 0;
+    lg.cost_nano = 0;
+}
+
+fn srv_log_user(lg: &SrvReqLog, uid: i64) void {
+    lg.uid = uid;
+    lg.email_len = store_user_email(runtime_db(), uid, &lg.email[0], STORE_EMAIL_MAX);
+}
+
+fn srv_log_plan(lg: &SrvReqLog, plan: &const ChatPlan) void {
+    lg.model_len = srv_log_copy(&lg.model[0], CHAT_MODEL_MAX, &plan.model[0], plan.model_len);
+    lg.provider_len = srv_log_copy(&lg.provider[0], STORE_PROVIDER_NAME_MAX,
+        &plan.provider_name[0], plan.provider_name_len);
+    lg.stream = plan.stream;
+}
+
+fn srv_log_usage(lg: &SrvReqLog, u: &const PriceUsage, cost_nano: i64) void {
+    lg.in_tokens = u.input_tokens;
+    lg.out_tokens = u.output_tokens;
+    lg.cache_tokens = u.cache_read_tokens;
+    lg.cost_nano = cost_nano;
+}
+
+fn srv_log_emit(lg: &SrvReqLog) void {
+    if lg.endpoint_len == 0 {
+        return;
+    }
+    var rl: ReqLog = ReqLog{};
+    reqlog_init(&rl);
+    reqlog_set_request_id(&rl, lg.rid[0: lg.rid_len]);
+    reqlog_set_endpoint(&rl, lg.endpoint[0: lg.endpoint_len]);
+    reqlog_set_method(&rl, lg.method[0: lg.method_len]);
+    reqlog_set_protocol(&rl, lg.protocol[0: lg.protocol_len]);
+    reqlog_set_product(&rl, lg.product[0: lg.product_len]);
+    reqlog_set_model(&rl, lg.model[0: lg.model_len]);
+    reqlog_set_provider(&rl, lg.provider[0: lg.provider_len]);
+    var uid_text: [byte: 24] = [0: 24];
+    const un: usize = srv_i64_text(lg.uid, &uid_text[0], 24);
+    reqlog_set_user(&rl, lg.email[0: lg.email_len], uid_text[0: un]);
+    reqlog_set_user_agent(&rl, lg.ua[0: lg.ua_len]);
+    rl.status = lg.status;
+    rl.stream = lg.stream;
+    const now: u64 = srv_now_ms();
+    const dur: u64 = now -| lg.start_ms;
+    rl.duration_ms = dur;
+    rl.ttft_ms = lg.ttft_ms;
+    rl.input_tokens = lg.in_tokens;
+    rl.output_tokens = lg.out_tokens;
+    rl.cache_read_tokens = lg.cache_tokens;
+    rl.cost_nano = lg.cost_nano;
+    var line: [byte: SRV_REQLOG_MAX] = [0: SRV_REQLOG_MAX];
+    const ln: usize = reqlog_format(&line[0], SRV_REQLOG_MAX, &rl);
+    if ln == 0 {
+        return;
+    }
+    var dir: [byte: 512] = [0: 512];
+    const dn: usize = runtime_dir_copy(&dir[0], 512);
+    if dn == 0 || dn + 13 > SRV_REQLOG_PATH_MAX {
+        return;
+    }
+    var path: [byte: SRV_REQLOG_PATH_MAX] = [0: SRV_REQLOG_PATH_MAX];
+    var i: usize = 0;
+    while i < dn {
+        path[i] = dir[i];
+        i = i + 1;
+    }
+    i = 0;
+    while i < 13 {
+        path[dn + i] = SRV_REQLOG_SUFFIX[i];
+        i = i + 1;
+    }
+    _ = spool_try_append(path[0: dn + 13], line[0: ln]);
+}
+
 /// SSE 结束/出错：直接切到 ST_WRITE 并关闭连接（流式响应已绕过 out 缓冲）。
 fn srv_chat_close(c: &SrvConn) void {
     c.keep = false;
@@ -1014,7 +1164,7 @@ fn srv_send_all(fd: i32, data: &[byte]) bool {
 
 /// 流式 chat：打开上游 → 逐事件 chunk 透传 → 终止块。阻塞，写完关连接。
 fn srv_chat_stream(c: &SrvConn, plan: &ChatPlan, cfg: &const HttppConfig, nowu: u64,
-    user_id: i64) void {
+    user_id: i64, lg: &SrvReqLog) void {
     var call: HtcCall = HtcCall{};
     htc_call_init(&call);
     defer { htc_call_free(&call); }
@@ -1023,15 +1173,18 @@ fn srv_chat_stream(c: &SrvConn, plan: &ChatPlan, cfg: &const HttppConfig, nowu: 
         plan.path[0: plan.path_len], plan.payload[0: plan.payload_len], true, nowu, deadline, &call));
     const orc: i32 = o catch |_| {
         lb_report(plan.provider_id, false, store_now());
+        lg.status = 502;
         srv_static(c, 502, SRV_JSON_502, c.keep);
         return;
     };
     if orc != 0 {
         lb_report(plan.provider_id, false, store_now());
+        lg.status = 502;
         srv_static(c, 502, SRV_JSON_502, c.keep);
         return;
     }
     lb_report(plan.provider_id, true, store_now());
+    lg.stream = true;
     // 临时阻塞发送：SSE 期间不参与 epoll 写事件
     const fl: !i32 = sys_fcntl(c.fd, 3, 0);
     const flags: i32 = fl catch {
@@ -1044,6 +1197,7 @@ fn srv_chat_stream(c: &SrvConn, plan: &ChatPlan, cfg: &const HttppConfig, nowu: 
     const hn: usize = hsrv_resp_head(&head[0], 256, 200, &SRV_CTYPE_SSE[0: 17], 17,
         0 as i64, true, false);
     if !srv_send_all(c.fd, head[0: hn]) {
+        lg.status = 502;
         srv_chat_close(c);
         return;
     }
@@ -1060,6 +1214,9 @@ fn srv_chat_stream(c: &SrvConn, plan: &ChatPlan, cfg: &const HttppConfig, nowu: 
         };
         if rr == 0 || !has {
             break;
+        }
+        if lg.ttft_ms == 0 {
+            lg.ttft_ms = srv_now_ms() -| lg.start_ms;
         }
         if sse_is_done(&call.sse) {
             done = true;
@@ -1105,18 +1262,14 @@ fn srv_chat_stream(c: &SrvConn, plan: &ChatPlan, cfg: &const HttppConfig, nowu: 
     }
     _ = srv_send_all(c.fd, &"0\r\n\r\n"[0: 5]);
     if usage_found {
-        var rid: [byte: 32] = [0: 32];
-        var ridn: usize = 0;
-        ridn = store_new_slug(&rid[0], 32) catch {
-            0 as usize;
-        };
-        if ridn > 0 {
-            var settle: BillingResult = BillingResult{ cost_nano: 0, price_nano: 0, rate_version: 0, duplicate: false, found: false };
+        var settle: BillingResult = BillingResult{ cost_nano: 0, price_nano: 0, rate_version: 0, duplicate: false, found: false };
+        if lg.rid_len > 0 {
             // A4：只查价 + 入队，批量落库在事件循环里做
-            billing_settle_deferred(rid[0: ridn], user_id, store_now(), 0,
+            billing_settle_deferred(lg.rid[0: lg.rid_len], user_id, store_now(), 0,
                 plan.model[0: plan.model_len],
                 plan.provider_name[0: plan.provider_name_len], &usage, &settle) catch {};
         }
+        srv_log_usage(lg, &usage, settle.cost_nano);
     }
     srv_chat_close(c);
 }
@@ -1385,47 +1538,59 @@ fn srv_usage(c: &SrvConn, stats: &ServeStats) void {
 /// chat：鉴权 → 解析/路由 → 非流式结算 / 流式透传。
 fn srv_chat(c: &SrvConn, stats: &ServeStats) void {
     const keep: bool = c.keep;
+    var lg: SrvReqLog = SrvReqLog{};
+    srv_log_init(&lg, c, &"chat"[0: 4]);
+    defer { srv_log_emit(&lg); }
     stats.requests = stats.requests +% 1;
     if !runtime_ready() {
+        lg.status = 503;
         srv_static(c, 503, SRV_JSON_503, keep);
         return;
     }
     if c.body_overflow {
+        lg.status = 413;
         srv_static(c, 413, SRV_JSON_413, keep);
         return;
     }
     var tok: [byte: 256] = [0: 256];
     const tn: usize = chat_bearer_span(&c.auth[0], c.auth_len, &tok[0], 256);
     if tn == 0 {
+        lg.status = 401;
         srv_static(c, 401, SRV_JSON_401, keep);
         return;
     }
     var key: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
     // A4 快路径：同一 Key 的连续请求走单槽缓存（TTL 2s），省一次 DB 校验。
     store_verify_key_fast(runtime_db(), tok[0: tn], store_now(), &key) catch {
+        lg.status = 401;
         srv_static(c, 401, SRV_JSON_401, keep);
         return;
     };
+    srv_log_user(&lg, key.user_id);
     var plan: ChatPlan = ChatPlan{};
     chat_prepare_span_session(runtime_db(), &c.body[0], c.body_len, tok[0: tn],
         store_now(), &plan) catch {
+        lg.status = 400;
         srv_static(c, 400, SRV_JSON_400, keep);
         return;
     };
+    srv_log_plan(&lg, &plan);
     var attempts: i32 = 0;
     while true {
         var cfg: HttppConfig = httpp_empty();
         if !upstream_config(&plan.host[0], plan.host_len, plan.port, plan.auth_type,
             &plan.secret[0], plan.secret_len, &cfg) {
+            lg.status = 400;
             srv_static(c, 400, SRV_JSON_400, keep);
             return;
         }
         const nowu: u64 = now_ms() catch {
+            lg.status = 502;
             srv_static(c, 502, SRV_JSON_502, keep);
             return;
         };
         if plan.stream {
-            srv_chat_stream(c, &plan, &cfg, nowu, key.user_id);
+            srv_chat_stream(c, &plan, &cfg, nowu, key.user_id, &lg);
             return;
         }
         var resp: [byte: 8192] = [0: 8192];
@@ -1441,41 +1606,49 @@ fn srv_chat(c: &SrvConn, stats: &ServeStats) void {
             lb_report(plan.provider_id, false, store_now());
             // A8：硬失败后先熔断该 provider，重试才会换下一家（否则同 session 亲和会挑回同一家）。
             lb_block_for(plan.provider_id, store_now(), 30);
-            var dbgb: [byte: 48] = [0: 48];
-            var di: usize = 0;
-            while di < 24 {
-                dbgb[di] = 0;
-                di = di + 1;
-            }
             attempts = attempts +% 1;
             if attempts >= 3 {
+                lg.status = 502;
                 srv_static(c, 502, SRV_JSON_502, keep);
                 return;
             }
             chat_prepare_span_session(runtime_db(), &c.body[0], c.body_len, tok[0: tn],
                 store_now(), &plan) catch {
+                lg.status = 502;
                 srv_static(c, 502, SRV_JSON_502, keep);
                 return;
             };
+            srv_log_plan(&lg, &plan);
             continue;
         }
         lb_report(plan.provider_id, true, store_now());
         if st != 200 {
+            lg.status = st;
             srv_static(c, st, resp[0: rn], keep);
             return;
         }
-        var rid: [byte: 32] = [0: 32];
-        var ridn: usize = 0;
-        ridn = store_new_slug(&rid[0], 32) catch {
+        if lg.rid_len == 0 {
+            lg.status = 502;
             srv_static(c, 502, SRV_JSON_502, keep);
             return;
-        };
+        }
         var settle: BillingResult = BillingResult{ cost_nano: 0, price_nano: 0, rate_version: 0, duplicate: false, found: false };
-        chat_settle_deferred(rid[0: ridn], key.user_id, store_now(), 0,
+        chat_settle_deferred(lg.rid[0: lg.rid_len], key.user_id, store_now(), 0,
             &plan, resp[0: rn], &settle) catch {
+            lg.status = 502;
             srv_static(c, 502, SRV_JSON_502, keep);
             return;
         };
+        // 日志字段（usage 已由结算解析过一遍，这里只为记录再取一次，开销可忽略）。
+        var jd: JsonDoc = JsonDoc{};
+        var usg: PriceUsage = PriceUsage{ input_tokens: 0, output_tokens: 0, cache_read_tokens: 0 };
+        json_parse(&jd, resp[0: rn]) catch {};
+        if billing_usage_parse(&jd, json_root(&jd), &usg) {
+            srv_log_usage(&lg, &usg, settle.cost_nano);
+        } else {
+            lg.cost_nano = settle.cost_nano;
+        }
+        lg.ttft_ms = srv_now_ms() -| lg.start_ms;
         srv_static(c, st, resp[0: rn], keep);
         return;
     }
@@ -1883,6 +2056,21 @@ fn srv_drive(c: &SrvConn, stats: &ServeStats) void {
             c.route = srv_route_of(&req);
             c.is_head_req = req.method_len == 4 && req.method[0] == ('H' as byte);
             c.is_get = req.method_len == 3 && req.method[0] == ('G' as byte);
+            c.method_len = 0;
+            var umi: usize = 0;
+            while umi < req.method_len && umi < HSRV_METHOD_MAX {
+                c.method[umi] = req.method[umi];
+                umi = umi + 1;
+            }
+            c.method_len = umi;
+            c.ua_len = 0;
+            var uai: usize = 0;
+            while uai < req.user_agent_len && uai < HSRV_UA_MAX {
+                c.ua[uai] = req.user_agent[uai];
+                uai = uai + 1;
+            }
+            c.ua_len = uai;
+            c.minor = req.minor;
             c.auth_len = 0;
             var ai: usize = 0;
             while ai < req.auth_len && ai < 256 {
@@ -2883,29 +3071,38 @@ fn srv_admin_backup(c: &SrvConn, stats: &ServeStats) void {
 
 fn srv_responses(c: &SrvConn, stats: &ServeStats) void {
     const keep: bool = c.keep;
+    var lg: SrvReqLog = SrvReqLog{};
+    srv_log_init(&lg, c, &"responses"[0: 9]);
+    defer { srv_log_emit(&lg); }
     stats.requests = stats.requests +% 1;
     if !runtime_ready() {
+        lg.status = 503;
         srv_static(c, 503, SRV_JSON_503, keep);
         return;
     }
     if c.body_overflow {
+        lg.status = 413;
         srv_static(c, 413, SRV_JSON_413, keep);
         return;
     }
     var tok: [byte: 256] = [0: 256];
     const tn: usize = chat_bearer_span(&c.auth[0], c.auth_len, &tok[0], 256);
     if tn == 0 {
+        lg.status = 401;
         srv_static(c, 401, SRV_JSON_401, keep);
         return;
     }
     var key: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
     // A4 快路径：同一 Key 的连续请求走单槽缓存（TTL 2s），省一次 DB 校验。
     store_verify_key_fast(runtime_db(), tok[0: tn], store_now(), &key) catch {
+        lg.status = 401;
         srv_static(c, 401, SRV_JSON_401, keep);
         return;
     };
+    srv_log_user(&lg, key.user_id);
     var d: JsonDoc = JsonDoc{};
     json_parse(&d, c.body[0: c.body_len]) catch {
+        lg.status = 400;
         srv_static(c, 400, SRV_JSON_400, keep);
         return;
     };
@@ -2918,6 +3115,7 @@ fn srv_responses(c: &SrvConn, stats: &ServeStats) void {
     const pn: usize = json_str(&d, json_get(&d, root, &"previous_response_id"[0: 20]), &prev[0], 64);
     const stream: bool = json_bool(&d, json_get(&d, root, &"stream"[0: 6]));
     if mn == 0 || in_n == 0 {
+        lg.status = 400;
         srv_static(c, 400, SRV_JSON_400, keep);
         return;
     }
@@ -2926,6 +3124,7 @@ fn srv_responses(c: &SrvConn, stats: &ServeStats) void {
     var prev_out_len: usize = 0;
     if pn > 0 {
         resp_get(runtime_db(), prev[0: pn], &r) catch {
+            lg.status = 404;
             srv_static(c, 404, SRV_JSON_404, keep);
             return;
         };
@@ -2940,6 +3139,7 @@ fn srv_responses(c: &SrvConn, stats: &ServeStats) void {
     const pln: usize = resp_build_chat(model[0: mn], prev_out[0: prev_out_len],
         input[0: in_n], stream, &payload[0], 32768);
     if pln == 0 {
+        lg.status = 502;
         srv_static(c, 502, SRV_JSON_502, keep);
         return;
     }
@@ -2952,28 +3152,31 @@ fn srv_responses(c: &SrvConn, stats: &ServeStats) void {
         use_payload = aug[0: augn];
     }
     chat_prepare_session(runtime_db(), use_payload, tok[0: tn], store_now(), &plan) catch {
+        lg.status = 400;
         srv_static(c, 400, SRV_JSON_400, keep);
         return;
     };
+    srv_log_plan(&lg, &plan);
     var cfg: HttppConfig = httpp_empty();
     if !upstream_config(&plan.host[0], plan.host_len, plan.port, plan.auth_type,
         &plan.secret[0], plan.secret_len, &cfg) {
+        lg.status = 400;
         srv_static(c, 400, SRV_JSON_400, keep);
         return;
     }
     const nowu: u64 = now_ms() catch {
+        lg.status = 502;
         srv_static(c, 502, SRV_JSON_502, keep);
         return;
     };
-    var rid: [byte: 32] = [0: 32];
-    var ridn: usize = 0;
-    ridn = store_new_slug(&rid[0], 32) catch {
+    if lg.rid_len == 0 {
+        lg.status = 502;
         srv_static(c, 502, SRV_JSON_502, keep);
         return;
-    };
+    }
     if plan.stream {
-        srv_responses_stream(c, key.user_id, &plan, &cfg, rid[0: ridn],
-            input[0: in_n], prev[0: pn]);
+        srv_responses_stream(c, key.user_id, &plan, &cfg, lg.rid[0: lg.rid_len],
+            input[0: in_n], prev[0: pn], &lg);
         return;
     }
     var resp: [byte: 8192] = [0: 8192];
@@ -2987,22 +3190,28 @@ fn srv_responses(c: &SrvConn, stats: &ServeStats) void {
     };
     if failed {
         lb_report(plan.provider_id, false, store_now());
+        lg.status = 502;
         srv_static(c, 502, SRV_JSON_502, keep);
         return;
     }
     lb_report(plan.provider_id, true, store_now());
     if st != 200 {
+        lg.status = st;
         srv_static(c, st, resp[0: rn], keep);
         return;
     }
     var out_text: [byte: RESP_OUTPUT_MAX] = [0: RESP_OUTPUT_MAX];
     var usage: PriceUsage = PriceUsage{ input_tokens: 0, output_tokens: 0, cache_read_tokens: 0 };
     json_parse(&d, resp[0: rn]) catch {
+        lg.status = 502;
         srv_static(c, 502, SRV_JSON_502, keep);
         return;
     };
     const out_len: usize = resp_parse_output(&d, json_root(&d), &out_text[0], RESP_OUTPUT_MAX);
     const has_usage: bool = billing_usage_parse(&d, json_root(&d), &usage);
+    if has_usage {
+        srv_log_usage(&lg, &usage, 0);
+    }
     var tcs: i32 = 0 - 1;
     var msg: i32 = 0 - 1;
     const ch0: i32 = json_arr_at(&d, json_get(&d, json_root(&d), &"choices"[0: 7]), 0);
@@ -3017,18 +3226,23 @@ fn srv_responses(c: &SrvConn, stats: &ServeStats) void {
         tcn = json_arr_len(&d, tcs);
     }
     if (out_len == 0 && tcn == 0) || !has_usage {
+        lg.status = 502;
         srv_static(c, 502, SRV_JSON_502, keep);
         return;
     }
     var settle: BillingResult = BillingResult{ cost_nano: 0, price_nano: 0, rate_version: 0, duplicate: false, found: false };
-    billing_settle_deferred(rid[0: ridn], key.user_id, store_now(), 0,
+    billing_settle_deferred(lg.rid[0: lg.rid_len], key.user_id, store_now(), 0,
         plan.model[0: plan.model_len], plan.provider_name[0: plan.provider_name_len],
         &usage, &settle) catch {
+        lg.status = 502;
         srv_static(c, 502, SRV_JSON_502, keep);
         return;
     };
-    resp_store(runtime_db(), rid[0: ridn], key.user_id, store_now(), plan.model[0: plan.model_len],
+    srv_log_usage(&lg, &usage, settle.cost_nano);
+    lg.ttft_ms = srv_now_ms() -| lg.start_ms;
+    resp_store(runtime_db(), lg.rid[0: lg.rid_len], key.user_id, store_now(), plan.model[0: plan.model_len],
         prev[0: pn], input[0: in_n], out_text[0: out_len], &"{}"[0: 2]) catch {
+        lg.status = 502;
         srv_static(c, 502, SRV_JSON_502, keep);
         return;
     };
@@ -3036,7 +3250,7 @@ fn srv_responses(c: &SrvConn, stats: &ServeStats) void {
     jsonw_init(&w);
     jsonw_obj(&w);
     jsonw_key(&w, &"id"[0: 2]);
-    jsonw_str(&w, rid[0: ridn]);
+    jsonw_str(&w, lg.rid[0: lg.rid_len]);
     jsonw_key(&w, &"object"[0: 6]);
     jsonw_str(&w, &"response"[0: 8]);
     jsonw_key(&w, &"created_at"[0: 10]);
@@ -3504,11 +3718,13 @@ fn srv_tc_emit_done(c: &SrvConn, tc: &SrvToolCall, idx: usize) bool {
 }
 
 fn srv_responses_stream(c: &SrvConn, uid: i64, plan: &ChatPlan, cfg: &const HttppConfig,
-    rid: &[byte], input_text: &[byte], prev_id: &[byte]) void {
+    rid: &[byte], input_text: &[byte], prev_id: &[byte], lg: &SrvReqLog) void {
     var call: HtcCall = HtcCall{};
     htc_call_init(&call);
     defer { htc_call_free(&call); }
+    lg.stream = true;
     const nowu: u64 = now_ms() catch {
+        lg.status = 502;
         srv_static(c, 502, SRV_JSON_502, c.keep);
         return;
     };
@@ -3517,11 +3733,13 @@ fn srv_responses_stream(c: &SrvConn, uid: i64, plan: &ChatPlan, cfg: &const Http
         nowu, nowu +% 10000, &call));
     const orc: i32 = o catch |_| {
         lb_report(plan.provider_id, false, store_now());
+        lg.status = 502;
         srv_static(c, 502, SRV_JSON_502, c.keep);
         return;
     };
     if orc != 0 {
         lb_report(plan.provider_id, false, store_now());
+        lg.status = 502;
         srv_static(c, 502, SRV_JSON_502, c.keep);
         return;
     }
@@ -3537,9 +3755,11 @@ fn srv_responses_stream(c: &SrvConn, uid: i64, plan: &ChatPlan, cfg: &const Http
     const hn: usize = hsrv_resp_head(&head[0], 256, 200, &SRV_CTYPE_SSE[0: 17], 17,
         0 as i64, true, false);
     if !srv_send_all(c.fd, head[0: hn]) {
+        lg.status = 502;
         srv_chat_close(c);
         return;
     }
+    lg.status = 200;
     var jw: JsonW = JsonW{};
     // response.created
     {
@@ -3581,6 +3801,9 @@ fn srv_responses_stream(c: &SrvConn, uid: i64, plan: &ChatPlan, cfg: &const Http
         };
         if rr == 0 || !has {
             break;
+        }
+        if lg.ttft_ms == 0 {
+            lg.ttft_ms = srv_now_ms() -| lg.start_ms;
         }
         if sse_is_done(&call.sse) {
             done = true;
@@ -3691,6 +3914,7 @@ fn srv_responses_stream(c: &SrvConn, uid: i64, plan: &ChatPlan, cfg: &const Http
             plan.model[0: plan.model_len], plan.provider_name[0: plan.provider_name_len],
             &usage, &settle) catch {};
     }
+    srv_log_usage(lg, &usage, settle.cost_nano);
     resp_store(runtime_db(), rid, uid, store_now(), plan.model[0: plan.model_len],
         prev_id, input_text, out_text[0: out_len], &"{}"[0: 2]) catch {};
     {
