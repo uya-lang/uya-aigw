@@ -59,7 +59,8 @@ A4/A5/A8 进度（子项已完成记录见 `TODO_DONE.md`）：
   网关侧 SSE 1k 并发压测已通过（`make load-sse`：1000 连接 × 20 事件 ≈0.55s）；
   edge→node 的 SSE 流式转发待做。
 - B5：幂等 ingest（`POST /controller/ingest`，重复批 `duplicate`）、区间重算、本地 spool
-  （`POST /node/spool` + tick 每 2s 重放，失败保留）、Key 吊销已完成；usage 分片与 journal 全量重放待做。
+  （`POST /node/spool` + tick 每 2s 重放，失败保留）、Key 吊销、journal 重放（`journal_replay`/
+  `journal_replay_days` 幂等，`tests/test_journal.uya` 5 组）已完成；usage 分片待做。
 - B6 已完成：`make cluster-e2e` 全绿 + `deploy/nginx.conf`、`docs/deploy.md`（见 `TODO_DONE.md`）。
 
 已完成：B1（meta.db/选主/控制面）、B2（uplink、注册/心跳、config 快照、归属校验）、
