@@ -80,6 +80,10 @@ const ROUTE_ADMIN_BILLING: i32 = 12;
 const ROUTE_ADMIN_BACKUP: i32 = 13;
 const ROUTE_RESPONSES: i32 = 14;
 const ROUTE_MCP: i32 = 15;
+const ROUTE_CTL_REGISTER: i32 = 16;
+const ROUTE_CTL_HEARTBEAT: i32 = 17;
+const ROUTE_CTL_CONFIG: i32 = 18;
+const ROUTE_CTL_STATUS: i32 = 19;
 
 /// chat 请求体上限（与 CHAT_PAYLOAD_MAX 一致；超了回 413）。
 const SRV_BODY_CAP: usize = 32768;
@@ -147,6 +151,48 @@ struct SrvConn {
 }
 
 var g_conns: [SrvConn: SRV_MAX_CONNS] = [];
+/// B1 meta.db（`--meta` 时打开）与节点 id；用于 controller 选主/心跳/配置接口。
+var g_meta: Db = Db{ h: null };
+var g_meta_ready: bool = false;
+var g_node_id: [byte: 64] = [0: 64];
+var g_node_id_len: usize = 0;
+
+fn srv_meta_setup(path: &[byte], node_id: &[byte]) void {
+    g_meta_ready = false;
+    g_node_id_len = 0;
+    var i: usize = 0;
+    while i < node_id.len && i < 64 {
+        g_node_id[i] = node_id[i];
+        i = i + 1;
+    }
+    g_node_id_len = i;
+    if path.len == 0 {
+        return;
+    }
+    meta_open(&g_meta, path) catch {
+        return;
+    };
+    g_meta_ready = true;
+    var nb: [byte: 64] = [0: 64];
+    var m: usize = 0;
+    while m < g_node_id_len && m < 64 {
+        nb[m] = g_node_id[m];
+        m = m + 1;
+    }
+    meta_node_register(&g_meta, nb[0: m], &"controller"[0: 10],
+        &""[0: 0], store_now()) catch {};
+}
+
+/// 把节点 id 拷到局部缓冲（模块级数组不能直接做运行时切片）。
+fn srv_node_copy(out: &byte, cap: usize) usize {
+    var i: usize = 0;
+    while i < g_node_id_len && i < cap {
+        out[i] = g_node_id[i];
+        i = i + 1;
+    }
+    return i;
+}
+
 /// A4 上游 TLS 上下文（serve 启动时初始化；bundle 由 --ca 注入）。
 var g_up_ctx: HtcCtx = HtcCtx{};
 
@@ -481,6 +527,18 @@ fn srv_route_of(req: &HsrvReq) i32 {
     }
     if srv_path_is(req, &"/v1/me"[0: 6]) {
         return ROUTE_ME;
+    }
+    if srv_path_is(req, &"/controller/register"[0: 20]) {
+        return ROUTE_CTL_REGISTER;
+    }
+    if srv_path_is(req, &"/controller/heartbeat"[0: 21]) {
+        return ROUTE_CTL_HEARTBEAT;
+    }
+    if srv_path_is(req, &"/controller/config"[0: 18]) {
+        return ROUTE_CTL_CONFIG;
+    }
+    if srv_path_is(req, &"/controller/status"[0: 18]) {
+        return ROUTE_CTL_STATUS;
     }
     if srv_path_is(req, &"/mcp"[0: 4]) {
         return ROUTE_MCP;
@@ -1019,6 +1077,22 @@ fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
         srv_me(c, stats);
         return;
     }
+    if c.route == ROUTE_CTL_REGISTER {
+        srv_ctl_register(c, stats);
+        return;
+    }
+    if c.route == ROUTE_CTL_HEARTBEAT {
+        srv_ctl_heartbeat(c, stats);
+        return;
+    }
+    if c.route == ROUTE_CTL_CONFIG {
+        srv_ctl_config(c, stats);
+        return;
+    }
+    if c.route == ROUTE_CTL_STATUS {
+        srv_ctl_status(c, stats);
+        return;
+    }
     if c.route == ROUTE_MCP {
         srv_mcp(c, stats);
         return;
@@ -1492,7 +1566,15 @@ export fn serve_run(lfd: i32, stats: &ServeStats) !i32 {
     var rc: i32 = 0;
     while true {
         // A2 接线：每日备份 / journal 清理；未初始化运行时是 no-op。
-        runtime_tick();
+        if g_meta_ready {
+        const mnow: i64 = store_now();
+        var nb: [byte: 64] = [0: 64];
+        const nn: usize = srv_node_copy(&nb[0], 64);
+        const role: i32 = elect_tick_or(&g_meta, nb[0: nn], mnow, 30);
+        runtime_set_backup_allowed(elect_may_backup(role));
+        meta_node_heartbeat(&g_meta, nb[0: nn], mnow) catch {};
+    }
+    runtime_tick();
         if srv_stop_requested() != 0 && stopping == 0 {
             stopping = 1;
             stop_at = srv_now_ms() +% SRV_SHUTDOWN_MS;
@@ -2682,4 +2764,209 @@ fn srv_responses_stream(c: &SrvConn, uid: i64, plan: &ChatPlan, cfg: &const Http
     }
     _ = srv_send_all(c.fd, &"0\r\n\r\n"[0: 5]);
     srv_chat_close(c);
+}
+
+// ---------------------------------------------------------------
+// B1：controller 控制面（meta.db；register/heartbeat/config/status）
+// ---------------------------------------------------------------
+
+fn srv_ctl_register(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    if !g_meta_ready {
+        srv_static(c, 503, SRV_JSON_503, keep);
+        return;
+    }
+    if c.body_overflow {
+        srv_static(c, 413, SRV_JSON_413, keep);
+        return;
+    }
+    var id: [byte: 64] = [0: 64];
+    const idn: usize = srv_json_body_str(c, &"id"[0: 2], &id[0], 64);
+    var role: [byte: 16] = [0: 16];
+    const rn: usize = srv_json_body_str(c, &"role"[0: 4], &role[0], 16);
+    var addr: [byte: 256] = [0: 256];
+    const an: usize = srv_json_body_str(c, &"addr"[0: 4], &addr[0], 256);
+    if idn == 0 {
+        srv_static(c, 400, SRV_JSON_400, keep);
+        return;
+    }
+    var role_s: [byte: 8] = [0: 8];
+    var rs: &[byte] = role[0: rn];
+    if rn == 0 {
+        role_s[0] = 'e'; role_s[1] = 'd'; role_s[2] = 'g'; role_s[3] = 'e';
+        rs = role_s[0: 4];
+    }
+    meta_node_register(&g_meta, id[0: idn], rs, addr[0: an], store_now()) catch {
+        srv_static(c, 502, SRV_JSON_502, keep);
+        return;
+    };
+    var pb: [byte: 4096] = [0: 4096];
+    var plen: usize = 0;
+    var ver: i64 = 0;
+    ver = meta_config_get(&g_meta, &pb[0], 4096, &plen) catch { 0 as i64; };
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"ok"[0: 2]);
+    jsonw_bool(&w, true);
+    jsonw_key(&w, &"config_version"[0: 14]);
+    jsonw_i64(&w, ver);
+    jsonw_end_obj(&w);
+    srv_static(c, 200, jsonw_span(&w), keep);
+}
+
+fn srv_ctl_heartbeat(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    if !g_meta_ready {
+        srv_static(c, 503, SRV_JSON_503, keep);
+        return;
+    }
+    if c.body_overflow {
+        srv_static(c, 413, SRV_JSON_413, keep);
+        return;
+    }
+    var d: JsonDoc = JsonDoc{};
+    json_parse(&d, c.body[0: c.body_len]) catch {
+        srv_static(c, 400, SRV_JSON_400, keep);
+        return;
+    };
+    const root: i32 = json_root(&d);
+    var id: [byte: 64] = [0: 64];
+    const idn: usize = json_str(&d, json_get(&d, root, &"id"[0: 2]), &id[0], 64);
+    if idn == 0 {
+        srv_static(c, 400, SRV_JSON_400, keep);
+        return;
+    }
+    const now: i64 = store_now();
+    meta_node_heartbeat(&g_meta, id[0: idn], now) catch {
+        srv_static(c, 404, SRV_JSON_404, keep);
+        return;
+    };
+    const day: i64 = json_i64(&d, json_get(&d, root, &"journal_day"[0: 11]));
+    const entries: i64 = json_i64(&d, json_get(&d, root, &"entries"[0: 7]));
+    if day > 0 {
+        meta_journal_index_put(&g_meta, id[0: idn], day, entries, now) catch {};
+    }
+    var pb: [byte: 4096] = [0: 4096];
+    var plen: usize = 0;
+    var ver: i64 = 0;
+    ver = meta_config_get(&g_meta, &pb[0], 4096, &plen) catch { 0 as i64; };
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"ok"[0: 2]);
+    jsonw_bool(&w, true);
+    jsonw_key(&w, &"config_version"[0: 14]);
+    jsonw_i64(&w, ver);
+    jsonw_end_obj(&w);
+    srv_static(c, 200, jsonw_span(&w), keep);
+}
+
+fn srv_ctl_config(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    if !g_meta_ready {
+        srv_static(c, 503, SRV_JSON_503, keep);
+        return;
+    }
+    if c.body_len > 0 && c.body_overflow {
+        srv_static(c, 413, SRV_JSON_413, keep);
+        return;
+    }
+    // POST（admin）写一版配置；GET 读当前版本
+    if c.body_len > 0 {
+        if !srv_admin_ok(c) {
+            srv_static(c, 401, SRV_JSON_401, keep);
+            return;
+        }
+        var d: JsonDoc = JsonDoc{};
+        json_parse(&d, c.body[0: c.body_len]) catch {
+            srv_static(c, 400, SRV_JSON_400, keep);
+            return;
+        };
+        var payload: [byte: 4096] = [0: 4096];
+        const pln: usize = json_str(&d, json_get(&d, json_root(&d), &"payload"[0: 7]), &payload[0], 4096);
+        var ver: i64 = 0;
+        ver = meta_config_put(&g_meta, payload[0: pln], store_now()) catch {
+            srv_static(c, 502, SRV_JSON_502, keep);
+            return;
+        };
+        var w: JsonW = JsonW{};
+        jsonw_init(&w);
+        jsonw_obj(&w);
+        jsonw_key(&w, &"ok"[0: 2]);
+        jsonw_bool(&w, true);
+        jsonw_key(&w, &"version"[0: 7]);
+        jsonw_i64(&w, ver);
+        jsonw_end_obj(&w);
+        srv_static(c, 200, jsonw_span(&w), keep);
+        return;
+    }
+    var pb: [byte: 4096] = [0: 4096];
+    var plen: usize = 0;
+    var ver: i64 = 0;
+    ver = meta_config_get(&g_meta, &pb[0], 4096, &plen) catch {
+        srv_static(c, 502, SRV_JSON_502, keep);
+        return;
+    };
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"version"[0: 7]);
+    jsonw_i64(&w, ver);
+    jsonw_key(&w, &"payload"[0: 7]);
+    jsonw_str(&w, pb[0: plen]);
+    jsonw_end_obj(&w);
+    srv_static(c, 200, jsonw_span(&w), keep);
+}
+
+fn srv_ctl_status(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    if !g_meta_ready {
+        srv_static(c, 503, SRV_JSON_503, keep);
+        return;
+    }
+    if !srv_admin_ok(c) {
+        srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    }
+    var nodes: [MetaNode: 32] = [];
+    var n: usize = 0;
+    n = meta_node_list(&g_meta, &nodes[0], 32) catch {
+        0 as usize;
+    };
+    var lb: [byte: 64] = [0: 64];
+    var ln: usize = 0;
+    ln = elect_leader(&g_meta, store_now(), &lb[0], 64) catch {
+        0 as usize;
+    };
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"leader"[0: 6]);
+    jsonw_str(&w, lb[0: ln]);
+    jsonw_key(&w, &"nodes"[0: 5]);
+    jsonw_arr(&w);
+    var i: usize = 0;
+    while i < n {
+        jsonw_obj(&w);
+        jsonw_key(&w, &"id"[0: 2]);
+        jsonw_str(&w, nodes[i].id[0: nodes[i].id_len]);
+        jsonw_key(&w, &"role"[0: 4]);
+        jsonw_str(&w, nodes[i].role[0: nodes[i].role_len]);
+        jsonw_key(&w, &"addr"[0: 4]);
+        jsonw_str(&w, nodes[i].addr[0: nodes[i].addr_len]);
+        jsonw_key(&w, &"status"[0: 6]);
+        jsonw_str(&w, nodes[i].status[0: nodes[i].status_len]);
+        jsonw_key(&w, &"last_seen"[0: 9]);
+        jsonw_i64(&w, nodes[i].last_seen);
+        jsonw_end_obj(&w);
+        i = i + 1;
+    }
+    jsonw_end_arr(&w);
+    jsonw_end_obj(&w);
+    srv_static(c, 200, jsonw_span(&w), keep);
 }

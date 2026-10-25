@@ -30,6 +30,8 @@ var g_db: Db = Db{ h: null };
 var g_dir: [byte: 256] = [0: 256];
 var g_dir_len: usize = 0;
 var g_last_backup_day: i64 = 0;
+/// B1：standby 不备份，由 controller 选主结果设置（默认允许，单机模式不受影响）。
+var g_backup_allowed: bool = true;
 var g_last_journal_day: i64 = 0;
 
 /// 把切片拷进 NUL 结尾的缓冲。
@@ -71,6 +73,10 @@ fn rt_hour(ts: i64) i64 {
 /// 最近一次成功备份的 UTC 天序号（0 = 还没备份过）。
 export fn runtime_last_backup_day() i64 {
     return g_last_backup_day;
+}
+
+export fn runtime_set_backup_allowed(v: bool) void {
+    g_backup_allowed = v;
 }
 
 export fn runtime_ready() bool {
@@ -151,7 +157,7 @@ export fn runtime_tick_at(now: i64) void {
     const dn: usize = rt_dir_copy(&dirbuf[0], 256);
     const dir: &[byte] = dirbuf[0: dn];
     // 03:00（UTC）之后且今天还没备份 → 快照 + 清理旧备份。
-    if rt_hour(now) >= RT_BACKUP_HOUR && today != g_last_backup_day {
+    if g_backup_allowed && rt_hour(now) >= RT_BACKUP_HOUR && today != g_last_backup_day {
         var path: [byte: 512] = [0: 512];
         backup_run(&g_db, dir, now, &path[0], 512) catch {};
         backup_prune(dir, now, RT_BACKUP_KEEP);

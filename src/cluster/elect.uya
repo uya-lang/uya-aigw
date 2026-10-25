@@ -23,6 +23,14 @@ export fn elect_tick(d: &Db, node_id: &[byte], now: i64, ttl: i64) !i32 {
     return ELECT_STANDBY;
 }
 
+/// 同 `elect_tick`，但失败按 standby 处理（事件循环用，避免错误传播）。
+export fn elect_tick_or(d: &Db, node_id: &[byte], now: i64, ttl: i64) i32 {
+    const r: i32 = elect_tick(d, node_id, now, ttl) catch |_| {
+        return ELECT_STANDBY;
+    };
+    return r;
+}
+
 /// 当前 leader 的节点 id（过期则返回 0 长度）。
 export fn elect_leader(d: &Db, now: i64, out: &byte, cap: usize) !usize {
     return meta_lease_holder(d, &"controller"[0: 10], now, out, cap) catch {
