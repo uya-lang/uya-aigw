@@ -52,8 +52,8 @@ A4/A5/A8 进度（子项已完成记录见 `TODO_DONE.md`）：
 | B5 | ingest 幂等 + 金额/时段重算 + usage 分片 + spool + 吊销 + journal 重放 | 断网 30s 不丢不重；恢复对账一致 | B1/B3 |
 | B6 | 集群 e2e + 部署（1 controller + 3 node + 2 edge + nginx） | `cluster_e2e.sh` 全绿 | B1–B5 |
 
-B5 进度：幂等 ingest + 区间重算 + 本地 spool（追加/读取/清空）已完成；
-吊销、journal 重放、spool 消费循环待做。
+B5 进度：幂等 ingest + 区间重算 + 本地 spool + Key 吊销（GET /v1/keys、
+POST /v1/keys/revoke，撤销后 401）已完成；journal 重放、spool 消费循环待做。
 
 B4 进度：edge 路由核心（slug 归属 + session 亲和 + 失败清缓存，11 断言）已完成；
 HTTP/SSE 代理与 1k 并发待做。

@@ -80,6 +80,7 @@ const ROUTE_ADMIN_BILLING: i32 = 12;
 const ROUTE_ADMIN_BACKUP: i32 = 13;
 const ROUTE_RESPONSES: i32 = 14;
 const ROUTE_MCP: i32 = 15;
+const ROUTE_KEY_REVOKE: i32 = 24;
 const ROUTE_CTL_EPOCH: i32 = 21;
 const ROUTE_CTL_ASSIGN: i32 = 22;
 const ROUTE_CTL_DRAIN: i32 = 23;
@@ -136,6 +137,7 @@ struct SrvConn {
     route: i32,
     keep: bool,
     is_head_req: bool,
+    is_get: bool,
     // chat：Authorization 头 + 请求体（仅 ROUTE_CHAT 采集，其他路由只排空）
     auth: [byte: 256],
     auth_len: usize,
@@ -574,6 +576,9 @@ fn srv_route_of(req: &HsrvReq) i32 {
     }
     if srv_path_is(req, &"/v1/auth/login"[0: 14]) {
         return ROUTE_LOGIN;
+    }
+    if srv_path_is(req, &"/v1/keys/revoke"[0: 15]) {
+        return ROUTE_KEY_REVOKE;
     }
     if srv_path_is(req, &"/v1/keys"[0: 8]) {
         return ROUTE_KEYS;
@@ -1131,6 +1136,10 @@ fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
         srv_login(c, stats);
         return;
     }
+    if c.route == ROUTE_KEY_REVOKE {
+        srv_key_revoke(c, stats);
+        return;
+    }
     if c.route == ROUTE_KEYS {
         srv_keys(c, stats);
         return;
@@ -1353,6 +1362,7 @@ fn srv_drive(c: &SrvConn, stats: &ServeStats) void {
             c.keep = req.keep_alive;
             c.route = srv_route_of(&req);
             c.is_head_req = req.method_len == 4 && req.method[0] == ('H' as byte);
+            c.is_get = req.method_len == 3 && req.method[0] == ('G' as byte);
             c.auth_len = 0;
             var ai: usize = 0;
             while ai < req.auth_len && ai < 256 {
@@ -1554,6 +1564,7 @@ fn srv_accept_all(stats: &ServeStats) void {
         g_conns[i].route = ROUTE_404;
         g_conns[i].keep = false;
         g_conns[i].is_head_req = false;
+        g_conns[i].is_get = false;
         g_conns[i].body_left = 0;
         g_conns[i].chunked = false;
         g_conns[i].chunk_left = 0;
@@ -1871,7 +1882,53 @@ fn srv_login(c: &SrvConn, stats: &ServeStats) void {
     srv_static(c, 200, jsonw_span(&w), keep);
 }
 
-/// POST /v1/keys：会话鉴权后建 Key。
+/// POST /v1/keys/revoke：撤销自己的 Key（越权/不存在 → 404）。
+fn srv_key_revoke(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    if !runtime_ready() {
+        srv_static(c, 503, SRV_JSON_503, keep);
+        return;
+    }
+    if c.body_overflow {
+        srv_static(c, 413, SRV_JSON_413, keep);
+        return;
+    }
+    var uid: i64 = 0;
+    if !srv_bearer_uid(c, &uid) {
+        srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    }
+    var d: JsonDoc = JsonDoc{};
+    json_parse(&d, c.body[0: c.body_len]) catch {
+        srv_static(c, 400, SRV_JSON_400, keep);
+        return;
+    };
+    const kid: i64 = json_i64(&d, json_get(&d, json_root(&d), &"key_id"[0: 6]));
+    if kid <= 0 {
+        srv_static(c, 400, SRV_JSON_400, keep);
+        return;
+    }
+    const ok: bool = store_revoke_key_owned(runtime_db(), kid, uid, store_now()) catch {
+        srv_static(c, 502, SRV_JSON_502, keep);
+        return;
+    };
+    if !ok {
+        srv_static(c, 404, SRV_JSON_404, keep);
+        return;
+    }
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"ok"[0: 2]);
+    jsonw_bool(&w, true);
+    jsonw_key(&w, &"key_id"[0: 6]);
+    jsonw_i64(&w, kid);
+    jsonw_end_obj(&w);
+    srv_static(c, 200, jsonw_span(&w), keep);
+}
+
+/// POST /v1/keys：会话鉴权后建 Key；GET 列自己的 Key。
 fn srv_keys(c: &SrvConn, stats: &ServeStats) void {
     const keep: bool = c.keep;
     stats.requests = stats.requests +% 1;
@@ -1886,6 +1943,39 @@ fn srv_keys(c: &SrvConn, stats: &ServeStats) void {
     var uid: i64 = 0;
     if !srv_bearer_uid(c, &uid) {
         srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    }
+    if c.is_get {
+        var rows: [StoreKeyRow: 32] = [];
+        var n: usize = 0;
+        n = store_list_keys(runtime_db(), uid, &rows[0], 32) catch {
+            srv_static(c, 502, SRV_JSON_502, keep);
+            return;
+        };
+        var w: JsonW = JsonW{};
+        jsonw_init(&w);
+        jsonw_obj(&w);
+        jsonw_key(&w, &"data"[0: 4]);
+        jsonw_arr(&w);
+        var i: usize = 0;
+        while i < n {
+            jsonw_obj(&w);
+            jsonw_key(&w, &"id"[0: 2]);
+            jsonw_i64(&w, rows[i].key_id);
+            jsonw_key(&w, &"prefix"[0: 6]);
+            jsonw_str(&w, rows[i].prefix[0: rows[i].prefix_len]);
+            jsonw_key(&w, &"name"[0: 4]);
+            jsonw_str(&w, rows[i].name[0: rows[i].name_len]);
+            jsonw_key(&w, &"created_at"[0: 10]);
+            jsonw_i64(&w, rows[i].created_at);
+            jsonw_key(&w, &"revoked_at"[0: 10]);
+            jsonw_i64(&w, rows[i].revoked_at);
+            jsonw_end_obj(&w);
+            i = i + 1;
+        }
+        jsonw_end_arr(&w);
+        jsonw_end_obj(&w);
+        srv_static(c, 200, jsonw_span(&w), keep);
         return;
     }
     var name: [byte: 64] = [0: 64];

@@ -42,6 +42,28 @@ export struct StoreUser {
 }
 
 /// 校验通过后的 Key 读模型（鉴权只需要这些）。
+export const STORE_KEY_NAME_MAX: usize = 64;
+export const STORE_KEY_PREFIX_MAX: usize = 16;
+
+/// GET /v1/keys 的一行（不含 hash/token）。
+export struct StoreKeyRow {
+    key_id: i64,
+    prefix: [byte: STORE_KEY_PREFIX_MAX],
+    prefix_len: usize,
+    name: [byte: STORE_KEY_NAME_MAX],
+    name_len: usize,
+    created_at: i64,
+    revoked_at: i64,
+}
+
+export fn store_key_row_zero(r: &StoreKeyRow) void {
+    r.key_id = 0;
+    r.prefix_len = 0;
+    r.name_len = 0;
+    r.created_at = 0;
+    r.revoked_at = 0;
+}
+
 export struct StoreKey {
     key_id: i64,
     user_id: i64,
@@ -92,6 +114,57 @@ export fn store_now() i64 {
         return 0;
     };
     return ts.tv_sec;
+}
+
+/// 列出某用户的 Key（含已撤销，revoked_at>0）。返回行数。
+export fn store_list_keys(d: &Db, uid: i64, out: &StoreKeyRow, cap: usize) !usize {
+    var st: DbStmt = dbx_prepare(d,
+        "select id, prefix, name, created_at, revoked_at from api_keys where user_id = ? order by id limit ?" as &const byte) catch {
+        return error.StoreFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_i64(&st, 1, uid) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_i64(&st, 2, cap as i64) catch {
+        return error.StoreFailed;
+    };
+    var n: usize = 0;
+    while n < cap {
+        if dbx_step(&st) != 1 {
+            break;
+        }
+        store_key_row_zero(&out[n]);
+        out[n].key_id = dbx_col_i64(&st, 0);
+        out[n].prefix_len = dbx_col_text(&st, 1, &out[n].prefix[0], STORE_KEY_PREFIX_MAX);
+        out[n].name_len = dbx_col_text(&st, 2, &out[n].name[0], STORE_KEY_NAME_MAX);
+        out[n].created_at = dbx_col_i64(&st, 3);
+        out[n].revoked_at = dbx_col_i64(&st, 4);
+        n = n + 1;
+    }
+    return n;
+}
+
+/// 撤销某用户自己的 Key；返回是否命中（越权/不存在都是 false）。
+export fn store_revoke_key_owned(d: &Db, key_id: i64, uid: i64, now: i64) !bool {
+    var st: DbStmt = dbx_prepare(d,
+        "update api_keys set revoked_at = ? where id = ? and user_id = ? and revoked_at = 0" as &const byte) catch {
+        return error.StoreFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_i64(&st, 1, now) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_i64(&st, 2, key_id) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_i64(&st, 3, uid) catch {
+        return error.StoreFailed;
+    };
+    if dbx_step(&st) != 0 {
+        return error.StoreFailed;
+    }
+    return dbx_changes(d) == 1;
 }
 
 // ---------------------------------------------------------------
