@@ -5,7 +5,7 @@ UYA_ROOT ?= /home/winger/uya/uya/lib
 SRC := $(shell find src -name '*.uya' | sort)
 export UYA_ROOT
 
-.PHONY: check test spike clean selftest e2e db_bench ui-e2e cluster-e2e
+.PHONY: check test spike clean selftest e2e db_bench ui-e2e cluster-e2e load-sse
 
 # 类型检查全部源文件（合并命名空间）
 check:
@@ -26,6 +26,10 @@ selftest: check
 ui-e2e:
 	rm -rf .uyacache
 	./tests/chat_e2e.sh
+
+# 网关侧 SSE 并发（默认 1000 连接 × 20 事件）
+load-sse: check
+	./tests/sse_load.sh 1000 20
 
 # 集群端到端：controller + uplink 注册 + epoch/assign + edge 路由 + drain + ingest（B6）
 cluster-e2e:
