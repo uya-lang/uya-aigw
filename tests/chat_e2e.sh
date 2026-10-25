@@ -350,6 +350,19 @@ echo "$AA" | grep -q '"action":"bind"' || { echo "$AA" >&2; fail "audit bind"; }
 echo "$AA" | grep -q '"target":"price-model"' || { echo "$AA" >&2; fail "audit target"; }
 AA401=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$BASE/admin/audit")
 [ "$AA401" = "401" ] || fail "audit expected 401, got $AA401"
+# C5：更多审计动作（key.create / key.revoke / schedule.put，actor=user）
+NK=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $SESSION" --data '{"name":"audit-key"}' "$BASE/v1/keys")
+echo "$NK" | grep -q '"key":"aigw_sk_' || { echo "$NK" >&2; fail "audit key create"; }
+NKEYS=$(curl -s --max-time 5 -H "Authorization: Bearer $SESSION" "$BASE/v1/keys")
+NKID=$(echo "$NKEYS" | tr '}' '\n' | grep '"name":"audit-key"' | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+[ -n "$NKID" ] || { echo "$NKEYS" >&2; fail "audit key id"; }
+NRV=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $SESSION" --data "{\"key_id\":$NKID}" "$BASE/v1/keys/revoke")
+echo "$NRV" | grep -q '"ok":true' || { echo "$NRV" >&2; fail "audit key revoke"; }
+AA2=$(curl -s --max-time 5 -H 'Authorization: Bearer test-admin' "$BASE/admin/audit")
+echo "$AA2" | grep -q '"action":"key.create"' || { echo "$AA2" >&2; fail "audit key.create"; }
+echo "$AA2" | grep -q '"action":"key.revoke"' || { echo "$AA2" >&2; fail "audit key.revoke"; }
+echo "$AA2" | grep -q '"action":"schedule.put"' || { echo "$AA2" >&2; fail "audit schedule.put"; }
+echo "$AA2" | grep -q '"actor":"user"' || { echo "$AA2" >&2; fail "audit actor"; }
 
 # 4n) C2：请求列表 / 详情（分页）
 RL=$(curl -s --max-time 5 -H "Authorization: Bearer $TOKEN" "$BASE/v1/requests?limit=5&offset=0")

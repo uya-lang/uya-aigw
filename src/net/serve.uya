@@ -2391,6 +2391,9 @@ fn srv_key_revoke(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 404, SRV_JSON_404, keep);
         return;
     }
+    var tb: [byte: 24] = [0: 24];
+    const tn: usize = srv_i64_text(kid, &tb[0], 24);
+    srv_audit_actor(&"user"[0: 4], &"key.revoke"[0: 10], tb[0: tn]);
     var w: JsonW = JsonW{};
     jsonw_init(&w);
     jsonw_obj(&w);
@@ -2460,6 +2463,7 @@ fn srv_keys(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 502, SRV_JSON_502, keep);
         return;
     };
+    srv_audit_actor(&"user"[0: 4], &"key.create"[0: 10], name[0: nn]);
     var w: JsonW = JsonW{};
     jsonw_init(&w);
     jsonw_obj(&w);
@@ -4948,8 +4952,8 @@ fn srv_audit_path(out: &byte, cap: usize) usize {
     return n;
 }
 
-/// 追加一条审计：`{"ts":..,"actor":"admin","action":"..","target":".."}`。
-fn srv_audit(action: &[byte], target: &[byte]) void {
+/// 追加一条审计（actor 可指定：admin / user）：`{"ts":..,"actor":..,"action":..,"target":..}`。
+fn srv_audit_actor(actor: &[byte], action: &[byte], target: &[byte]) void {
     var path: [byte: 320] = [0: 320];
     const pn: usize = srv_audit_path(&path[0], 320);
     if pn == 0 {
@@ -4961,13 +4965,45 @@ fn srv_audit(action: &[byte], target: &[byte]) void {
     jsonw_key(&w, &"ts"[0: 2]);
     jsonw_i64(&w, store_now());
     jsonw_key(&w, &"actor"[0: 5]);
-    jsonw_str(&w, &"admin"[0: 5]);
+    jsonw_str(&w, actor);
     jsonw_key(&w, &"action"[0: 6]);
     jsonw_str(&w, action);
     jsonw_key(&w, &"target"[0: 6]);
     jsonw_str(&w, target);
     jsonw_end_obj(&w);
     _ = spool_try_append(path[0: pn], jsonw_span(&w));
+}
+
+/// 管理端写操作的审计（actor 固定 admin）。
+fn srv_audit(action: &[byte], target: &[byte]) void {
+    srv_audit_actor(&"admin"[0: 5], action, target);
+}
+
+/// 非负整数转文本（审计 target 里的 key id 用）。
+fn srv_i64_text(v: i64, out: &byte, cap: usize) usize {
+    var x: u64 = 0;
+    if v > 0 {
+        x = v as u64;
+    }
+    var digits: [byte: 20] = [0: 20];
+    var d: usize = 0;
+    if x == 0 {
+        digits[0] = 48;
+        d = 1;
+    } else {
+        while x > 0 && d < 20 {
+            digits[d] = (48 +% (x % (10 as u64))) as byte;
+            x = x / (10 as u64);
+            d = d + 1;
+        }
+    }
+    var n: usize = 0;
+    while d > 0 && n < cap {
+        d = d - 1;
+        out[n] = digits[d];
+        n = n + 1;
+    }
+    return n;
 }
 
 /// C5：审计列表（最近 N 行，text/plain 的 JSONL）。
