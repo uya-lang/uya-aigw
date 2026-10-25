@@ -92,7 +92,7 @@ AIGW_MODE=seed AIGW_DB="$SEED_DB" AIGW_UPSTREAM_PORT="$MPORT" ./build/seed >/dev
 
 UYA_ROOT="$UYA_ROOT" "$UYA" build \
   src/foundation/buf.uya src/net/httpsrv.uya src/net/tcpx.uya src/net/serve.uya \
-  src/core/money.uya src/core/reqlog.uya src/core/dbx.uya src/cluster/meta.uya src/cluster/elect.uya src/cluster/uplink.uya src/cluster/ingest.uya src/net/ui.uya src/net/rsav.uya \
+  src/core/money.uya src/core/reqlog.uya src/core/dbx.uya src/cluster/meta.uya src/cluster/elect.uya src/cluster/uplink.uya src/cluster/edge.uya src/cluster/ingest.uya src/net/ui.uya src/net/rsav.uya \
   src/core/schema.uya src/core/store.uya src/core/budget.uya src/core/backup.uya src/core/journal.uya \
   src/core/runtime.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/rollup.uya \
   src/core/billing.uya src/core/lb.uya src/core/responses.uya src/core/chat.uya src/providers/upstream.uya \
@@ -241,19 +241,19 @@ echo "$CD" | grep -q '"ok":true' || { echo "$CD" >&2; fail "drain"; }
 CST3=$(curl -s --max-time 5 -H 'Authorization: Bearer test-admin' "$BASE/controller/status")
 echo "$CST3" | grep -q '"status":"draining"' || { echo "$CST3" >&2; fail "drain status"; }
 
-# 4g) B2：node-b 通过 uplink 注册到 controller
+# 4g) B2：node-uplink 通过 uplink 注册到 controller（独立 id，避免与上面的 curl 注册混淆）
 mkdir -p "$TMP/nodeb"
 ./build/aigw serve --host 127.0.0.1 --port 0 --db "$TMP/nodeb/aigw.db" \
-  --data-dir "$TMP/nodeb" --uplink "127.0.0.1:$PORT" --node-id node-b \
+  --data-dir "$TMP/nodeb" --uplink "127.0.0.1:$PORT" --node-id node-uplink \
   >"$TMP/nodeb.log" 2>&1 &
 NB_PID=$!
 CST2=""
 for _ in $(seq 1 50); do
   CST2=$(curl -s --max-time 5 -H 'Authorization: Bearer test-admin' "$BASE/controller/status")
-  echo "$CST2" | grep -q '"node-b"' && break
+  echo "$CST2" | grep -q '"node-uplink"' && break
   sleep 0.1
 done
-echo "$CST2" | grep -q '"node-b"' || { cat "$TMP/nodeb.log" >&2; echo "$CST2" >&2; fail "uplink register"; }
+echo "$CST2" | grep -q '"node-uplink"' || { cat "$TMP/nodeb.log" >&2; echo "$CST2" >&2; fail "uplink register"; }
 kill "$NB_PID" 2>/dev/null || true
 wait "$NB_PID" 2>/dev/null || true
 NB_PID=""

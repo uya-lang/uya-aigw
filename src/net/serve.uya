@@ -86,6 +86,8 @@ const ROUTE_ADMIN_USERS: i32 = 31;
 const ROUTE_ADMIN_PROVIDERS: i32 = 32;
 const ROUTE_ADMIN_PAGE: i32 = 33;
 const ROUTE_ADMIN_JS: i32 = 34;
+const ROUTE_EDGE_ROUTE: i32 = 35;
+const ROUTE_EDGE_FAIL: i32 = 36;
 const ROUTE_BUDGET: i32 = 30;
 const ROUTE_ESTIMATE: i32 = 29;
 const ROUTE_USAGE_CSV: i32 = 28;
@@ -105,6 +107,7 @@ const SRV_BODY_CAP: usize = 32768;
 // 固定回包体（切片字面量放模块级常量：编译器已修，但这样也不会碰异步帧退化）
 const SRV_JSON_HEALTH: &[byte] = &"{\"ok\":true}"[0: 11];
 const SRV_JSON_MODELS: &[byte] = &"{\"object\":\"list\",\"data\":[]}"[0: 27];
+const SRV_JSON_OK: &[byte] = &"{\"ok\":true}"[0: 11];
 const SRV_JSON_404: &[byte] = &"{\"error\":\"not found\"}"[0: 21];
 const SRV_JSON_400: &[byte] = &"{\"error\":\"bad request\"}"[0: 23];
 const SRV_JSON_431: &[byte] = &"{\"error\":\"head too large\"}"[0: 26];
@@ -589,6 +592,12 @@ fn srv_route_of(req: &HsrvReq) i32 {
     }
     if srv_path_is(req, &"/v1/keys/revoke"[0: 15]) {
         return ROUTE_KEY_REVOKE;
+    }
+    if srv_path_is(req, &"/edge/fail"[0: 10]) {
+        return ROUTE_EDGE_FAIL;
+    }
+    if srv_path_is(req, &"/edge/route"[0: 11]) {
+        return ROUTE_EDGE_ROUTE;
     }
     if srv_path_is(req, &"/ui/admin.js"[0: 12]) {
         return ROUTE_ADMIN_JS;
@@ -1202,8 +1211,24 @@ fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
         srv_me(c, stats);
         return;
     }
+    if c.route == ROUTE_EDGE_FAIL {
+        srv_edge_fail(c, stats);
+        return;
+    }
+    if c.route == ROUTE_EDGE_ROUTE {
+        srv_edge_route(c, stats);
+        return;
+    }
     if c.route == ROUTE_ADMIN_JS {
         srv_admin_js(c, stats);
+        return;
+    }
+    if c.route == ROUTE_EDGE_FAIL {
+        srv_edge_fail(c, stats);
+        return;
+    }
+    if c.route == ROUTE_EDGE_ROUTE {
+        srv_edge_route(c, stats);
         return;
     }
     if c.route == ROUTE_ADMIN_JS {
@@ -1772,7 +1797,7 @@ export fn serve_run(lfd: i32, stats: &ServeStats) !i32 {
             const ipn: usize = srv_uplink_copy(&ipb[0], 64);
             var nb: [byte: 64] = [0: 64];
             const nn: usize = srv_node_copy(&nb[0], 64);
-            uplink_register(ipb[0: ipn], g_uplink_port, nb[0: nn],
+            _ = uplink_register(ipb[0: ipn], g_uplink_port, nb[0: nn],
                 &"edge"[0: 4], &""[0: 0], 2000) catch {};
             uplink_heartbeat(ipb[0: ipn], g_uplink_port, nb[0: nn], 0, 0, 2000) catch {};
         }
@@ -3384,17 +3409,77 @@ fn srv_ctl_drain(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 400, SRV_JSON_400, keep);
         return;
     }
-    meta_node_set_status(&g_meta, id[0: idn], &"draining"[0: 8], store_now()) catch {
+    const now: i64 = store_now();
+    meta_node_set_status(&g_meta, id[0: idn], &"draining"[0: 8], now) catch {
         srv_static(c, 404, SRV_JSON_404, keep);
         return;
     };
+    // drain 语义：把该节点的 slug 全量迁到一台 active 节点（epoch 必须高于现有归属）。
+    var nodes: [MetaNode: 64] = [];
+    var n: usize = 0;
+    n = meta_node_list(&g_meta, &nodes[0], 64) catch {
+        0 as usize;
+    };
+    var tgt: [byte: 64] = [0: 64];
+    var tn: usize = 0;
+    var i: usize = 0;
+    while i < n {
+        if nodes[i].status_len == 6 && nodes[i].status[0] == ('a' as byte) && nodes[i].id_len > 0
+            && !(nodes[i].id_len == idn && srv_slice_eq(nodes[i].id[0: nodes[i].id_len], id[0: idn])) {
+            var k: usize = 0;
+            while k < nodes[i].id_len && k < 64 {
+                tgt[k] = nodes[i].id[k];
+                k = k + 1;
+            }
+            tn = k;
+            break;
+        }
+        i = i + 1;
+    }
+    var moved: i64 = 0;
+    if tn > 0 {
+        var attempt: usize = 0;
+        while attempt < 8 && moved == 0 {
+            var ep: i64 = 0;
+            ep = meta_epoch_bump(&g_meta, tgt[0: tn], now) catch {
+                0 as i64;
+            };
+            if ep <= 0 {
+                break;
+            }
+            const mv: !i64 = meta_reassign_all(&g_meta, id[0: idn], tgt[0: tn], ep, now);
+            moved = mv catch {
+                0 as i64;
+            };
+            attempt = attempt + 1;
+        }
+    }
     var w: JsonW = JsonW{};
     jsonw_init(&w);
     jsonw_obj(&w);
     jsonw_key(&w, &"ok"[0: 2]);
     jsonw_bool(&w, true);
+    jsonw_key(&w, &"moved"[0: 5]);
+    jsonw_i64(&w, moved);
+    jsonw_key(&w, &"to"[0: 2]);
+    jsonw_str(&w, tgt[0: tn]);
     jsonw_end_obj(&w);
     srv_static(c, 200, jsonw_span(&w), keep);
+}
+
+/// 字节切片相等（长度 + 内容）。
+fn srv_slice_eq(a: &[byte], b: &[byte]) bool {
+    if a.len != b.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < a.len {
+        if a[i] != b[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
 }
 
 
@@ -3794,4 +3879,45 @@ fn srv_admin_js(c: &SrvConn, stats: &ServeStats) void {
     var buf: [byte: 16384] = [0: 16384];
     const n: usize = admin_js(&buf[0], 16384);
     srv_static_ct(c, 200, buf[0: n], keep, SRV_CTYPE_JS[0: 22], 22);
+}
+
+
+/// B6：edge 路由查询（`?slug=..&session=..`），用于 e2e 验证归属与亲和。
+fn srv_edge_route(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    if !g_meta_ready {
+        srv_static(c, 503, SRV_JSON_503, keep);
+        return;
+    }
+    var slug: [byte: 128] = [0: 128];
+    const sn: usize = srv_query_str(&c.path[0], c.path_len, &"slug"[0: 4], 4, &slug[0], 128);
+    var sess: [byte: 128] = [0: 128];
+    const ssn: usize = srv_query_str(&c.path[0], c.path_len, &"session"[0: 7], 7, &sess[0], 128);
+    var nb: [byte: 64] = [0: 64];
+    // 归属在 meta.db（边缘节点是本地副本），不是业务库。
+    const nn: usize = edge_route(&g_meta, slug[0: sn], sess[0: ssn], &nb[0], 64);
+    if nn == 0 {
+        srv_static(c, 404, SRV_JSON_404, keep);
+        return;
+    }
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"slug"[0: 4]);
+    jsonw_str(&w, slug[0: sn]);
+    jsonw_key(&w, &"node"[0: 4]);
+    jsonw_str(&w, nb[0: nn]);
+    jsonw_end_obj(&w);
+    srv_static(c, 200, jsonw_span(&w), keep);
+}
+
+/// B6：手动失效某 session 亲和（模拟节点故障后重试）。
+fn srv_edge_fail(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    var sess: [byte: 128] = [0: 128];
+    const sn: usize = srv_query_str(&c.path[0], c.path_len, &"session"[0: 7], 7, &sess[0], 128);
+    edge_fail(sess[0: sn]);
+    srv_static(c, 200, SRV_JSON_OK, keep);
 }

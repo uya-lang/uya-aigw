@@ -52,6 +52,7 @@ A4/A5/A8 进度（子项已完成记录见 `TODO_DONE.md`）：
 | B5 | ingest 幂等 + 金额/时段重算 + usage 分片 + spool + 吊销 + journal 重放 | 断网 30s 不丢不重；恢复对账一致 | B1/B3 |
 | B6 | 集群 e2e + 部署（1 controller + 3 node + 2 edge + nginx） | `cluster_e2e.sh` 全绿 | B1–B5 |
 
+
 B5 进度：幂等 ingest（HTTP `/controller/ingest` 幂等，重复批 duplicate）、区间重算、
 本地 spool、Key 吊销已完成；spool 自动消费循环待做。
 
@@ -60,8 +61,11 @@ HTTP/SSE 代理与 1k 并发待做。
 
 B1 已完成（见 `TODO_DONE.md`）：meta.db、A/S 选主、controller 控制面与 standby 不备份。
 
-B2 进度：`uplink.uya` + `--uplink` 已通（node 注册/心跳，e2e 断言 controller status 出现 node-b）；
-config 快照拉取、slug 归属校验待做。
+B6 进度：`tests/cluster_e2e.sh`（`make cluster-e2e`）已全绿 —— 1 controller + 3 node 真 uplink
+注册、epoch/fencing、edge 路由与亲和、drain 迁移、ingest 幂等；nginx 反代与部署脚本待做。
+
+B2 进度：`uplink.uya` + `--uplink` 已真正打通（阻塞 connect + 点分 IP 解析 + 固定缓冲请求；
+`cluster_e2e.sh` 用独立 node id 验证注册，避免假通过）；config 快照拉取、slug 归属校验待做。
 
 B3 已完成（见 `TODO_DONE.md`）：epoch/fencing/drain、控制面（421）、批量迁移/清零、
 stale 自动迁移，controller tick 每 3s 触发。
@@ -73,26 +77,20 @@ stale 自动迁移，controller tick 每 3s 触发。
 | ID | 任务 | 验收 | 依赖 |
 |---|---|---|---|
 | C1 | 静态壳 + 登录/资料 + 接入点页 | 登录→复制 URL→curl 成功 | A2/A7 |
-
-C1 进度：静态壳（`/`、`/ui/app.js`；登录/资料/密钥/接入点 + curl 示例）已落地；
-其余页面（概览/用量/Playground/管理后台）在 C2–C5。
 | C2 | 概览 + 用量/费用（含时段）+ 请求列表/详情 + CSV | 数据与 `/v1/usage` 一致；分页正确 | A6 |
-
-C2 进度：`/v1/usage.csv` + 概览/明细表 + CSV 导出已落地；请求列表/详情分页待做。
 | C3 | 密钥管理 + 模型/价格 + 估算器 | 创建 key 立即能调用；估算 == 实际 | A7 |
-
-C3 进度：Key 管理（建/列/撤销）+ `POST /v1/estimate` 估算器已落地；模型/价格编辑页待做。
 | C4 | Playground + 账单 + 设置/通知 | SSE 指标正确；预算告警触发 | C2/C3 |
-
-C4 进度：Playground（流式指标）+ 账单预算（schema v8 budgets、`/v1/budget`、超额告警）
-已落地；通知（webhook/邮件）待做。
 | C5 | 管理后台（用户/供应商/模型/定价/分时/节点/备份/审计） | 改价/绑定/节点 drain/备份状态可见 | A7/B3 |
-
-C5 进度：`/admin` 页 + 用户/供应商列表已落地（含 401 保护）；改价/绑定/审计日志待做。
 | C6 | e2e + 安全（CSRF/XSS/CSP/越权）+ 文档 | `make ui-e2e` 全绿 | C1–C5 |
 
-C6 进度：安全头（CSP/nosniff/Referrer-Policy/XFO）、XSS/越权断言、`make ui-e2e` 已落地；
-CSRF 说明（Bearer-only）与前后端联调文档见 `docs/STATUS.md`。
+进度（子项完成记录见 `TODO_DONE.md`）：
+- C1：静态壳（`/`、`/ui/app.js`；登录/资料/密钥/接入点 + curl 示例）已落地。
+- C2：`/v1/usage.csv` + 概览/明细表 + CSV 导出已落地；请求列表/详情分页待做。
+- C3：Key 管理（建/列/撤销）+ `POST /v1/estimate` 估算器已落地；模型/价格编辑页待做。
+- C4：Playground（流式指标）+ 账单预算（schema v8 budgets、`/v1/budget`、超额告警）已落地；通知待做。
+- C5：`/admin` 页 + 用户/供应商列表已落地（含 401 保护）；改价/绑定/审计日志待做。
+- C6：安全头（CSP/nosniff/Referrer-Policy/XFO）、XSS/越权断言、`make ui-e2e` 已落地；
+  CSRF 说明（Bearer-only）见 `docs/STATUS.md`。
 
 ---
 
@@ -102,7 +100,7 @@ CSRF 说明（Bearer-only）与前后端联调文档见 `docs/STATUS.md`。
 2. 并行：A0 spike（SQLite + money）
 3. TLS-06 → TLS-07 → TLS-08 → TLS-09 → TLS-10 → TLS-11
 4. ~~A1 → A2 → A3 → A6 → A7 → A9~~ → A4/A5/A8 收尾
-5. ~~B1 → B3~~ → B2 收尾 → B4 → B5 → B6
+5. ~~B1 → B3 → B6~~ → B2 收尾 → B4 → B5
 6. C1 → C2 → C3 → C4 → C5 → C6
 
 ---

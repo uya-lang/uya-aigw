@@ -8,6 +8,26 @@ use libc.syscall;
 
 export error UplinkFailed;
 
+/// 与 x86_64 `struct timeval` 布局一致（SO_RCVTIMEO 用）。
+struct UpTimeval {
+    tv_sec: i64,
+    tv_usec: i64,
+}
+
+/// 把 s 追加到 out[at[0]..cap)，成功返回 true。
+fn up_put(out: &byte, cap: usize, at: &usize, s: &[byte]) bool {
+    var i: usize = 0;
+    while i < s.len {
+        if at[0] + i >= cap {
+            return false;
+        }
+        out[at[0] + i] = s[i];
+        i = i + 1;
+    }
+    at[0] = at[0] + i;
+    return true;
+}
+
 fn up_send_all(fd: i32, data: &[byte]) bool {
     var off: usize = 0;
     while off < data.len {
@@ -53,7 +73,22 @@ export fn uplink_request(ip: &[byte], port: u16, method: &[byte], path: &[byte],
     if ip.len == 0 || port == 0 {
         return error.UplinkFailed;
     }
-    const fd: i32 = tcpx_connect_v4(ip, port, timeout_ms) catch {
+    // 同步阻塞建连：事件循环里不能用 tcpx_connect_v4（其 block_on 只空转，
+    // 等不到 connect 完成，会一直拿到 AsyncDeadlineExceeded）。
+    const fd: i32 = sys_socket(2 as i32, 1 as i32, 6 as i32) catch {
+        return error.UplinkFailed;
+    };
+    // ip 是点分文本（如 "127.0.0.1"），tcpx_sockaddr_v4 要的是 4 字节二进制。
+    var b4: [byte: 4] = [0: 4];
+    if !dnsx_parse_ipv4(ip, &b4[0]) {
+        _ = sys_close(fd) catch {};
+        return error.UplinkFailed;
+    }
+    var saddr: [byte: 16] = [0: 16];
+    tcpx_sockaddr_v4(&b4[0], port, &saddr[0]);
+    const cr: !i32 = sys_connect(fd, &saddr[0] as *void, 16 as u32);
+    _ = cr catch |_| {
+        _ = sys_close(fd) catch {};
         return error.UplinkFailed;
     };
     defer { tcpx_close(fd); }
@@ -64,57 +99,106 @@ export fn uplink_request(ip: &[byte], port: u16, method: &[byte], path: &[byte],
     if flags != 0 {
         _ = sys_fcntl(fd, 4, flags & (0 -% 2049)) catch {};
     }
-    var req: Buf = buf_new(2048 +% body.len);
-    defer { buf_free(&req); }
-    if !buf_valid(&req) {
-        return error.UplinkFailed;
-    }
-    if !buf_append_slice(&req, method) {
-        return error.UplinkFailed;
-    }
-    if !buf_append_cstr(&req, " " as &const byte) {
-        return error.UplinkFailed;
-    }
-    if !buf_append_slice(&req, path) {
-        return error.UplinkFailed;
-    }
-    if !buf_append_cstr(&req, " HTTP/1.1\r\nHost: " as &const byte) {
-        return error.UplinkFailed;
-    }
-    if !buf_append_slice(&req, ip) {
-        return error.UplinkFailed;
-    }
-    if !buf_append_cstr(&req, "\r\nContent-Type: application/json\r\nContent-Length: " as &const byte) {
-        return error.UplinkFailed;
-    }
-    if !buf_append_u64(&req, body.len as u64) {
-        return error.UplinkFailed;
-    }
-    if !buf_append_cstr(&req, "\r\nConnection: close\r\n\r\n" as &const byte) {
-        return error.UplinkFailed;
-    }
-    if body.len > 0 && !buf_append_slice(&req, body) {
-        return error.UplinkFailed;
-    }
-    if !up_send_all(fd, req.ptr[0: req.len]) {
-        return error.UplinkFailed;
-    }
-    var resp: [byte: 16384] = [0: 16384];
+    var req: [byte: 4096] = [0: 4096];
     var rn: usize = 0;
-    while rn < 16384 {
-        const r: !isize = sys_read(fd, &resp[rn], 16384 - rn);
+    if !up_put(&req[0], 4096, &rn, method) {
+        return error.UplinkFailed;
+    }
+    if !up_put(&req[0], 4096, &rn, &" "[0: 1]) {
+        return error.UplinkFailed;
+    }
+    if !up_put(&req[0], 4096, &rn, path) {
+        return error.UplinkFailed;
+    }
+    if !up_put(&req[0], 4096, &rn, &" HTTP/1.1\r\nHost: "[0: 17]) {
+        return error.UplinkFailed;
+    }
+    if !up_put(&req[0], 4096, &rn, ip) {
+        return error.UplinkFailed;
+    }
+    if !up_put(&req[0], 4096, &rn, &"\r\nContent-Type: application/json\r\nContent-Length: "[0: 50]) {
+        return error.UplinkFailed;
+    }
+    var num: [byte: 24] = [0: 24];
+    var nn: usize = 0;
+    var v: u64 = body.len as u64;
+    if v == 0 {
+        num[0] = 48;
+        nn = 1;
+    } else {
+        while v > 0 && nn < 24 {
+            num[nn] = (48 +% (v % (10 as u64))) as byte;
+            v = v / (10 as u64);
+            nn = nn + 1;
+        }
+    }
+    while nn > 0 {
+        nn = nn - 1;
+        var one: [byte: 1] = [0: 1];
+        one[0] = num[nn];
+        if !up_put(&req[0], 4096, &rn, one[0: 1]) {
+            return error.UplinkFailed;
+        }
+    }
+    if !up_put(&req[0], 4096, &rn, &"\r\nConnection: close\r\n\r\n"[0: 23]) {
+        return error.UplinkFailed;
+    }
+    if body.len > 0 && !up_put(&req[0], 4096, &rn, body) {
+        return error.UplinkFailed;
+    }
+    if !up_send_all(fd, req[0: rn]) {
+        return error.UplinkFailed;
+    }
+    // 接收超时兜底（服务端未及时关连接时不至于永久阻塞）。
+    var tv: UpTimeval = UpTimeval{ tv_sec: 2, tv_usec: 0 };
+    _ = sys_setsockopt(fd, 1, 20, &tv as *void, 16) catch {};
+    var resp: [byte: 16384] = [0: 16384];
+    var got: usize = 0;
+    var header_end: usize = 0;
+    var cl: usize = 0;
+    var have_cl: bool = false;
+    while got < 16384 {
+        const r: !isize = sys_read(fd, &resp[got], 16384 - got);
         const n: isize = r catch |_| {
             break;
         };
         if n <= 0 {
             break;
         }
-        rn = rn +% (n as usize);
+        got = got +% (n as usize);
+        if header_end == 0 {
+            const he: usize = up_find(resp[0: got], &"\r\n\r\n"[0: 4], 0);
+            if he < got {
+                header_end = he + 4;
+                const ci: usize = up_find(resp[0: he], &"Content-Length: "[0: 16], 0);
+                if ci + 16 < he {
+                    var cv: usize = 0;
+                    var k: usize = ci + 16;
+                    var dg: usize = 0;
+                    while k < he && k < 16384 {
+                        const c: byte = resp[k];
+                        if c < ('0' as byte) || c > ('9' as byte) {
+                            break;
+                        }
+                        cv = cv *% 10 +% ((c as usize) -% 48);
+                        dg = dg + 1;
+                        k = k + 1;
+                    }
+                    if dg > 0 {
+                        cl = cv;
+                        have_cl = true;
+                    }
+                }
+            }
+        }
+        if header_end > 0 && have_cl && got >= header_end +% cl {
+            break;
+        }
     }
-    if rn == 0 {
+    if got == 0 {
         return error.UplinkFailed;
     }
-    const all: &[byte] = resp[0: rn];
+    const all: &[byte] = resp[0: got];
     // 状态行 HTTP/1.1 200 OK
     const sp: usize = up_find(all, &" "[0: 1], 0);
     if sp >= all.len {

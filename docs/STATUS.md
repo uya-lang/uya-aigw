@@ -41,6 +41,12 @@
 - C4（进行中）：Playground（流式指标）+ 账单预算（schema v8、`/v1/budget`）已落地；
   通知待做。
 - C5（进行中）：`/admin` 页 + `/admin/users`、`/admin/providers` 已落地；改价/绑定/审计待做。
+- B2（已修复）：uplink 之前其实从未成功（`tcpx_connect_v4` 在事件循环里只空转、点分 IP 未解析、
+  请求用了非 NUL 结尾的 cstr 追加）；已改为阻塞 socket/connect + `dnsx_parse_ipv4` + 固定缓冲，
+  `make cluster-e2e` 用独立 node id 验证注册。
+- B4（进行中）：edge 路由核心 + `GET /edge/route`、`/edge/fail` 已落地；HTTP/SSE 代理与 1k 并发待做。
+- B6（进行中）：`tests/cluster_e2e.sh`（1 controller + 3 node、epoch/fencing、edge 路由/亲和、
+  drain 迁移、ingest 幂等）已全绿；nginx 反代与部署脚本待做。
 - C6（进行中）：CSP/nosniff/Referrer-Policy/XFO 安全头 + `make ui-e2e` 已落地；
   API 全 Bearer、无 Cookie，故 CSRF 面为零（不做双提交 token）。
 - B4（进行中）：edge 路由核心（slug 归属 + session 亲和 + 失败清缓存，11 断言）；
@@ -84,6 +90,12 @@
 - C4（进行中）：Playground（流式指标）+ 账单预算（schema v8、`/v1/budget`）已落地；
   通知待做。
 - C5（进行中）：`/admin` 页 + `/admin/users`、`/admin/providers` 已落地；改价/绑定/审计待做。
+- B2（已修复）：uplink 之前其实从未成功（`tcpx_connect_v4` 在事件循环里只空转、点分 IP 未解析、
+  请求用了非 NUL 结尾的 cstr 追加）；已改为阻塞 socket/connect + `dnsx_parse_ipv4` + 固定缓冲，
+  `make cluster-e2e` 用独立 node id 验证注册。
+- B4（进行中）：edge 路由核心 + `GET /edge/route`、`/edge/fail` 已落地；HTTP/SSE 代理与 1k 并发待做。
+- B6（进行中）：`tests/cluster_e2e.sh`（1 controller + 3 node、epoch/fencing、edge 路由/亲和、
+  drain 迁移、ingest 幂等）已全绿；nginx 反代与部署脚本待做。
 - C6（进行中）：CSP/nosniff/Referrer-Policy/XFO 安全头 + `make ui-e2e` 已落地；
   API 全 Bearer、无 Cookie，故 CSRF 面为零（不做双提交 token）。
 - B4（进行中）：edge 路由核心（slug 归属 + session 亲和 + 失败清缓存，11 断言）；
