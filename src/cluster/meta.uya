@@ -420,3 +420,40 @@ export fn meta_clear_node(d: &Db, node_id: &[byte]) !i64 {
     }
     return dbx_changes(d) as i64;
 }
+
+/// 自动再平衡：先标 stale，再把 stale 节点的 slug 迁到首个 active 节点（提升其 epoch）。
+/// 返回迁移条数。没有 active 目标时返回 0。
+export fn meta_rebalance(d: &Db, now: i64, ttl: i64) !i64 {
+    _ = try meta_node_expire(d, now, ttl);
+    var tgt: [byte: 64] = [0: 64];
+    var tn: usize = 0;
+    var ts: DbStmt = dbx_prepare(d,
+        "select id from meta_nodes where status = 'active' order by id limit 1" as &const byte) catch {
+        return error.MetaFailed;
+    };
+    if dbx_step(&ts) == 1 {
+        tn = dbx_col_text(&ts, 0, &tgt[0], 64);
+    }
+    dbx_finalize(&ts);
+    if tn == 0 {
+        return 0 as i64;
+    }
+    const cur: i64 = try meta_epoch_bump(d, tgt[0: tn], now);
+    var st: DbStmt = dbx_prepare(d,
+        "select id from meta_nodes where status = 'stale' order by id" as &const byte) catch {
+        return error.MetaFailed;
+    };
+    var moved: i64 = 0;
+    while dbx_step(&st) == 1 {
+        var from: [byte: 64] = [0: 64];
+        const idn: usize = dbx_col_text(&st, 0, &from[0], 64);
+        if idn > 0 {
+            const n: i64 = meta_reassign_all(d, from[0: idn], tgt[0: tn], cur, now) catch {
+                0 as i64;
+            };
+            moved = moved +% n;
+        }
+    }
+    dbx_finalize(&st);
+    return moved;
+}

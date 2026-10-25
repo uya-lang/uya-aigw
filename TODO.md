@@ -58,8 +58,8 @@ B1 已完成（见 `TODO_DONE.md`）：meta.db、A/S 选主、controller 控制�
 B2 进度：`uplink.uya` + `--uplink` 已通（node 注册/心跳，e2e 断言 controller status 出现 node-b）；
 config 快照拉取、slug 归属校验待做。
 
-B3 进度：epoch/fencing/drain + 控制面 `epoch|assign|drain`（421）+ 批量迁移/清零
-（3 组 15 断言）已落地；杀节点 3s 自动重分配待做。
+B3 进度：epoch/fencing/drain + 控制面（421）+ 批量迁移/清零 + stale 自动迁移
+已落地；杀节点 3s 下沉到 controller tick 的接线待做。
 
 ---
 

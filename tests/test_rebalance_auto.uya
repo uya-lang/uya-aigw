@@ -1,0 +1,49 @@
+// tests/test_rebalance_auto.uya — B3 stale 节点自动迁移
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_i64;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+const T0: i64 = 1700000000;
+
+fn open_meta(d: &Db) !void {
+    try meta_open(d, &":memory:"[0: 8]);
+}
+
+fn eq(a: &[byte], b: &[byte]) bool {
+    if a.len != b.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < a.len {
+        if a[i] != b[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn test_auto() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_meta(&d);
+    try meta_node_register(&d, &"a"[0: 1], &"edge"[0: 4], &"127.0.0.1:1"[0: 11], T0);
+    try meta_node_register(&d, &"b"[0: 1], &"edge"[0: 4], &"127.0.0.1:2"[0: 11], T0);
+    try meta_node_heartbeat(&d, &"b"[0: 1], T0 +% 100);
+    try assert_eq_i64(try meta_epoch_bump(&d, &"a"[0: 1], T0), 1);
+    try meta_assign(&d, &"s1"[0: 2], &"a"[0: 1], 1, T0);
+    try meta_assign(&d, &"s2"[0: 2], &"a"[0: 1], 1, T0);
+    // a 超时 → stale；b 仍 active
+    try assert_eq_i64(try meta_rebalance(&d, T0 +% 100, 50), 2);
+    try assert_eq_i64(try meta_assign_count(&d, &"a"[0: 1]), 0);
+    try assert_eq_i64(try meta_assign_count(&d, &"b"[0: 1]), 2);
+    var nb: [byte: 16] = [0: 16];
+    var ep: i64 = 0;
+    var n: usize = try meta_assign_get(&d, &"s1"[0: 2], &nb[0], 16, &ep);
+    try assert_eq_bool(eq(nb[0: n], &"b"[0: 1]), true);
+    // 再跑一次没有可迁移的
+    try assert_eq_i64(try meta_rebalance(&d, T0 +% 100, 50), 0);
+}
+
+test "auto" { run_test("auto", test_auto); }
