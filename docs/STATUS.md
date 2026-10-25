@@ -54,7 +54,12 @@
 2. Phase A：A0 SQLite+money spike、A1 事件循环、A2 schema/认证/备份/journal、A3 插件池、A4 chat … A9 文档/e2e
 3. Phase B：controller/node/edge、lease/epoch、ingest/journal
 4. Phase C：用户端/管理端后台
-5. A4 拆解：① `src/core/json.uya`（有界 DOM 解析 + 字符串转义/构造）；
+5. A4 剩余接线（下轮直接做）：serve 持有 `HtcCtx`（`--ca <pem>` 读入 bundle，
+   默认 `TLSX_MODE_CHAIN`），`ChatPlan → HttppConfig` 映射（host/port/auth_type/secret），
+   收到完整 body 后 `upstream_post` → 成功则 `chat_settle` → 原样回上游 JSON；
+   `stream=true` 时用 `htc_next_event_async` 逐事件 `hsrv_chunk` 透传并在 `[DONE]` 收尾；
+   e2e 复用 `tests/provider_spike.sh` 的 TLS mock（root/inter/leaf）造 `/v1/chat/completions`。
+6. A4 拆解（历史）：① `src/core/json.uya`（有界 DOM 解析 + 字符串转义/构造）；
    ② schema v4 `providers`（base_url/host/port/auth/secret/超时/启用）与 store CRUD；
    ③ `POST /v1/chat/completions`：Bearer 鉴权 → `htc_open_async` 上游 → usage 解析 →
    `price_quote` → `usage_ledger` + `journal_append`；④ SSE 透传与 `[DONE]` 对齐。
