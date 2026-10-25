@@ -82,6 +82,7 @@ const SRV_JSON_501: &[byte] = &"{\"error\":\"chat not implemented\"}"[0: 32];
 const SRV_JSON_401: &[byte] = &"{\"error\":\"unauthorized\"}"[0: 24];
 const SRV_JSON_413: &[byte] = &"{\"error\":\"payload too large\"}"[0: 29];
 const SRV_JSON_503: &[byte] = &"{\"error\":\"service unavailable\"}"[0: 31];
+const SRV_JSON_502: &[byte] = &"{\"error\":\"upstream failed\"}"[0: 27];
 const SRV_CTYPE_JSON: &[byte] = &"application/json"[0: 16];
 const SRV_CTYPE_SSE: &[byte] = &"text/event-stream"[0: 17];
 const SRV_SSE_LINE: &[byte] = &"data: {}\n\n"[0: 10];
@@ -132,6 +133,39 @@ struct SrvConn {
 }
 
 var g_conns: [SrvConn: SRV_MAX_CONNS] = [];
+/// A4 上游 TLS 上下文（serve 启动时初始化；bundle 由 --ca 注入）。
+var g_up_ctx: HtcCtx = HtcCtx{};
+
+/// 读 PEM CA bundle 到上游上下文；文件缺失/过大返回 false（不阻塞启动）。
+fn srv_load_ca(path: &[byte]) bool {
+    if path.len == 0 || path.len >= 512 {
+        return false;
+    }
+    var p: [byte: 512] = [0: 512];
+    var i: usize = 0;
+    while i < path.len {
+        p[i] = path[i];
+        i = i + 1;
+    }
+    p[i] = 0 as byte;
+    const fd: i32 = sys_open(&p[0] as *const byte, 0 as i32, 0) catch {
+        return false;
+    };
+    defer { _ = sys_close(fd) catch {}; }
+    var off: usize = 0;
+    while off < HTC_BUNDLE_MAX {
+        const r: !isize = sys_read(fd, &g_up_ctx.bundle[off], HTC_BUNDLE_MAX - off);
+        const n: isize = r catch {
+            return false;
+        };
+        if n <= 0 {
+            break;
+        }
+        off = off +% (n as usize);
+    }
+    g_up_ctx.bundle_len = off;
+    return off > 0;
+}
 var g_stop: i32 = 0;
 var g_listen_fd: i32 = 0 - 1;
 var g_epfd: i32 = 0 - 1;
@@ -478,7 +512,45 @@ fn srv_chat(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 400, SRV_JSON_400, keep);
         return;
     };
-    srv_static(c, 501, SRV_JSON_501, keep);
+    if plan.stream {
+        srv_static(c, 501, SRV_JSON_501, keep);
+        return;
+    }
+    var cfg: HttppConfig = httpp_empty();
+    if !upstream_config(&plan.host[0], plan.host_len, plan.port, plan.auth_type,
+        &plan.secret[0], plan.secret_len, &cfg) {
+        srv_static(c, 400, SRV_JSON_400, keep);
+        return;
+    }
+    var resp: [byte: 8192] = [0: 8192];
+    var st: i32 = 0;
+    var rn: usize = 0;
+    const nowu: u64 = srv_now_ms();
+    upstream_post(&g_up_ctx, &cfg, plan.path[0: plan.path_len],
+        plan.payload[0: plan.payload_len], nowu, nowu +% 60000,
+        &resp[0], 8192, &st, &rn) catch {
+        srv_static(c, 502, SRV_JSON_502, keep);
+        return;
+    };
+    if st != 200 {
+        srv_static(c, st, resp[0: rn], keep);
+        return;
+    }
+    var rid: [byte: 32] = [0: 32];
+    var ridn: usize = 0;
+    ridn = store_new_slug(&rid[0], 32) catch {
+        srv_static(c, 502, SRV_JSON_502, keep);
+        return;
+    };
+    var settle: BillingResult = BillingResult{ cost_nano: 0, price_nano: 0, rate_version: 0, duplicate: false, found: false };
+    var dirbuf: [byte: 256] = [0: 256];
+    const dn: usize = runtime_dir_copy(&dirbuf[0], 256);
+    chat_settle(runtime_db(), dirbuf[0: dn], rid[0: ridn], key.user_id, store_now(), 0,
+        &plan, resp[0: rn], &settle) catch {
+        srv_static(c, 502, SRV_JSON_502, keep);
+        return;
+    };
+    srv_static(c, st, resp[0: rn], keep);
 }
 
 /// 按解析出来的路由号出响应。

@@ -28,18 +28,24 @@ fn arg_u16(p: &byte) u16 {
 }
 
 fn usage() i32 {
-    printf("usage:\n  aigw serve [--host 0.0.0.0] [--port 8080] [--db data/aigw.db] [--data-dir data]\n  aigw tls probe <host> [--port N] [--ca <pem>]\n  aigw tls pin <host> <sha256hex> [--file <tsv>]\n" as *byte);
+    printf("usage:\n  aigw serve [--host 0.0.0.0] [--port 8080] [--db data/aigw.db] [--data-dir data] [--ca <pem>]\n  aigw tls probe <host> [--port N] [--ca <pem>]\n  aigw tls pin <host> <sha256hex> [--file <tsv>]\n" as *byte);
     return 2;
 }
 
 /// `aigw serve`：打开数据库（迁移 + journal 重放 + 每日备份）、起服务、跑单线程 epoll。
 /// `--port 0` 让内核挑端口（回归脚本靠这条读取真实端口）。
-fn serve_main(host: &[byte], port: u16, db_path: &[byte], data_dir: &[byte]) i32 {
+fn serve_main(host: &[byte], port: u16, db_path: &[byte], data_dir: &[byte],
+    ca_path: &[byte]) i32 {
     runtime_setup(db_path, data_dir) catch |_| {
         printf("runtime init failed\n" as *byte);
         return 1;
     };
     defer { runtime_shutdown(); }
+    htc_ctx_init(&g_up_ctx, TLSX_MODE_CHAIN);
+    g_up_ctx.allow_private = true;
+    if ca_path.len > 0 {
+        _ = srv_load_ca(ca_path);
+    }
     const lfd: i32 = serve_listen(host, port) catch |_| {
         printf("listen failed\n" as *byte);
         return 1;
@@ -94,6 +100,8 @@ export fn main() i32 {
         dbf[10] = 'd';
         dbf[11] = 'b';
         var dblen: usize = 12;
+        var ca: [byte: 512] = [0: 512];
+        var calen: usize = 0;
         var dat: [byte: 512] = [0: 512];
         dat[0] = 'd';
         dat[1] = 'a';
@@ -115,6 +123,14 @@ export fn main() i32 {
                     m = m + 1;
                 }
                 host_len = m;
+            } else if arg_eq(f, "--ca" as &const byte) {
+                const vn: usize = arg_len(v);
+                var m: usize = 0;
+                while m < vn && m < 512 {
+                    ca[m] = v[m];
+                    m = m + 1;
+                }
+                calen = m;
             } else if arg_eq(f, "--db" as &const byte) {
                 const vn: usize = arg_len(v);
                 var m: usize = 0;
@@ -134,7 +150,7 @@ export fn main() i32 {
             }
             k = k + 2;
         }
-        return serve_main(host[0: host_len], port, dbf[0: dblen], dat[0: datlen]);
+        return serve_main(host[0: host_len], port, dbf[0: dblen], dat[0: datlen], ca[0: calen]);
     }
 
     if argc < 4 {

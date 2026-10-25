@@ -77,6 +77,11 @@ export fn runtime_db() &Db {
     return &g_db;
 }
 
+/// 拷贝当前数据目录（serve 等模块级调用方需要局部缓冲时用）。
+export fn runtime_dir_copy(out: &byte, cap: usize) usize {
+    return rt_dir_copy(out, cap);
+}
+
 /// 把模块级目录缓冲拷到局部（Uya 0.11 不能直接对模块级数组做运行时切片）。
 fn rt_dir_copy(out: &byte, cap: usize) usize {
     var i: usize = 0;
