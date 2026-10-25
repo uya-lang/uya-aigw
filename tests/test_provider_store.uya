@@ -60,6 +60,8 @@ fn test_create_and_find() !void {
     try assert_eq_i32(p.port, 18080);
     try assert_eq_i32(p.auth_type, 1);
     try assert_eq_i32(p.timeout_ms, 60000);
+    try assert_eq_i32(p.priority, 100);
+    try assert_eq_i32(p.weight, 1);
     try assert_eq_bool(eq(p.name[0: p.name_len], &"mock"[0: 4]), true);
     try assert_eq_bool(eq(p.kind[0: p.kind_len], &"openai"[0: 6]), true);
     try assert_eq_bool(eq(p.scheme[0: p.scheme_len], &"https"[0: 5]), true);
@@ -99,6 +101,10 @@ fn test_auth_and_disable() !void {
     try store_provider_set_enabled(&d, p.id, false, T0 + 2);
     try store_provider_get(&d, p.id, &g);
     try assert_eq_bool(g.enabled, false);
+    try store_provider_set_priority(&d, p.id, 10, 3, T0 + 2);
+    try store_provider_get(&d, p.id, &g);
+    try assert_eq_i32(g.priority, 10);
+    try assert_eq_i32(g.weight, 3);
 
     var missing: bool = false;
     _ = store_provider_set_enabled(&d, 999, false, T0 + 3) catch |_| {

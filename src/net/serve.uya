@@ -544,13 +544,16 @@ fn srv_chat_stream(c: &SrvConn, plan: &ChatPlan, cfg: &const HttppConfig, nowu: 
     const o: !i32 = block_on<i32>(htc_open_async(cfg, &g_up_ctx, &"POST"[0: 4],
         plan.path[0: plan.path_len], plan.payload[0: plan.payload_len], true, nowu, deadline, &call));
     const orc: i32 = o catch |_| {
+        lb_report(plan.provider_id, false, store_now());
         srv_static(c, 502, SRV_JSON_502, c.keep);
         return;
     };
     if orc != 0 {
+        lb_report(plan.provider_id, false, store_now());
         srv_static(c, 502, SRV_JSON_502, c.keep);
         return;
     }
+    lb_report(plan.provider_id, true, store_now());
     // 临时阻塞发送：SSE 期间不参与 epoll 写事件
     const fl: !i32 = sys_fcntl(c.fd, 3, 0);
     const flags: i32 = fl catch {
@@ -869,52 +872,72 @@ fn srv_chat(c: &SrvConn, stats: &ServeStats) void {
         return;
     };
     var plan: ChatPlan = ChatPlan{};
-    chat_prepare_span(runtime_db(), &c.body[0], c.body_len, store_now(), &plan) catch {
+    chat_prepare_span_session(runtime_db(), &c.body[0], c.body_len, tok[0: tn],
+        store_now(), &plan) catch {
         srv_static(c, 400, SRV_JSON_400, keep);
         return;
     };
-    var cfg: HttppConfig = httpp_empty();
-    if !upstream_config(&plan.host[0], plan.host_len, plan.port, plan.auth_type,
-        &plan.secret[0], plan.secret_len, &cfg) {
-        srv_static(c, 400, SRV_JSON_400, keep);
-        return;
-    }
-    const nowu: u64 = now_ms() catch {
-        srv_static(c, 502, SRV_JSON_502, keep);
-        return;
-    };
-    if plan.stream {
-        srv_chat_stream(c, &plan, &cfg, nowu, key.user_id);
-        return;
-    }
-    var resp: [byte: 8192] = [0: 8192];
-    var st: i32 = 0;
-    var rn: usize = 0;
-    upstream_post(&g_up_ctx, &cfg, plan.path[0: plan.path_len],
-        plan.payload[0: plan.payload_len], nowu, nowu +% 60000,
-        &resp[0], 8192, &st, &rn) catch {
-        srv_static(c, 502, SRV_JSON_502, keep);
-        return;
-    };
-    if st != 200 {
+    var attempts: i32 = 0;
+    while true {
+        var cfg: HttppConfig = httpp_empty();
+        if !upstream_config(&plan.host[0], plan.host_len, plan.port, plan.auth_type,
+            &plan.secret[0], plan.secret_len, &cfg) {
+            srv_static(c, 400, SRV_JSON_400, keep);
+            return;
+        }
+        const nowu: u64 = now_ms() catch {
+            srv_static(c, 502, SRV_JSON_502, keep);
+            return;
+        };
+        if plan.stream {
+            srv_chat_stream(c, &plan, &cfg, nowu, key.user_id);
+            return;
+        }
+        var resp: [byte: 8192] = [0: 8192];
+        var st: i32 = 0;
+        var rn: usize = 0;
+        var failed: bool = false;
+        upstream_post(&g_up_ctx, &cfg, plan.path[0: plan.path_len],
+            plan.payload[0: plan.payload_len], nowu, nowu +% 60000,
+            &resp[0], 8192, &st, &rn) catch {
+            failed = true;
+        };
+        if failed {
+            lb_report(plan.provider_id, false, store_now());
+            attempts = attempts +% 1;
+            if attempts >= 3 {
+                srv_static(c, 502, SRV_JSON_502, keep);
+                return;
+            }
+            chat_prepare_span_session(runtime_db(), &c.body[0], c.body_len, tok[0: tn],
+                store_now(), &plan) catch {
+                srv_static(c, 502, SRV_JSON_502, keep);
+                return;
+            };
+            continue;
+        }
+        lb_report(plan.provider_id, true, store_now());
+        if st != 200 {
+            srv_static(c, st, resp[0: rn], keep);
+            return;
+        }
+        var rid: [byte: 32] = [0: 32];
+        var ridn: usize = 0;
+        ridn = store_new_slug(&rid[0], 32) catch {
+            srv_static(c, 502, SRV_JSON_502, keep);
+            return;
+        };
+        var settle: BillingResult = BillingResult{ cost_nano: 0, price_nano: 0, rate_version: 0, duplicate: false, found: false };
+        var dirbuf: [byte: 256] = [0: 256];
+        const dn: usize = runtime_dir_copy(&dirbuf[0], 256);
+        chat_settle(runtime_db(), dirbuf[0: dn], rid[0: ridn], key.user_id, store_now(), 0,
+            &plan, resp[0: rn], &settle) catch {
+            srv_static(c, 502, SRV_JSON_502, keep);
+            return;
+        };
         srv_static(c, st, resp[0: rn], keep);
         return;
     }
-    var rid: [byte: 32] = [0: 32];
-    var ridn: usize = 0;
-    ridn = store_new_slug(&rid[0], 32) catch {
-        srv_static(c, 502, SRV_JSON_502, keep);
-        return;
-    };
-    var settle: BillingResult = BillingResult{ cost_nano: 0, price_nano: 0, rate_version: 0, duplicate: false, found: false };
-    var dirbuf: [byte: 256] = [0: 256];
-    const dn: usize = runtime_dir_copy(&dirbuf[0], 256);
-    chat_settle(runtime_db(), dirbuf[0: dn], rid[0: ridn], key.user_id, store_now(), 0,
-        &plan, resp[0: rn], &settle) catch {
-        srv_static(c, 502, SRV_JSON_502, keep);
-        return;
-    };
-    srv_static(c, st, resp[0: rn], keep);
 }
 
 /// 按解析出来的路由号出响应。

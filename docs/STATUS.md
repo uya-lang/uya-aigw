@@ -30,6 +30,8 @@
   `/v1/auth/login`、`/v1/keys`、`/v1/me`，e2e 用 HTTP 拿 Key 调 chat。
 - A6（已落地）：`usage_daily` 汇总 + `rollup` 重建/查询；billing 实时 upsert；
   `/v1/usage`（data+totals 含 profit）与 `/v1/models`；chat e2e 断言 models/usage/profit。
+- A8（进行中）：schema v6 priority/weight + `lb.uya`（优先级/加权/会话亲和/熔断），
+  serve 失败自动换 provider 重试；插件级重绑待接。
 - A5/A7 待做：responses 与 管理 REST/MCP。
 - A4（进行中）：`src/core/json.uya` 有界 JSON DOM + 构造器（44 断言）；
   schema v4 `providers`/`provider_models` + store CRUD/路由（33 断言）；

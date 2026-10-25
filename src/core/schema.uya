@@ -6,6 +6,7 @@
 //   v2 → v3：用量账本（usage_ledger，request_id 幂等）
 //   v3 → v4：供应商与模型路由（providers / provider_models）
 //   v4 → v5：用量汇总（usage_daily，按天/用户/模型/供应商/时段）
+//   v5 → v6：供应商优先级/权重（A8 负载均衡）
 //
 // 约定：
 //   * 迁移**幂等**：重复执行到同一版本不产生副作用（`create table if not exists`）。
@@ -15,7 +16,7 @@
 //
 // 打开流程（`schema_open`）：open → pragmas → migrate。热路径不该调它。
 
-export const SCHEMA_VERSION: i32 = 5;
+export const SCHEMA_VERSION: i32 = 6;
 
 export error SchemaFailed;
 
@@ -124,6 +125,15 @@ fn schema_v5(d: &Db) !void {
 }
 
 // ---------------------------------------------------------------
+// v6：供应商优先级/权重（A8）
+// ---------------------------------------------------------------
+
+fn schema_v6(d: &Db) !void {
+    _ = dbx_exec_cstr(d, "alter table providers add column priority integer not null default 100" as &const byte) catch {};
+    _ = dbx_exec_cstr(d, "alter table providers add column weight integer not null default 1" as &const byte) catch {};
+}
+
+// ---------------------------------------------------------------
 // 版本号写回
 // ---------------------------------------------------------------
 
@@ -202,6 +212,11 @@ export fn schema_migrate(d: &Db) !i32 {
             applied = true;
         } else if cur == 4 {
             schema_v5(d) catch |_| {
+                failed = true;
+            };
+            applied = true;
+        } else if cur == 5 {
+            schema_v6(d) catch |_| {
                 failed = true;
             };
             applied = true;

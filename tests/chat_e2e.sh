@@ -93,7 +93,7 @@ UYA_ROOT="$UYA_ROOT" "$UYA" build \
   src/core/money.uya src/core/reqlog.uya src/core/dbx.uya src/net/rsav.uya \
   src/core/schema.uya src/core/store.uya src/core/backup.uya src/core/journal.uya \
   src/core/runtime.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/rollup.uya \
-  src/core/billing.uya src/core/chat.uya src/providers/upstream.uya \
+  src/core/billing.uya src/core/lb.uya src/core/chat.uya src/providers/upstream.uya \
   src/providers/upstream_cfg.uya \
   src/net/x509min.uya src/net/chainx.uya src/net/urlx.uya src/net/dnsx.uya \
   src/net/tlsx.uya src/net/tlsx_conn.uya src/net/httpc.uya src/net/ssex.uya \

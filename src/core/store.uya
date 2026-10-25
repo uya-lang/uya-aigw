@@ -65,6 +65,8 @@ export struct StoreProvider {
     auth_type: i32,
     timeout_ms: i32,
     enabled: bool,
+    priority: i32,
+    weight: i32,
     found: bool,
     name: [byte: STORE_PROVIDER_NAME_MAX],
     name_len: usize,
@@ -589,6 +591,8 @@ export fn store_provider_zero(out: &StoreProvider) void {
     out.auth_type = 0;
     out.timeout_ms = 0;
     out.enabled = false;
+    out.priority = 0;
+    out.weight = 0;
     out.found = false;
     out.name_len = 0;
     out.kind_len = 0;
@@ -613,11 +617,13 @@ fn store_provider_fill(st: &DbStmt, out: &StoreProvider) void {
     out.secret_len = dbx_col_text(st, 9, &out.secret[0], STORE_PROVIDER_SECRET_MAX);
     out.timeout_ms = dbx_col_i64(st, 10) as i32;
     out.enabled = dbx_col_i64(st, 11) != 0;
+    out.priority = dbx_col_i64(st, 12) as i32;
+    out.weight = dbx_col_i64(st, 13) as i32;
     out.found = true;
 }
 
 const STORE_PROVIDER_COLS: &const byte =
-    "select id, name, kind, scheme, host, port, base_path, auth_type, auth_name, secret, timeout_ms, enabled from providers where id = ?" as &const byte;
+    "select id, name, kind, scheme, host, port, base_path, auth_type, auth_name, secret, timeout_ms, enabled, priority, weight from providers where id = ?" as &const byte;
 
 /// 建供应商（默认 openai/https/443/bearer/60s/enabled）。
 export fn store_provider_create(d: &Db, name: &[byte], host: &[byte], port: i32,
@@ -678,7 +684,7 @@ export fn store_provider_get(d: &Db, id: i64, out: &StoreProvider) !void {
 export fn store_provider_find(d: &Db, name: &[byte], out: &StoreProvider) !void {
     store_provider_zero(out);
     var st: DbStmt = dbx_prepare(d,
-        "select id, name, kind, scheme, host, port, base_path, auth_type, auth_name, secret, timeout_ms, enabled from providers where name = ?" as &const byte) catch {
+        "select id, name, kind, scheme, host, port, base_path, auth_type, auth_name, secret, timeout_ms, enabled, priority, weight from providers where name = ?" as &const byte) catch {
         return error.StoreFailed;
     };
     defer { dbx_finalize(&st); }
@@ -725,6 +731,26 @@ export fn store_provider_set_auth(d: &Db, id: i64, auth_type: i32,
     if dbx_changes(d) == 0 {
         return error.ProviderNotFound;
     }
+    return;
+}
+
+/// 设置优先级（越小越优先）与权重（0 = 不参与分摊）。
+export fn store_provider_set_priority(d: &Db, id: i64, priority: i32, weight: i32,
+    now: i64) !void {
+    if priority < 0 || weight < 0 || weight > 1000 {
+        return error.StoreFailed;
+    }
+    var st: DbStmt = dbx_prepare(d,
+        "update providers set priority = ?, weight = ?, updated_at = ? where id = ?" as &const byte) catch {
+        return error.StoreFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_i64(&st, 1, priority as i64) catch { return error.StoreFailed; };
+    dbx_bind_i64(&st, 2, weight as i64) catch { return error.StoreFailed; };
+    dbx_bind_i64(&st, 3, now) catch { return error.StoreFailed; };
+    dbx_bind_i64(&st, 4, id) catch { return error.StoreFailed; };
+    if dbx_step(&st) != 0 { return error.StoreFailed; }
+    if dbx_changes(d) == 0 { return error.ProviderNotFound; }
     return;
 }
 
@@ -794,7 +820,7 @@ export fn store_provider_route(d: &Db, model: &[byte], out: &StoreProvider,
     upstream_len[0] = 0;
     store_provider_zero(out);
     var st: DbStmt = dbx_prepare(d,
-        "select p.id, p.name, p.kind, p.scheme, p.host, p.port, p.base_path, p.auth_type, p.auth_name, p.secret, p.timeout_ms, p.enabled, m.upstream_model from provider_models m join providers p on p.id = m.provider_id where m.model = ? and p.enabled = 1 order by p.id limit 1" as &const byte) catch {
+        "select p.id, p.name, p.kind, p.scheme, p.host, p.port, p.base_path, p.auth_type, p.auth_name, p.secret, p.timeout_ms, p.enabled, p.priority, p.weight, m.upstream_model from provider_models m join providers p on p.id = m.provider_id where m.model = ? and p.enabled = 1 order by p.id limit 1" as &const byte) catch {
         return error.StoreFailed;
     };
     defer { dbx_finalize(&st); }
@@ -805,6 +831,27 @@ export fn store_provider_route(d: &Db, model: &[byte], out: &StoreProvider,
         return false;
     }
     store_provider_fill(&st, out);
-    upstream_len[0] = dbx_col_text(&st, 12, upstream_out, cap);
+    upstream_len[0] = dbx_col_text(&st, 14, upstream_out, cap);
     return true;
+}
+
+/// 取某 provider 下某个对外模型的上游模型名（A8 选择后使用）。
+export fn store_provider_upstream(d: &Db, provider_id: i64, model: &[byte],
+    out: &byte, cap: usize, out_len: &usize) !void {
+    var st: DbStmt = dbx_prepare(d,
+        "select upstream_model from provider_models where provider_id = ? and model = ?" as &const byte) catch {
+        return error.StoreFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_i64(&st, 1, provider_id) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_text(&st, 2, model) catch {
+        return error.StoreFailed;
+    };
+    if dbx_step(&st) != 1 {
+        return error.ProviderNotFound;
+    }
+    out_len[0] = dbx_col_text(&st, 0, out, cap);
+    return;
 }

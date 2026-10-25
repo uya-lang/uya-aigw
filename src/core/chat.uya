@@ -137,6 +137,11 @@ fn chat_rewrite_model(body: &[byte], model: &[byte], out: &byte, cap: usize) usi
     return off;
 }
 
+/// 无亲和的入口（单测/兼容）。
+export fn chat_prepare(d: &Db, body: &[byte], now: i64, out: &ChatPlan) !void {
+    return chat_prepare_session(d, body, &""[0: 0], now, out);
+}
+
 /// serve 用：请求体以「指针 + 长度」给出时的入口。
 export fn chat_prepare_span(d: &Db, body: &const byte, n: usize, now: i64,
     out: &ChatPlan) !void {
@@ -144,6 +149,15 @@ export fn chat_prepare_span(d: &Db, body: &const byte, n: usize, now: i64,
         return error.ChatTooLarge;
     }
     return chat_prepare(d, body[0: n], now, out);
+}
+
+/// serve 用：带会话亲和的版本。
+export fn chat_prepare_span_session(d: &Db, body: &const byte, n: usize,
+    session: &[byte], now: i64, out: &ChatPlan) !void {
+    if n > CHAT_PAYLOAD_MAX {
+        return error.ChatTooLarge;
+    }
+    return chat_prepare_session(d, body[0: n], session, now, out);
 }
 
 /// 解析 `Authorization: Bearer <token>`；返回 token 长度（0=格式不对）。
@@ -184,7 +198,9 @@ export fn chat_bearer(auth: &[byte], out: &byte, cap: usize) usize {
 }
 
 /// 解析请求 → 选 provider → 生成上游 path 与重写后的请求体。
-export fn chat_prepare(d: &Db, body: &[byte], now: i64, out: &ChatPlan) !void {
+/// `session` 用于 A8 会话亲和（空串表示无亲和，按权重哈希 0 选）。
+export fn chat_prepare_session(d: &Db, body: &[byte], session: &[byte], now: i64,
+    out: &ChatPlan) !void {
     if body.len == 0 || body.len > CHAT_PAYLOAD_MAX {
         return error.ChatTooLarge;
     }
@@ -211,7 +227,7 @@ export fn chat_prepare(d: &Db, body: &[byte], now: i64, out: &ChatPlan) !void {
     var prov: StoreProvider = StoreProvider{};
     var up: [byte: CHAT_MODEL_MAX] = [0: CHAT_MODEL_MAX];
     var upn: usize = 0;
-    const ok: bool = try store_provider_route(d, mbuf[0: mn], &prov, &up[0], CHAT_MODEL_MAX, &upn);
+    const ok: bool = try lb_pick(d, mbuf[0: mn], session, now, &prov, &up[0], CHAT_MODEL_MAX, &upn);
     if !ok {
         return error.ChatNoRoute;
     }
