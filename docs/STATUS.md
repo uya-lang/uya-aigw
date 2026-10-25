@@ -39,8 +39,8 @@
   `/v1/usage`（data+totals 含 profit）与 `/v1/models`；chat e2e 断言 models/usage/profit。
 - A8（进行中）：schema v6 priority/weight + `lb.uya`（优先级/加权/会话亲和/熔断），
   serve 失败自动换 provider 重试；插件级重绑待接。
-- A7（进行中）：管理 REST（health/pricing GET+POST/billing/backup，`--admin-key`）
-  已通；MCP 与改时段/预览接口待做。
+- A7（已落地）：管理 REST（health/pricing GET+POST/billing/backup）+ MCP
+  （initialize/tools/list/tools/call：pricing_get、billing_query、backup_status）。
 - A5（进行中）：`/v1/responses` 非流式 + previous_response_id 续轮已通；
   reasoning/tools 透传与流式事件序列待做。
 - A4（进行中）：`src/core/json.uya` 有界 JSON DOM + 构造器（44 断言）；

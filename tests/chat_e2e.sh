@@ -183,6 +183,17 @@ echo "$AK" | grep -q '"ok":true' || { echo "$AK" >&2; fail "admin backup"; }
 AN=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$BASE/admin/health")
 [ "$AN" = "401" ] || fail "admin without key expected 401, got $AN"
 
+# 4e) A7 MCP：initialize / tools/list / tools/call
+M0=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer test-admin' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"initialize"}' "$BASE/mcp")
+echo "$M0" | grep -q '"protocolVersion"' || { echo "$M0" >&2; fail "mcp initialize"; }
+MT=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer test-admin' \
+  --data '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' "$BASE/mcp")
+echo "$MT" | grep -q '"pricing_get"' || { echo "$MT" >&2; fail "mcp tools/list"; }
+MC=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer test-admin' \
+  --data '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"backup_status","arguments":{}}}' "$BASE/mcp")
+echo "$MC" | grep -q 'last_backup_day' || { echo "$MC" >&2; fail "mcp tools/call"; }
+
 # 5) 停机后查账本
 kill "$SRV_PID" 2>/dev/null || true
 wait "$SRV_PID" 2>/dev/null || true

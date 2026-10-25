@@ -79,6 +79,7 @@ const ROUTE_ADMIN_PRICING: i32 = 11;
 const ROUTE_ADMIN_BILLING: i32 = 12;
 const ROUTE_ADMIN_BACKUP: i32 = 13;
 const ROUTE_RESPONSES: i32 = 14;
+const ROUTE_MCP: i32 = 15;
 
 /// chat 请求体上限（与 CHAT_PAYLOAD_MAX 一致；超了回 413）。
 const SRV_BODY_CAP: usize = 32768;
@@ -480,6 +481,9 @@ fn srv_route_of(req: &HsrvReq) i32 {
     }
     if srv_path_is(req, &"/v1/me"[0: 6]) {
         return ROUTE_ME;
+    }
+    if srv_path_is(req, &"/mcp"[0: 4]) {
+        return ROUTE_MCP;
     }
     if srv_path_is(req, &"/v1/responses"[0: 13]) {
         return ROUTE_RESPONSES;
@@ -1013,6 +1017,10 @@ fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
     }
     if c.route == ROUTE_ME {
         srv_me(c, stats);
+        return;
+    }
+    if c.route == ROUTE_MCP {
+        srv_mcp(c, stats);
         return;
     }
     if c.route == ROUTE_RESPONSES {
@@ -2238,6 +2246,240 @@ fn srv_responses(c: &SrvConn, stats: &ServeStats) void {
     jsonw_key(&w, &"price_nano"[0: 10]);
     jsonw_i64(&w, settle.price_nano);
     jsonw_end_obj(&w);
+    jsonw_end_obj(&w);
+    srv_static(c, 200, jsonw_span(&w), keep);
+}
+
+// ---------------------------------------------------------------
+// A7：MCP（JSON-RPC over HTTP POST /mcp，Bearer --admin-key）
+// ---------------------------------------------------------------
+
+fn srv_bytes_eq(a: &[byte], b: &[byte]) bool {
+    if a.len != b.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < a.len {
+        if a[i] != b[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn srv_mcp(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    if !runtime_ready() {
+        srv_static(c, 503, SRV_JSON_503, keep);
+        return;
+    }
+    if !srv_admin_ok(c) {
+        srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    }
+    if c.body_overflow {
+        srv_static(c, 413, SRV_JSON_413, keep);
+        return;
+    }
+    var d: JsonDoc = JsonDoc{};
+    json_parse(&d, c.body[0: c.body_len]) catch {
+        srv_static(c, 400, SRV_JSON_400, keep);
+        return;
+    };
+    const root: i32 = json_root(&d);
+    const id: i64 = json_i64(&d, json_get(&d, root, &"id"[0: 2]));
+    var method: [byte: 64] = [0: 64];
+    const mn: usize = json_str(&d, json_get(&d, root, &"method"[0: 6]), &method[0], 64);
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"jsonrpc"[0: 7]);
+    jsonw_str(&w, &"2.0"[0: 3]);
+    jsonw_key(&w, &"id"[0: 2]);
+    jsonw_i64(&w, id);
+    if srv_bytes_eq(method[0: mn], &"initialize"[0: 10]) {
+        jsonw_key(&w, &"result"[0: 6]);
+        jsonw_obj(&w);
+        jsonw_key(&w, &"protocolVersion"[0: 15]);
+        jsonw_str(&w, &"2024-11-05"[0: 10]);
+        jsonw_key(&w, &"capabilities"[0: 12]);
+        jsonw_obj(&w);
+        jsonw_key(&w, &"tools"[0: 5]);
+        jsonw_obj(&w);
+        jsonw_end_obj(&w);
+        jsonw_end_obj(&w);
+        jsonw_key(&w, &"serverInfo"[0: 10]);
+        jsonw_obj(&w);
+        jsonw_key(&w, &"name"[0: 4]);
+        jsonw_str(&w, &"aigw"[0: 4]);
+        jsonw_key(&w, &"version"[0: 7]);
+        jsonw_str(&w, &"0.1"[0: 3]);
+        jsonw_end_obj(&w);
+        jsonw_end_obj(&w);
+    } else if srv_bytes_eq(method[0: mn], &"tools/list"[0: 10]) {
+        jsonw_key(&w, &"result"[0: 6]);
+        jsonw_obj(&w);
+        jsonw_key(&w, &"tools"[0: 5]);
+        jsonw_arr(&w);
+        jsonw_obj(&w);
+        jsonw_key(&w, &"name"[0: 4]);
+        jsonw_str(&w, &"pricing_get"[0: 11]);
+        jsonw_key(&w, &"description"[0: 11]);
+        jsonw_str(&w, &"query sell/cost rates"[0: 21]);
+        jsonw_key(&w, &"inputSchema"[0: 11]);
+        jsonw_obj(&w);
+        jsonw_key(&w, &"type"[0: 4]);
+        jsonw_str(&w, &"object"[0: 6]);
+        jsonw_end_obj(&w);
+        jsonw_end_obj(&w);
+        jsonw_obj(&w);
+        jsonw_key(&w, &"name"[0: 4]);
+        jsonw_str(&w, &"billing_query"[0: 13]);
+        jsonw_key(&w, &"description"[0: 11]);
+        jsonw_str(&w, &"query usage rollup"[0: 18]);
+        jsonw_key(&w, &"inputSchema"[0: 11]);
+        jsonw_obj(&w);
+        jsonw_key(&w, &"type"[0: 4]);
+        jsonw_str(&w, &"object"[0: 6]);
+        jsonw_end_obj(&w);
+        jsonw_end_obj(&w);
+        jsonw_obj(&w);
+        jsonw_key(&w, &"name"[0: 4]);
+        jsonw_str(&w, &"backup_status"[0: 13]);
+        jsonw_key(&w, &"description"[0: 11]);
+        jsonw_str(&w, &"backup status"[0: 13]);
+        jsonw_key(&w, &"inputSchema"[0: 11]);
+        jsonw_obj(&w);
+        jsonw_key(&w, &"type"[0: 4]);
+        jsonw_str(&w, &"object"[0: 6]);
+        jsonw_end_obj(&w);
+        jsonw_end_obj(&w);
+        jsonw_end_arr(&w);
+        jsonw_end_obj(&w);
+    } else if srv_bytes_eq(method[0: mn], &"tools/call"[0: 10]) {
+        const params: i32 = json_get(&d, root, &"params"[0: 6]);
+        var name: [byte: 64] = [0: 64];
+        const nn: usize = json_str(&d, json_get(&d, params, &"name"[0: 4]), &name[0], 64);
+        const args: i32 = json_get(&d, params, &"arguments"[0: 9]);
+        var iw: JsonW = JsonW{};
+        jsonw_init(&iw);
+        var known: bool = true;
+        if srv_bytes_eq(name[0: nn], &"pricing_get"[0: 11]) {
+            var model: [byte: 128] = [0: 128];
+            const mlen: usize = json_str(&d, json_get(&d, args, &"model"[0: 5]), &model[0], 128);
+            var prov: [byte: 128] = [0: 128];
+            const plen: usize = json_str(&d, json_get(&d, args, &"provider"[0: 8]), &prov[0], 128);
+            var uid: i64 = json_i64(&d, json_get(&d, args, &"user_id"[0: 7]));
+            if uid < 0 {
+                uid = 0;
+            }
+            var ts: i64 = json_i64(&d, json_get(&d, args, &"ts"[0: 2]));
+            if ts <= 0 {
+                ts = store_now();
+            }
+            var sell: PriceRates = PriceRates{ input_nano_per_mtok: 0, output_nano_per_mtok: 0, cache_read_nano_per_mtok: 0, per_request_nano: 0, permille: 1000, card_id: 0, version: 0, found: false };
+            var cost: PriceRates = PriceRates{ input_nano_per_mtok: 0, output_nano_per_mtok: 0, cache_read_nano_per_mtok: 0, per_request_nano: 0, permille: 1000, card_id: 0, version: 0, found: false };
+            var no_prov: [byte: 1] = [0: 1];
+            price_lookup(runtime_db(), PRICE_KIND_SELL, model[0: mlen], no_prov[0: 0], uid, ts, 0, &sell) catch {
+                known = false;
+            };
+            if known {
+                price_lookup(runtime_db(), PRICE_KIND_COST, model[0: mlen], prov[0: plen], 0, ts, 0, &cost) catch {
+                    known = false;
+                };
+            }
+            if known {
+                jsonw_obj(&iw);
+                jsonw_key(&iw, &"model"[0: 5]);
+                jsonw_str(&iw, model[0: mlen]);
+                jsonw_key(&iw, &"ts"[0: 2]);
+                jsonw_i64(&iw, ts);
+                srv_rates_out(&iw, &"sell"[0: 4], &sell);
+                srv_rates_out(&iw, &"cost"[0: 4], &cost);
+                jsonw_end_obj(&iw);
+            }
+        } else if srv_bytes_eq(name[0: nn], &"billing_query"[0: 13]) {
+            var uid: i64 = json_i64(&d, json_get(&d, args, &"user_id"[0: 7]));
+            if uid < 0 {
+                uid = 0;
+            }
+            var from_day: i64 = json_i64(&d, json_get(&d, args, &"from_day"[0: 8]));
+            if from_day < 0 {
+                from_day = 0;
+            }
+            var to_day: i64 = json_i64(&d, json_get(&d, args, &"to_day"[0: 6]));
+            if to_day <= 0 {
+                to_day = 999999;
+            }
+            var rows: [RollupRow: 64] = [];
+            var rn: usize = 0;
+            rn = rollup_query(runtime_db(), uid, from_day, to_day, &rows[0], 64) catch {
+                0 as usize;
+            };
+            jsonw_obj(&iw);
+            jsonw_key(&iw, &"rows"[0: 4]);
+            jsonw_arr(&iw);
+            var i: usize = 0;
+            while i < rn {
+                jsonw_obj(&iw);
+                jsonw_key(&iw, &"day"[0: 3]);
+                jsonw_i64(&iw, rows[i].day);
+                jsonw_key(&iw, &"model"[0: 5]);
+                jsonw_str(&iw, rows[i].model[0: rows[i].model_len]);
+                jsonw_key(&iw, &"requests"[0: 8]);
+                jsonw_i64(&iw, rows[i].requests);
+                jsonw_key(&iw, &"cost_nano"[0: 9]);
+                jsonw_i64(&iw, rows[i].cost_nano);
+                jsonw_key(&iw, &"price_nano"[0: 10]);
+                jsonw_i64(&iw, rows[i].price_nano);
+                jsonw_end_obj(&iw);
+                i = i + 1;
+            }
+            jsonw_end_arr(&iw);
+            jsonw_end_obj(&iw);
+        } else if srv_bytes_eq(name[0: nn], &"backup_status"[0: 13]) {
+            jsonw_obj(&iw);
+            jsonw_key(&iw, &"ok"[0: 2]);
+            jsonw_bool(&iw, true);
+            jsonw_key(&iw, &"last_backup_day"[0: 15]);
+            jsonw_i64(&iw, runtime_last_backup_day());
+            jsonw_end_obj(&iw);
+        } else {
+            known = false;
+        }
+        if !known {
+            jsonw_key(&w, &"error"[0: 5]);
+            jsonw_obj(&w);
+            jsonw_key(&w, &"code"[0: 4]);
+            jsonw_i64(&w, 0 - 32602);
+            jsonw_key(&w, &"message"[0: 7]);
+            jsonw_str(&w, &"invalid params"[0: 14]);
+            jsonw_end_obj(&w);
+        } else {
+            jsonw_key(&w, &"result"[0: 6]);
+            jsonw_obj(&w);
+            jsonw_key(&w, &"content"[0: 7]);
+            jsonw_arr(&w);
+            jsonw_obj(&w);
+            jsonw_key(&w, &"type"[0: 4]);
+            jsonw_str(&w, &"text"[0: 4]);
+            jsonw_key(&w, &"text"[0: 4]);
+            jsonw_str(&w, jsonw_span(&iw));
+            jsonw_end_obj(&w);
+            jsonw_end_arr(&w);
+            jsonw_end_obj(&w);
+        }
+    } else {
+        jsonw_key(&w, &"error"[0: 5]);
+        jsonw_obj(&w);
+        jsonw_key(&w, &"code"[0: 4]);
+        jsonw_i64(&w, 0 - 32601);
+        jsonw_key(&w, &"message"[0: 7]);
+        jsonw_str(&w, &"method not found"[0: 16]);
+        jsonw_end_obj(&w);
+    }
     jsonw_end_obj(&w);
     srv_static(c, 200, jsonw_span(&w), keep);
 }
