@@ -33,6 +33,8 @@
 - B3（已落地）：epoch/fencing/drain + 控制面（421）+ 批量迁移/清零 + stale 自动
   迁移；controller tick 每 3s 触发 rebalance。
 - B2 收尾：config 快照与 slug 归属校验。
+- B5（进行中）：幂等 ingest（applied/duplicate/bad + usage_daily，11 断言）；
+  spool/重算/吊销/journal 重放待做。
 
 ## 开发命令（A9）
 
@@ -64,6 +66,8 @@
 - B3（已落地）：epoch/fencing/drain + 控制面（421）+ 批量迁移/清零 + stale 自动
   迁移；controller tick 每 3s 触发 rebalance。
 - B2 收尾：config 快照与 slug 归属校验。
+- B5（进行中）：幂等 ingest（applied/duplicate/bad + usage_daily，11 断言）；
+  spool/重算/吊销/journal 重放待做。
 
 ## 开发命令（A9）
 

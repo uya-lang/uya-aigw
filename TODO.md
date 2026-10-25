@@ -52,6 +52,9 @@ A4/A5/A8 进度（子项已完成记录见 `TODO_DONE.md`）：
 | B5 | ingest 幂等 + 金额/时段重算 + usage 分片 + spool + 吊销 + journal 重放 | 断网 30s 不丢不重；恢复对账一致 | B1/B3 |
 | B6 | 集群 e2e + 部署（1 controller + 3 node + 2 edge + nginx） | `cluster_e2e.sh` 全绿 | B1–B5 |
 
+B5 进度：幂等 ingest（applied/duplicate/bad + usage_daily 实时 upsert，11 断言）已完成；
+spool、金额/时段重算、吊销、journal 重放待做。
+
 B1 已完成（见 `TODO_DONE.md`）：meta.db、A/S 选主、controller 控制面与 standby 不备份。
 
 B2 进度：`uplink.uya` + `--uplink` 已通（node 注册/心跳，e2e 断言 controller status 出现 node-b）；

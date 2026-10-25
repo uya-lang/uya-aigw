@@ -1,0 +1,97 @@
+// tests/test_ingest.uya — B5 幂等 ingest
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_i64;
+use std.testing.run_test;
+
+const T0: i64 = 1700000000;
+
+fn open_db(d: &Db) !void {
+    _ = try schema_open(d, &":memory:"[0: 8]);
+}
+
+fn row(w: &JsonW, rid: &[byte], uid: i64, ts: i64, model: &[byte], prov: &[byte],
+    i0: i64, o0: i64, c0: i64, cost: i64, price: i64, period: &[byte]) void {
+    jsonw_obj(w);
+    jsonw_key(w, &"request_id"[0: 10]);
+    jsonw_str(w, rid);
+    jsonw_key(w, &"user_id"[0: 7]);
+    jsonw_i64(w, uid);
+    jsonw_key(w, &"ts"[0: 2]);
+    jsonw_i64(w, ts);
+    jsonw_key(w, &"model"[0: 5]);
+    jsonw_str(w, model);
+    jsonw_key(w, &"provider"[0: 8]);
+    jsonw_str(w, prov);
+    jsonw_key(w, &"input_tokens"[0: 12]);
+    jsonw_i64(w, i0);
+    jsonw_key(w, &"output_tokens"[0: 13]);
+    jsonw_i64(w, o0);
+    jsonw_key(w, &"cache_read_tokens"[0: 17]);
+    jsonw_i64(w, c0);
+    jsonw_key(w, &"cost_nano"[0: 9]);
+    jsonw_i64(w, cost);
+    jsonw_key(w, &"price_nano"[0: 10]);
+    jsonw_i64(w, price);
+    jsonw_key(w, &"period"[0: 6]);
+    jsonw_str(w, period);
+    jsonw_key(w, &"rate_version"[0: 12]);
+    jsonw_i64(w, 1);
+    jsonw_end_obj(w);
+}
+
+fn build(w: &JsonW, second: bool) void {
+    jsonw_init(w);
+    jsonw_obj(w);
+    jsonw_key(w, &"rows"[0: 4]);
+    jsonw_arr(w);
+    row(w, &"r1"[0: 2], 1, T0, &"m"[0: 1], &"p"[0: 1], 100, 50, 10, 5, 9, &"peak"[0: 4]);
+    if second {
+        row(w, &"r2"[0: 2], 1, T0 +% 60, &"m"[0: 1], &"p"[0: 1], 20, 10, 0, 1, 2, &"peak"[0: 4]);
+    }
+    jsonw_end_arr(w);
+    jsonw_end_obj(w);
+}
+fn test_apply() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    var w: JsonW = JsonW{};
+    build(&w, true);
+    var s: IngestStats = try ingest_apply(&d, jsonw_span(&w), T0);
+    try assert_eq_i64(s.applied, 2);
+    try assert_eq_i64(s.duplicate, 0);
+    try assert_eq_i64(s.bad, 0);
+    // 幂等：再应用一次
+    s = try ingest_apply(&d, jsonw_span(&w), T0);
+    try assert_eq_i64(s.applied, 0);
+    try assert_eq_i64(s.duplicate, 2);
+    var n: i64 = 0;
+    try assert_eq_i32(dbx_scalar_i64(&d, &"select count(*) from usage_ledger"[0: 33], &n), 0);
+    try assert_eq_i64(n, 2);
+    var rq: i64 = 0;
+    try assert_eq_i32(dbx_scalar_i64(&d, &"select sum(requests) from usage_daily"[0: 37], &rq), 0);
+    try assert_eq_i64(rq, 2);
+}
+
+fn test_bad() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    var jw: JsonW = JsonW{};
+    jsonw_init(&jw);
+    jsonw_obj(&jw);
+    jsonw_key(&jw, &"rows"[0: 4]);
+    jsonw_arr(&jw);
+    jsonw_obj(&jw);
+    jsonw_key(&jw, &"user_id"[0: 7]);
+    jsonw_i64(&jw, 1);
+    jsonw_end_obj(&jw);
+    jsonw_end_arr(&jw);
+    jsonw_end_obj(&jw);
+    const s: IngestStats = try ingest_apply(&d, jsonw_span(&jw), T0);
+    try assert_eq_i64(s.bad, 1);
+    try assert_eq_i64(s.applied, 0);
+}
+
+test "apply" { run_test("apply", test_apply); }
+test "bad" { run_test("bad", test_bad); }
