@@ -92,6 +92,9 @@ const ROUTE_NODE_STATUS: i32 = 37;
 const ROUTE_EDGE_PROXY: i32 = 38;
 const ROUTE_NODE_SPOOL: i32 = 39;
 const ROUTE_REQUESTS: i32 = 40;
+const ROUTE_ADMIN_PRICES: i32 = 41;
+const ROUTE_ADMIN_MODELS: i32 = 42;
+const ROUTE_ADMIN_BIND: i32 = 43;
 const ROUTE_BUDGET: i32 = 30;
 const ROUTE_ESTIMATE: i32 = 29;
 const ROUTE_USAGE_CSV: i32 = 28;
@@ -904,6 +907,15 @@ fn srv_route_of(req: &HsrvReq) i32 {
     if srv_path_is(req, &"/admin/pricing"[0: 14]) {
         return ROUTE_ADMIN_PRICING;
     }
+    if srv_path_is(req, &"/admin/price-entries"[0: 20]) {
+        return ROUTE_ADMIN_PRICES;
+    }
+    if srv_path_is(req, &"/admin/models"[0: 13]) {
+        return ROUTE_ADMIN_MODELS;
+    }
+    if srv_path_is(req, &"/admin/bind"[0: 11]) {
+        return ROUTE_ADMIN_BIND;
+    }
     if srv_path_is(req, &"/admin/billing"[0: 14]) {
         return ROUTE_ADMIN_BILLING;
     }
@@ -1447,6 +1459,18 @@ fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
         srv_me(c, stats);
         return;
     }
+    if c.route == ROUTE_ADMIN_PRICES {
+        srv_admin_prices(c, stats);
+        return;
+    }
+    if c.route == ROUTE_ADMIN_MODELS {
+        srv_admin_models(c, stats);
+        return;
+    }
+    if c.route == ROUTE_ADMIN_BIND {
+        srv_admin_bind(c, stats);
+        return;
+    }
     if c.route == ROUTE_REQUESTS {
         srv_requests(c, stats);
         return;
@@ -1473,6 +1497,18 @@ fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
     }
     if c.route == ROUTE_ADMIN_JS {
         srv_admin_js(c, stats);
+        return;
+    }
+    if c.route == ROUTE_ADMIN_PRICES {
+        srv_admin_prices(c, stats);
+        return;
+    }
+    if c.route == ROUTE_ADMIN_MODELS {
+        srv_admin_models(c, stats);
+        return;
+    }
+    if c.route == ROUTE_ADMIN_BIND {
+        srv_admin_bind(c, stats);
         return;
     }
     if c.route == ROUTE_REQUESTS {
@@ -4556,4 +4592,199 @@ fn srv_request_json(w: &JsonW, r: &StoreLedgerRow) void {
     jsonw_i64(w, r.cost_nano);
     jsonw_key(w, &"period"[0: 6]);
     jsonw_str(w, r.period[0: r.period_len]);
+}
+
+
+/// C3：读取当前生效的价目卡 id（不存在则建一张）。
+fn srv_price_card() i64 {
+    var card: PriceCard = PriceCard{ id: 0, kind: 0, version: 0, effective_from: 0 };
+    const lk: !void = price_card_lookup(runtime_db(), 0, store_now(), &card);
+    var ok: bool = true;
+    _ = lk catch |_| {
+        ok = false;
+    };
+    if ok && card.id > 0 {
+        return card.id;
+    }
+    const now: i64 = store_now();
+    var made: PriceCard = PriceCard{ id: 0, kind: 0, version: 0, effective_from: 0 };
+    price_card_create(runtime_db(), 0, 1, now -% 86400, store_now(), &"ui"[0: 2], &made) catch {
+        return 0 as i64;
+    };
+    return made.id;
+}
+
+/// C3：价目表（GET）/ 改价（POST {model, provider, input, output, cache_read}）。
+fn srv_admin_prices(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    if !runtime_ready() {
+        srv_static(c, 503, SRV_JSON_503, keep);
+        return;
+    }
+    if !srv_admin_ok(c) {
+        srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    }
+    const card: i64 = srv_price_card();
+    if c.body_len > 0 {
+        if card <= 0 {
+            srv_static(c, 502, SRV_JSON_502, keep);
+            return;
+        }
+        var d: JsonDoc = JsonDoc{};
+        json_parse(&d, c.body[0: c.body_len]) catch {
+            srv_static(c, 400, SRV_JSON_400, keep);
+            return;
+        };
+        const root: i32 = json_root(&d);
+        var model: [byte: 96] = [0: 96];
+        const mn: usize = json_str(&d, json_get(&d, root, &"model"[0: 5]), &model[0], 96);
+        var prov: [byte: 64] = [0: 64];
+        const pn: usize = json_str(&d, json_get(&d, root, &"provider"[0: 8]), &prov[0], 64);
+        const inr: i64 = json_i64(&d, json_get(&d, root, &"input"[0: 5]));
+        const outr: i64 = json_i64(&d, json_get(&d, root, &"output"[0: 6]));
+        const cr: i64 = json_i64(&d, json_get(&d, root, &"cache_read"[0: 10]));
+        if mn == 0 {
+            srv_static(c, 400, SRV_JSON_400, keep);
+            return;
+        }
+        price_entry_put(runtime_db(), card, prov[0: pn], model[0: mn], 0, inr, outr, cr, 0,
+            &""[0: 0]) catch {
+            srv_static(c, 400, SRV_JSON_400, keep);
+            return;
+        };
+        srv_static(c, 200, SRV_JSON_OK, keep);
+        return;
+    }
+    var rows: [PriceEntryRow: 64] = [];
+    var n: usize = 0;
+    n = price_entry_list(runtime_db(), card, &rows[0], 64) catch {
+        0 as usize;
+    };
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"card_id"[0: 7]);
+    jsonw_i64(&w, card);
+    jsonw_key(&w, &"data"[0: 4]);
+    jsonw_arr(&w);
+    var i: usize = 0;
+    while i < n {
+        jsonw_obj(&w);
+        jsonw_key(&w, &"provider"[0: 8]);
+        jsonw_str(&w, rows[i].provider[0: rows[i].provider_len]);
+        jsonw_key(&w, &"model"[0: 5]);
+        jsonw_str(&w, rows[i].model[0: rows[i].model_len]);
+        jsonw_key(&w, &"input"[0: 5]);
+        jsonw_i64(&w, rows[i].input_nano_per_mtok);
+        jsonw_key(&w, &"output"[0: 6]);
+        jsonw_i64(&w, rows[i].output_nano_per_mtok);
+        jsonw_key(&w, &"cache_read"[0: 10]);
+        jsonw_i64(&w, rows[i].cache_read_nano_per_mtok);
+        jsonw_end_obj(&w);
+        i = i + 1;
+    }
+    jsonw_end_arr(&w);
+    jsonw_end_obj(&w);
+    srv_static(c, 200, jsonw_span(&w), keep);
+}
+
+/// C3：模型绑定列表（GET）/ 绑定（POST {provider, model, upstream_model}）。
+fn srv_admin_models(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    if !runtime_ready() {
+        srv_static(c, 503, SRV_JSON_503, keep);
+        return;
+    }
+    if !srv_admin_ok(c) {
+        srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    }
+    var rows: [StoreModelRow: 64] = [];
+    var n: usize = 0;
+    n = store_list_provider_models(runtime_db(), &rows[0], 64) catch {
+        0 as usize;
+    };
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"data"[0: 4]);
+    jsonw_arr(&w);
+    var i: usize = 0;
+    while i < n {
+        jsonw_obj(&w);
+        jsonw_key(&w, &"provider_id"[0: 11]);
+        jsonw_i64(&w, rows[i].provider_id);
+        jsonw_key(&w, &"provider"[0: 8]);
+        jsonw_str(&w, rows[i].provider_name[0: rows[i].provider_name_len]);
+        jsonw_key(&w, &"model"[0: 5]);
+        jsonw_str(&w, rows[i].model[0: rows[i].model_len]);
+        jsonw_key(&w, &"upstream_model"[0: 14]);
+        jsonw_str(&w, rows[i].upstream_model[0: rows[i].upstream_len]);
+        jsonw_end_obj(&w);
+        i = i + 1;
+    }
+    jsonw_end_arr(&w);
+    jsonw_end_obj(&w);
+    srv_static(c, 200, jsonw_span(&w), keep);
+}
+
+/// C3：把 model 绑到供应商（admin）。
+fn srv_admin_bind(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    if !runtime_ready() {
+        srv_static(c, 503, SRV_JSON_503, keep);
+        return;
+    }
+    if !srv_admin_ok(c) {
+        srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    }
+    var d: JsonDoc = JsonDoc{};
+    json_parse(&d, c.body[0: c.body_len]) catch {
+        srv_static(c, 400, SRV_JSON_400, keep);
+        return;
+    };
+    const root: i32 = json_root(&d);
+    var prov: [byte: 64] = [0: 64];
+    const pn: usize = json_str(&d, json_get(&d, root, &"provider"[0: 8]), &prov[0], 64);
+    var model: [byte: 96] = [0: 96];
+    const mn: usize = json_str(&d, json_get(&d, root, &"model"[0: 5]), &model[0], 96);
+    var up: [byte: 96] = [0: 96];
+    const un: usize = json_str(&d, json_get(&d, root, &"upstream_model"[0: 14]), &up[0], 96);
+    if pn == 0 || mn == 0 {
+        srv_static(c, 400, SRV_JSON_400, keep);
+        return;
+    }
+    const pid: i64 = store_provider_id_by_name(runtime_db(), prov[0: pn]) catch {
+        0 as i64;
+    };
+    if pid <= 0 {
+        srv_static(c, 404, SRV_JSON_404, keep);
+        return;
+    }
+    var upb: [byte: 96] = [0: 96];
+    var upn: usize = un;
+    if un == 0 {
+        var k: usize = 0;
+        while k < mn && k < 96 {
+            upb[k] = model[k];
+            k = k + 1;
+        }
+        upn = k;
+    } else {
+        var k: usize = 0;
+        while k < un && k < 96 {
+            upb[k] = up[k];
+            k = k + 1;
+        }
+    }
+    store_provider_model_put(runtime_db(), pid, model[0: mn], upb[0: upn], store_now()) catch {
+        srv_static(c, 500, SRV_JSON_502, keep);
+        return;
+    };
+    srv_static(c, 200, SRV_JSON_OK, keep);
 }

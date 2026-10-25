@@ -228,6 +228,47 @@ fn price_entry_lookup(d: &Db, card: &PriceCard, provider: &[byte], model: &[byte
 
 /// 一站式查价：先定位 `ts` 生效的卡片，再取该模型（进价还要 provider）的条目。
 /// 卖价传 `provider = ""`；用户覆盖只在卖价上生效（进价的 user_id 恒为 0）。
+/// C3：价格条目读模型（管理后台改价/展示用）。
+export struct PriceEntryRow {
+    provider: [byte: 64],
+    provider_len: usize,
+    model: [byte: 96],
+    model_len: usize,
+    user_id: i64,
+    input_nano_per_mtok: i64,
+    output_nano_per_mtok: i64,
+    cache_read_nano_per_mtok: i64,
+    per_request_nano: i64,
+}
+
+export fn price_entry_list(d: &Db, card_id: i64, out: &PriceEntryRow, cap: usize) !usize {
+    if card_id <= 0 {
+        return error.PriceInvalid;
+    }
+    var st: DbStmt = dbx_prepare(d,
+        "select provider, model, user_id, input_nano_per_mtok, output_nano_per_mtok, cache_read_nano_per_mtok, per_request_nano from price_entries where card_id = ? order by model, provider limit ?" as &const byte) catch {
+        return error.PriceFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_i64(&st, 1, card_id) catch { return error.PriceFailed; };
+    dbx_bind_i64(&st, 2, cap as i64) catch { return error.PriceFailed; };
+    var n: usize = 0;
+    while n < cap {
+        if dbx_step(&st) != 1 {
+            break;
+        }
+        out[n].provider_len = dbx_col_text(&st, 0, &out[n].provider[0], 64);
+        out[n].model_len = dbx_col_text(&st, 1, &out[n].model[0], 96);
+        out[n].user_id = dbx_col_i64(&st, 2);
+        out[n].input_nano_per_mtok = dbx_col_i64(&st, 3);
+        out[n].output_nano_per_mtok = dbx_col_i64(&st, 4);
+        out[n].cache_read_nano_per_mtok = dbx_col_i64(&st, 5);
+        out[n].per_request_nano = dbx_col_i64(&st, 6);
+        n = n + 1;
+    }
+    return n;
+}
+
 export fn price_lookup(d: &Db, kind: i32, model: &[byte], provider: &[byte],
     user_id: i64, ts: i64, tz_min: i32, out: &PriceRates) !void {
     out.found = false;

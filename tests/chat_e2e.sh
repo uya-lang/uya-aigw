@@ -258,6 +258,21 @@ kill "$NB_PID" 2>/dev/null || true
 wait "$NB_PID" 2>/dev/null || true
 NB_PID=""
 
+# 4o) C3：模型绑定 + 价目条目编辑
+AB=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer test-admin' -H 'Content-Type: application/json' \
+  --data '{"provider":"mock","model":"price-model","upstream_model":"mock-1"}' "$BASE/admin/bind")
+echo "$AB" | grep -q '"ok":true' || { echo "$AB" >&2; fail "admin bind"; }
+AM=$(curl -s --max-time 5 -H 'Authorization: Bearer test-admin' "$BASE/admin/models")
+echo "$AM" | grep -q '"upstream_model":"mock-1"' || { echo "$AM" >&2; fail "admin models"; }
+AP2=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer test-admin' -H 'Content-Type: application/json' \
+  --data '{"model":"price-model","input":1000000,"output":2000000,"cache_read":0}' "$BASE/admin/price-entries")
+echo "$AP2" | grep -q '"ok":true' || { echo "$AP2" >&2; fail "price entry put"; }
+APL=$(curl -s --max-time 5 -H 'Authorization: Bearer test-admin' "$BASE/admin/price-entries")
+echo "$APL" | grep -q '"model":"price-model"' || { echo "$APL" >&2; fail "price entry list"; }
+echo "$APL" | grep -q '"input":1000000' || { echo "$APL" >&2; fail "price entry rate"; }
+AP401=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$BASE/admin/price-entries")
+[ "$AP401" = "401" ] || fail "price entries expected 401, got $AP401"
+
 # 4n) C2：请求列表 / 详情（分页）
 RL=$(curl -s --max-time 5 -H "Authorization: Bearer $TOKEN" "$BASE/v1/requests?limit=5&offset=0")
 echo "$RL" | grep -q '"request_id"' || { echo "$RL" >&2; fail "requests list"; }
@@ -282,6 +297,8 @@ AU401=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$BASE/admin/users")
 ADM=$(curl -s --max-time 5 "$BASE/admin")
 echo "$ADM" | grep -q 'id="admin-users"' || { echo "$ADM" >&2; fail "admin page"; }
 ADMJ=$(curl -s --max-time 5 "$BASE/ui/admin.js")
+echo "$ADMJ" | grep -q '/admin/price-entries' || { echo "$ADMJ" >&2; fail "admin js pricing"; }
+echo "$ADMJ" | grep -q '/admin/bind' || { echo "$ADMJ" >&2; fail "admin js bind"; }
 echo "$ADMJ" | grep -q '/admin/providers' || { echo "$ADMJ" >&2; fail "admin js"; }
 
 # 4l) C4：预算设置与告警（当月已用来自 usage_daily）
