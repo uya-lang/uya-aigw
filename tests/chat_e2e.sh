@@ -332,6 +332,15 @@ echo "$AP2" | grep -q '"ok":true' || { echo "$AP2" >&2; fail "price entry put"; 
 APL=$(curl -s --max-time 5 -H 'Authorization: Bearer test-admin' "$BASE/admin/price-entries")
 echo "$APL" | grep -q '"model":"price-model"' || { echo "$APL" >&2; fail "price entry list"; }
 echo "$APL" | grep -q '"input":1000000' || { echo "$APL" >&2; fail "price entry rate"; }
+# C3：分时价编辑（schedule 入库 + 列表回显 + 非法规则拒绝）
+APS=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer test-admin' \
+  --data '{"model":"sched-model","provider":"","input":100,"output":200,"cache_read":0,"schedule":"workday 09:00-18:00 120%"}' "$BASE/admin/price-entries")
+echo "$APS" | grep -q '"ok":true' || { echo "$APS" >&2; fail "schedule price put"; }
+APL2=$(curl -s --max-time 5 -H 'Authorization: Bearer test-admin' "$BASE/admin/price-entries")
+echo "$APL2" | grep -q '"schedule":"workday 09:00-18:00 120%"' || { echo "$APL2" >&2; fail "schedule echoed"; }
+APBAD=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' -X POST -H 'Authorization: Bearer test-admin' \
+  --data '{"model":"sched-model","schedule":"bogus"}' "$BASE/admin/price-entries")
+[ "$APBAD" = "400" ] || fail "bad schedule expected 400, got $APBAD"
 AP401=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$BASE/admin/price-entries")
 [ "$AP401" = "401" ] || fail "price entries expected 401, got $AP401"
 # C5：审计日志记录改价与绑定
@@ -366,10 +375,13 @@ AU401=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$BASE/admin/users")
 ADM=$(curl -s --max-time 5 "$BASE/admin")
 echo "$ADM" | grep -q 'id="admin-audit"' || { echo "$ADM" >&2; fail "admin audit section"; }
 echo "$ADM" | grep -q 'id="admin-users"' || { echo "$ADM" >&2; fail "admin page"; }
+echo "$ADM" | grep -q 'id="pe-schedule"' || { echo "$ADM" >&2; fail "admin schedule input"; }
+echo "$ADM" | grep -q '价目表' || { echo "$ADM" >&2; fail "admin price table"; }
 ADMJ=$(curl -s --max-time 5 "$BASE/ui/admin.js")
 echo "$ADMJ" | grep -q '/admin/price-entries' || { echo "$ADMJ" >&2; fail "admin js pricing"; }
 echo "$ADMJ" | grep -q '/admin/bind' || { echo "$ADMJ" >&2; fail "admin js bind"; }
 echo "$ADMJ" | grep -q '/admin/providers' || { echo "$ADMJ" >&2; fail "admin js"; }
+echo "$ADMJ" | grep -q 'pe-schedule' || { echo "$ADMJ" >&2; fail "admin js schedule"; }
 
 # 4l) C4：预算设置与告警（当月已用来自 usage_daily）
 BG=$(curl -s --max-time 5 -H "Authorization: Bearer $TOKEN" "$BASE/v1/budget")

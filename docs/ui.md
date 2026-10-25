@@ -7,9 +7,9 @@
 | `GET /` | 单页控制台（登录/资料/密钥/接入点/概览/用量/请求列表/估算/Playground/账单预算） |
 | `GET /ui/app.js` | 控制台脚本（同源加载，无内联脚本） |
 | `GET /ui/admin.js` | 管理后台脚本 |
-| `GET /admin` | 管理后台页（用户/供应商/节点/备份/定价/改价/模型绑定） |
+| `GET /admin` | 管理后台页（用户/供应商/节点/备份/定价/改价（含分时价）/价目表/模型绑定） |
 | `GET /admin/users`、`GET /admin/providers` | 管理后台列表（需 admin key） |
-| `GET/POST /admin/price-entries` | 价目条目列表 / 改价 |
+| `GET/POST /admin/price-entries` | 价目条目列表 / 改价（可带 `schedule` 分时规则，坏规则 400；`per_request` 可选） |
 | `GET /admin/models`、`POST /admin/bind` | 模型绑定列表 / 绑定 |
 | `GET /v1/requests?limit=&offset=`、`?id=` | 请求列表（分页）/ 详情 |
 | `GET /v1/usage`、`/v1/usage.csv`、`POST /v1/estimate` | 用量汇总 / CSV / 估算器 |

@@ -5040,16 +5040,30 @@ fn srv_admin_prices(c: &SrvConn, stats: &ServeStats) void {
         const inr: i64 = json_i64(&d, json_get(&d, root, &"input"[0: 5]));
         const outr: i64 = json_i64(&d, json_get(&d, root, &"output"[0: 6]));
         const cr: i64 = json_i64(&d, json_get(&d, root, &"cache_read"[0: 10]));
+        const pr: i64 = json_i64(&d, json_get(&d, root, &"per_request"[0: 11]));
+        var sched: [byte: 256] = [0: 256];
+        const sn: usize = json_str(&d, json_get(&d, root, &"schedule"[0: 8]), &sched[0], 256);
         if mn == 0 {
             srv_static(c, 400, SRV_JSON_400, keep);
             return;
         }
-        price_entry_put(runtime_db(), card, prov[0: pn], model[0: mn], 0, inr, outr, cr, 0,
-            &""[0: 0]) catch {
+        // 分时规则先解析校验：坏规则不入库（避免请求时才失败）。
+        if sn > 0 {
+            var sc: Sched = Sched{ rules: [], count: 0 };
+            schedule_parse(sched[0: sn], &sc) catch {
+                srv_static(c, 400, SRV_JSON_400, keep);
+                return;
+            };
+        }
+        price_entry_put(runtime_db(), card, prov[0: pn], model[0: mn], 0, inr, outr, cr, pr,
+            sched[0: sn]) catch {
             srv_static(c, 400, SRV_JSON_400, keep);
             return;
         };
         srv_audit(&"price.put"[0: 9], model[0: mn]);
+        if sn > 0 {
+            srv_audit(&"schedule.put"[0: 12], model[0: mn]);
+        }
         srv_static(c, 200, SRV_JSON_OK, keep);
         return;
     }
@@ -5078,6 +5092,10 @@ fn srv_admin_prices(c: &SrvConn, stats: &ServeStats) void {
         jsonw_i64(&w, rows[i].output_nano_per_mtok);
         jsonw_key(&w, &"cache_read"[0: 10]);
         jsonw_i64(&w, rows[i].cache_read_nano_per_mtok);
+        jsonw_key(&w, &"per_request"[0: 11]);
+        jsonw_i64(&w, rows[i].per_request_nano);
+        jsonw_key(&w, &"schedule"[0: 8]);
+        jsonw_str(&w, rows[i].schedule[0: rows[i].schedule_len]);
         jsonw_end_obj(&w);
         i = i + 1;
     }

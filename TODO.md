@@ -63,7 +63,6 @@ B3（epoch/fencing/drain、421、批量迁移/清零、stale 自动迁移），�
 |---|---|---|---|
 | C1 | 静态壳 + 登录/资料 + 接入点页 | 登录→复制 URL→curl 成功 | A2/A7 |
 | C2 | 概览 + 用量/费用（含时段）+ 请求列表/详情 + CSV | 数据与 `/v1/usage` 一致；分页正确 | A6 |
-| C3 | 密钥管理 + 模型/价格 + 估算器 | 创建 key 立即能调用；估算 == 实际 | A7 |
 | C4 | Playground + 账单 + 设置/通知 | SSE 指标正确；预算告警触发 | C2/C3 |
 | C5 | 管理后台（用户/供应商/模型/定价/分时/节点/备份/审计） | 改价/绑定/节点 drain/备份状态可见 | A7/B3 |
 | C6 | e2e + 安全（CSRF/XSS/CSP/越权）+ 文档 | `make ui-e2e` 全绿 | C1–C5 |
@@ -72,8 +71,6 @@ B3（epoch/fencing/drain、421、批量迁移/清零、stale 自动迁移），�
 - C1：静态壳（`/`、`/ui/app.js`；登录/资料/密钥/接入点 + curl 示例）已落地。
 - C2：`/v1/usage.csv` + 概览/明细表 + CSV 导出 + 请求列表/详情（`/v1/requests`，limit/offset 分页，
   UI 可点击看详情）已落地。
-- C3：Key 管理（建/列/撤销）+ `POST /v1/estimate` 估算器 + 改价（`/admin/price-entries`）
-  与模型绑定（`/admin/models`、`/admin/bind`）已落地；分时价编辑页待做。
 - C4：Playground（流式指标）+ 账单预算（schema v8 budgets、`/v1/budget`、超额告警）已落地；通知待做。
 - C5：`/admin` 页 + 用户/供应商列表 + 改价/绑定 + 审计日志（`/admin/audit`，
   记录 price.put/bind/drain）已落地；模型/定价的分时价编辑与更多审计动作待补。

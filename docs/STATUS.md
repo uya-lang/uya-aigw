@@ -44,8 +44,8 @@
 - C1（进行中）：静态壳 `/` + `/ui/app.js`（登录/资料/密钥/接入点 + curl 示例）已落地。
 - C2（进行中）：`/v1/usage.csv` + 概览/明细表 + CSV 导出已落地；请求列表/详情待做。
 - C2（已完成）：`/v1/usage`、`/v1/usage.csv`、`/v1/requests`（列表/详情分页）与 UI 概览页。
-- C3（进行中）：Key 管理、估算器、改价（`/admin/price-entries`）、模型绑定（`/admin/models`、
-  `/admin/bind`）已落地；分时价编辑页待做。旧注：Key 管理 + `POST /v1/estimate` 估算器已落地；模型/价格编辑页待做。
+- C3（已完成）：Key 管理、估算器、改价（`/admin/price-entries`，含 `schedule` 分时规则校验与
+  回显）、模型绑定、管理后台分时价编辑与价目表。
 - C4（进行中）：Playground（流式指标）+ 账单预算（schema v8、`/v1/budget`）已落地；
   通知待做。
 - C5（进行中）：`/admin` 页 + 用户/供应商列表 + 改价/绑定 + 审计日志（`/admin/audit`，
@@ -100,8 +100,8 @@
 - C1（进行中）：静态壳 `/` + `/ui/app.js`（登录/资料/密钥/接入点 + curl 示例）已落地。
 - C2（进行中）：`/v1/usage.csv` + 概览/明细表 + CSV 导出已落地；请求列表/详情待做。
 - C2（已完成）：`/v1/usage`、`/v1/usage.csv`、`/v1/requests`（列表/详情分页）与 UI 概览页。
-- C3（进行中）：Key 管理、估算器、改价（`/admin/price-entries`）、模型绑定（`/admin/models`、
-  `/admin/bind`）已落地；分时价编辑页待做。旧注：Key 管理 + `POST /v1/estimate` 估算器已落地；模型/价格编辑页待做。
+- C3（已完成）：Key 管理、估算器、改价（`/admin/price-entries`，含 `schedule` 分时规则校验与
+  回显）、模型绑定、管理后台分时价编辑与价目表。
 - C4（进行中）：Playground（流式指标）+ 账单预算（schema v8、`/v1/budget`）已落地；
   通知待做。
 - C5（进行中）：`/admin` 页 + 用户/供应商列表 + 改价/绑定 + 审计日志（`/admin/audit`，
