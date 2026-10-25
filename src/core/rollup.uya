@@ -1,0 +1,142 @@
+// src/core/rollup.uya — A6 用量汇总：usage_ledger → usage_daily（按天/用户/模型/供应商/时段）
+//
+// 查询只读 `usage_daily`，不扫明细；重建是幂等的（先删当天的汇总再按明细重算）。
+// `day` 是 UTC 天序号（unix 秒 / 86400），与 journal/backup 的日切一致。
+
+export const ROLLUP_MODEL_MAX: usize = 64;
+export const ROLLUP_PROVIDER_MAX: usize = 64;
+export const ROLLUP_PERIOD_MAX: usize = 32;
+
+export error RollupFailed;
+
+export struct RollupRow {
+    day: i64,
+    user_id: i64,
+    model: [byte: ROLLUP_MODEL_MAX],
+    model_len: usize,
+    provider: [byte: ROLLUP_PROVIDER_MAX],
+    provider_len: usize,
+    period: [byte: ROLLUP_PERIOD_MAX],
+    period_len: usize,
+    requests: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    cost_nano: i64,
+    price_nano: i64,
+}
+
+/// 重建某一天的汇总：先删后插（幂等）。
+export fn rollup_rebuild_day(d: &Db, day: i64) !void {
+    if day < 0 {
+        return error.RollupFailed;
+    }
+    var del: DbStmt = dbx_prepare(d, "delete from usage_daily where day = ?" as &const byte) catch {
+        return error.RollupFailed;
+    };
+    defer { dbx_finalize(&del); }
+    dbx_bind_i64(&del, 1, day) catch {
+        return error.RollupFailed;
+    };
+    if dbx_step(&del) != 0 {
+        return error.RollupFailed;
+    }
+    const from: i64 = day *% (86400 as i64);
+    const to: i64 = from +% (86400 as i64);
+    var ins: DbStmt = dbx_prepare(d,
+        "insert into usage_daily(day, user_id, model, provider, period, requests, input_tokens, output_tokens, cache_read_tokens, cost_nano, price_nano) select ?, user_id, model, provider, period, count(*), coalesce(sum(input_tokens), 0), coalesce(sum(output_tokens), 0), coalesce(sum(cache_read_tokens), 0), coalesce(sum(cost_nano), 0), coalesce(sum(price_nano), 0) from usage_ledger where ts >= ? and ts < ? group by user_id, model, provider, period" as &const byte) catch {
+        return error.RollupFailed;
+    };
+    defer { dbx_finalize(&ins); }
+    dbx_bind_i64(&ins, 1, day) catch {
+        return error.RollupFailed;
+    };
+    dbx_bind_i64(&ins, 2, from) catch {
+        return error.RollupFailed;
+    };
+    dbx_bind_i64(&ins, 3, to) catch {
+        return error.RollupFailed;
+    };
+    if dbx_step(&ins) != 0 {
+        return error.RollupFailed;
+    }
+    return;
+}
+
+/// 重建 [from_day, to_day] 闭区间。
+export fn rollup_rebuild_range(d: &Db, from_day: i64, to_day: i64) !void {
+    if from_day < 0 || to_day < from_day || to_day -% from_day > 3660 {
+        return error.RollupFailed;
+    }
+    var day: i64 = from_day;
+    while day <= to_day {
+        try rollup_rebuild_day(d, day);
+        day = day +% 1;
+    }
+    return;
+}
+
+fn rollup_fill(st: &DbStmt, out: &RollupRow, cap: usize) usize {
+    var n: usize = 0;
+    while n < cap {
+        if dbx_step(st) != 1 {
+            break;
+        }
+        out[n].day = dbx_col_i64(st, 0);
+        out[n].user_id = dbx_col_i64(st, 1);
+        out[n].model_len = dbx_col_text(st, 2, &out[n].model[0], ROLLUP_MODEL_MAX);
+        out[n].provider_len = dbx_col_text(st, 3, &out[n].provider[0], ROLLUP_PROVIDER_MAX);
+        out[n].period_len = dbx_col_text(st, 4, &out[n].period[0], ROLLUP_PERIOD_MAX);
+        out[n].requests = dbx_col_i64(st, 5);
+        out[n].input_tokens = dbx_col_i64(st, 6);
+        out[n].output_tokens = dbx_col_i64(st, 7);
+        out[n].cache_read_tokens = dbx_col_i64(st, 8);
+        out[n].cost_nano = dbx_col_i64(st, 9);
+        out[n].price_nano = dbx_col_i64(st, 10);
+        n = n + 1;
+    }
+    return n;
+}
+
+/// 查汇总：`user_id > 0` 只看该用户，`<= 0` 看全部；返回写入行数。
+export fn rollup_query(d: &Db, user_id: i64, from_day: i64, to_day: i64,
+    out: &RollupRow, cap: usize) !usize {
+    if from_day < 0 || to_day < from_day || cap == 0 {
+        return error.RollupFailed;
+    }
+    if user_id > 0 {
+        var st: DbStmt = dbx_prepare(d,
+            "select day, user_id, model, provider, period, requests, input_tokens, output_tokens, cache_read_tokens, cost_nano, price_nano from usage_daily where day >= ? and day <= ? and user_id = ? order by day, user_id, model limit ?" as &const byte) catch {
+            return error.RollupFailed;
+        };
+        defer { dbx_finalize(&st); }
+        dbx_bind_i64(&st, 1, from_day) catch {
+            return error.RollupFailed;
+        };
+        dbx_bind_i64(&st, 2, to_day) catch {
+            return error.RollupFailed;
+        };
+        dbx_bind_i64(&st, 3, user_id) catch {
+            return error.RollupFailed;
+        };
+        dbx_bind_i64(&st, 4, cap as i64) catch {
+            return error.RollupFailed;
+        };
+        return rollup_fill(&st, out, cap);
+    }
+    var st2: DbStmt = dbx_prepare(d,
+        "select day, user_id, model, provider, period, requests, input_tokens, output_tokens, cache_read_tokens, cost_nano, price_nano from usage_daily where day >= ? and day <= ? order by day, user_id, model limit ?" as &const byte) catch {
+        return error.RollupFailed;
+    };
+    defer { dbx_finalize(&st2); }
+    dbx_bind_i64(&st2, 1, from_day) catch {
+        return error.RollupFailed;
+    };
+    dbx_bind_i64(&st2, 2, to_day) catch {
+        return error.RollupFailed;
+    };
+    dbx_bind_i64(&st2, 3, cap as i64) catch {
+        return error.RollupFailed;
+    };
+    return rollup_fill(&st2, out, cap);
+}

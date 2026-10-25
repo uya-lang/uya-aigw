@@ -5,6 +5,7 @@
 //   v1 → v2：价目表（price_cards / price_entries，含分时 schedule）
 //   v2 → v3：用量账本（usage_ledger，request_id 幂等）
 //   v3 → v4：供应商与模型路由（providers / provider_models）
+//   v4 → v5：用量汇总（usage_daily，按天/用户/模型/供应商/时段）
 //
 // 约定：
 //   * 迁移**幂等**：重复执行到同一版本不产生副作用（`create table if not exists`）。
@@ -14,7 +15,7 @@
 //
 // 打开流程（`schema_open`）：open → pragmas → migrate。热路径不该调它。
 
-export const SCHEMA_VERSION: i32 = 4;
+export const SCHEMA_VERSION: i32 = 5;
 
 export error SchemaFailed;
 
@@ -113,6 +114,16 @@ fn schema_v4(d: &Db) !void {
 }
 
 // ---------------------------------------------------------------
+// v5：用量汇总（A6 查询不扫明细）
+// ---------------------------------------------------------------
+
+fn schema_v5(d: &Db) !void {
+    try dbx_exec_cstr(d, "create table if not exists usage_daily (day integer not null, user_id integer not null, model text not null, provider text not null default '', period text not null default '', requests integer not null default 0, input_tokens integer not null default 0, output_tokens integer not null default 0, cache_read_tokens integer not null default 0, cost_nano integer not null default 0, price_nano integer not null default 0, primary key(day, user_id, model, provider, period))" as &const byte);
+    try dbx_exec_cstr(d, "create index if not exists idx_usage_daily_user on usage_daily(user_id, day)" as &const byte);
+    try dbx_exec_cstr(d, "create index if not exists idx_usage_daily_day on usage_daily(day)" as &const byte);
+}
+
+// ---------------------------------------------------------------
 // 版本号写回
 // ---------------------------------------------------------------
 
@@ -186,6 +197,11 @@ export fn schema_migrate(d: &Db) !i32 {
             applied = true;
         } else if cur == 3 {
             schema_v4(d) catch |_| {
+                failed = true;
+            };
+            applied = true;
+        } else if cur == 4 {
+            schema_v5(d) catch |_| {
                 failed = true;
             };
             applied = true;

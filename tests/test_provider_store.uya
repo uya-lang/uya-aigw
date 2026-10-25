@@ -43,8 +43,7 @@ fn test_schema_v4() !void {
     var d: Db = Db{ h: null };
     defer { dbx_close(&d); }
     try open_db(&d);
-    try assert_eq_i32(schema_current(&d), 4);
-    try assert_eq_i32(SCHEMA_VERSION, 4);
+    try assert_eq_i32(schema_current(&d), SCHEMA_VERSION);
     try assert_eq_bool(table_exists(&d, &"providers"[0: 9]), true);
     try assert_eq_bool(table_exists(&d, &"provider_models"[0: 15]), true);
 }
@@ -149,7 +148,7 @@ fn test_route() !void {
     try assert_eq_bool(ok, false);
 }
 
-test "schema_v4" { run_test("schema_v4", test_schema_v4); }
+test "schema_version" { run_test("schema_version", test_schema_v4); }
 test "create_and_find" { run_test("create_and_find", test_create_and_find); }
 test "auth_and_disable" { run_test("auth_and_disable", test_auth_and_disable); }
 test "route" { run_test("route", test_route); }

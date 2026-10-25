@@ -1,0 +1,109 @@
+// tests/test_rollup.uya — A6 用量汇总：按天/用户/模型/时段重建与查询
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_i64;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+const D1: i64 = 19700;
+const D2: i64 = 19701;
+
+fn open_db(d: &Db) !void {
+    _ = try schema_open(d, &":memory:"[0: 8]);
+}
+
+fn add(d: &Db, rid: &[byte], user: i64, ts: i64, model: &[byte], prov: &[byte],
+    period: &[byte], i0: i64, o0: i64, c0: i64, cost: i64, price: i64) !void {
+    var st: DbStmt = dbx_prepare(d,
+        "insert into usage_ledger(request_id, user_id, ts, model, provider, input_tokens, output_tokens, cache_read_tokens, cost_nano, price_nano, period, rate_version) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)" as &const byte) catch {
+        return error.TestFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, rid) catch { return error.TestFailed; };
+    dbx_bind_i64(&st, 2, user) catch { return error.TestFailed; };
+    dbx_bind_i64(&st, 3, ts) catch { return error.TestFailed; };
+    dbx_bind_text(&st, 4, model) catch { return error.TestFailed; };
+    dbx_bind_text(&st, 5, prov) catch { return error.TestFailed; };
+    dbx_bind_i64(&st, 6, i0) catch { return error.TestFailed; };
+    dbx_bind_i64(&st, 7, o0) catch { return error.TestFailed; };
+    dbx_bind_i64(&st, 8, c0) catch { return error.TestFailed; };
+    dbx_bind_i64(&st, 9, cost) catch { return error.TestFailed; };
+    dbx_bind_i64(&st, 10, price) catch { return error.TestFailed; };
+    dbx_bind_text(&st, 11, period) catch { return error.TestFailed; };
+    dbx_bind_i64(&st, 12, 1) catch { return error.TestFailed; };
+    if dbx_step(&st) != 0 { return error.TestFailed; }
+}
+
+fn eq(a: &[byte], lit: &[byte]) bool {
+    if a.len != lit.len { return false; }
+    var i: usize = 0;
+    while i < a.len {
+        if a[i] != lit[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn seed(d: &Db) !void {
+    const t1: i64 = D1 *% 86400 +% 3600;
+    const t2: i64 = D1 *% 86400 +% 7200;
+    const t3: i64 = D1 *% 86400 +% 10800;
+    const t4: i64 = D2 *% 86400 +% 3600;
+    try add(d, &"a"[0: 1], 1, t1, &"m1"[0: 2], &"p1"[0: 2], &"peak"[0: 4], 100, 50, 10, 5, 9);
+    try add(d, &"b"[0: 1], 1, t2, &"m1"[0: 2], &"p1"[0: 2], &"peak"[0: 4], 200, 100, 20, 10, 18);
+    try add(d, &"c"[0: 1], 2, t3, &"m2"[0: 2], &"p2"[0: 2], &"off"[0: 3], 50, 25, 5, 3, 6);
+    try add(d, &"d"[0: 1], 1, t4, &"m1"[0: 2], &"p1"[0: 2], &""[0: 0], 10, 5, 0, 1, 2);
+}
+
+fn test_rebuild_and_query() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    try seed(&d);
+    try rollup_rebuild_day(&d, D1);
+    var rows: [RollupRow: 8] = [RollupRow{} , RollupRow{}, RollupRow{}, RollupRow{}, RollupRow{}, RollupRow{}, RollupRow{}, RollupRow{}];
+    var n: usize = try rollup_query(&d, 1, D1, D1, &rows[0], 8);
+    try assert_eq_i32(n as i32, 1);
+    try assert_eq_i64(rows[0].day, D1);
+    try assert_eq_i64(rows[0].user_id, 1);
+    try assert_eq_bool(eq(rows[0].model[0: rows[0].model_len], &"m1"[0: 2]), true);
+    try assert_eq_bool(eq(rows[0].period[0: rows[0].period_len], &"peak"[0: 4]), true);
+    try assert_eq_i64(rows[0].requests, 2);
+    try assert_eq_i64(rows[0].input_tokens, 300);
+    try assert_eq_i64(rows[0].output_tokens, 150);
+    try assert_eq_i64(rows[0].cache_read_tokens, 30);
+    try assert_eq_i64(rows[0].cost_nano, 15);
+    try assert_eq_i64(rows[0].price_nano, 27);
+
+    // 幂等：重建两次结果一致
+    try rollup_rebuild_day(&d, D1);
+    n = try rollup_query(&d, 1, D1, D1, &rows[0], 8);
+    try assert_eq_i32(n as i32, 1);
+    try assert_eq_i64(rows[0].requests, 2);
+
+    // 全部用户：两行（user1 m1、user2 m2）
+    n = try rollup_query(&d, 0, D1, D1, &rows[0], 8);
+    try assert_eq_i32(n as i32, 2);
+}
+
+fn test_range_and_period() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    try seed(&d);
+    try rollup_rebuild_range(&d, D1, D2);
+    var rows: [RollupRow: 8] = [RollupRow{}, RollupRow{}, RollupRow{}, RollupRow{}, RollupRow{}, RollupRow{}, RollupRow{}, RollupRow{}];
+    const n: usize = try rollup_query(&d, 1, D1, D2, &rows[0], 8);
+    try assert_eq_i32(n as i32, 2);
+    try assert_eq_i64(rows[0].day, D1);
+    try assert_eq_i64(rows[1].day, D2);
+    try assert_eq_i64(rows[1].requests, 1);
+    try assert_eq_bool(eq(rows[1].period[0: rows[1].period_len], &""[0: 0]), true);
+    // user2 只有 D1 一行
+    const n2: usize = try rollup_query(&d, 2, D1, D2, &rows[0], 8);
+    try assert_eq_i32(n2 as i32, 1);
+    try assert_eq_i64(rows[0].user_id, 2);
+    try assert_eq_bool(eq(rows[0].period[0: rows[0].period_len], &"off"[0: 3]), true);
+}
+
+test "rebuild_and_query" { run_test("rebuild_and_query", test_rebuild_and_query); }
+test "range_and_period" { run_test("range_and_period", test_range_and_period); }
