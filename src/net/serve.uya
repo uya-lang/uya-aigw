@@ -203,6 +203,7 @@ var g_uplink_ip: [byte: 64] = [0: 64];
 var g_uplink_ip_len: usize = 0;
 var g_uplink_port: u16 = 0;
 var g_uplink_last_ms: u64 = 0;
+var g_rebalance_last_ms: u64 = 0;
 
 fn srv_uplink_setup(spec: &[byte]) void {
     g_uplink_ready = false;
@@ -1646,10 +1647,17 @@ export fn serve_run(lfd: i32, stats: &ServeStats) !i32 {
         const role: i32 = elect_tick_or(&g_meta, nb[0: nn], mnow, 30);
         runtime_set_backup_allowed(elect_may_backup(role));
         meta_node_heartbeat(&g_meta, nb[0: nn], mnow) catch {};
+        const rms: u64 = srv_now_ms();
+        if rms > g_rebalance_last_ms +% 3000 {
+            g_rebalance_last_ms = rms;
+            _ = meta_rebalance(&g_meta, mnow, 3) catch {
+                0 as i64;
+            };
+        }
     }
     if g_uplink_ready {
         const ums: u64 = srv_now_ms();
-        if ums > g_uplink_last_ms +% 5000 {
+        if ums > g_uplink_last_ms +% 1000 {
             g_uplink_last_ms = ums;
             var ipb: [byte: 64] = [0: 64];
             const ipn: usize = srv_uplink_copy(&ipb[0], 64);

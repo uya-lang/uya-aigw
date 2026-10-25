@@ -30,8 +30,9 @@
   config/status，`--meta`/`--node-id`，standby 不备份）。
 - B2（进行中）：`uplink.uya` + `--uplink` 已通（node 注册/心跳）；config 快照与
   slug 归属待做。
-- B3（进行中）：epoch/fencing/drain + 控制面（421）+ 批量迁移/清零 + stale
-  自动迁移已落地；controller tick 里 3s 周期的接线待做。
+- B3（已落地）：epoch/fencing/drain + 控制面（421）+ 批量迁移/清零 + stale 自动
+  迁移；controller tick 每 3s 触发 rebalance。
+- B2 收尾：config 快照与 slug 归属校验。
 
 ## 开发命令（A9）
 
@@ -60,8 +61,9 @@
   config/status，`--meta`/`--node-id`，standby 不备份）。
 - B2（进行中）：`uplink.uya` + `--uplink` 已通（node 注册/心跳）；config 快照与
   slug 归属待做。
-- B3（进行中）：epoch/fencing/drain + 控制面（421）+ 批量迁移/清零 + stale
-  自动迁移已落地；controller tick 里 3s 周期的接线待做。
+- B3（已落地）：epoch/fencing/drain + 控制面（421）+ 批量迁移/清零 + stale 自动
+  迁移；controller tick 每 3s 触发 rebalance。
+- B2 收尾：config 快照与 slug 归属校验。
 
 ## 开发命令（A9）
 

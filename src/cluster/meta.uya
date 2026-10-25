@@ -425,6 +425,18 @@ export fn meta_clear_node(d: &Db, node_id: &[byte]) !i64 {
 /// 返回迁移条数。没有 active 目标时返回 0。
 export fn meta_rebalance(d: &Db, now: i64, ttl: i64) !i64 {
     _ = try meta_node_expire(d, now, ttl);
+    var maxep: i64 = 0;
+    var ms: DbStmt = dbx_prepare(d,
+        "select coalesce(max(a.epoch), 0) from meta_assignments a join meta_nodes n on n.id = a.node_id where n.status = 'stale'" as &const byte) catch {
+        return error.MetaFailed;
+    };
+    if dbx_step(&ms) == 1 {
+        maxep = dbx_col_i64(&ms, 0);
+    }
+    dbx_finalize(&ms);
+    if maxep <= 0 {
+        return 0 as i64;
+    }
     var tgt: [byte: 64] = [0: 64];
     var tn: usize = 0;
     var ts: DbStmt = dbx_prepare(d,
@@ -438,7 +450,10 @@ export fn meta_rebalance(d: &Db, now: i64, ttl: i64) !i64 {
     if tn == 0 {
         return 0 as i64;
     }
-    const cur: i64 = try meta_epoch_bump(d, tgt[0: tn], now);
+    var cur: i64 = try meta_epoch_bump(d, tgt[0: tn], now);
+    while cur <= maxep {
+        cur = try meta_epoch_bump(d, tgt[0: tn], now);
+    }
     var st: DbStmt = dbx_prepare(d,
         "select id from meta_nodes where status = 'stale' order by id" as &const byte) catch {
         return error.MetaFailed;

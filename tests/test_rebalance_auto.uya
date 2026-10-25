@@ -32,8 +32,9 @@ fn test_auto() !void {
     try meta_node_register(&d, &"b"[0: 1], &"edge"[0: 4], &"127.0.0.1:2"[0: 11], T0);
     try meta_node_heartbeat(&d, &"b"[0: 1], T0 +% 100);
     try assert_eq_i64(try meta_epoch_bump(&d, &"a"[0: 1], T0), 1);
-    try meta_assign(&d, &"s1"[0: 2], &"a"[0: 1], 1, T0);
-    try meta_assign(&d, &"s2"[0: 2], &"a"[0: 1], 1, T0);
+    try assert_eq_i64(try meta_epoch_bump(&d, &"a"[0: 1], T0), 2);
+    try meta_assign(&d, &"s1"[0: 2], &"a"[0: 1], 2, T0);
+    try meta_assign(&d, &"s2"[0: 2], &"a"[0: 1], 2, T0);
     // a 超时 → stale；b 仍 active
     try assert_eq_i64(try meta_rebalance(&d, T0 +% 100, 50), 2);
     try assert_eq_i64(try meta_assign_count(&d, &"a"[0: 1]), 0);
