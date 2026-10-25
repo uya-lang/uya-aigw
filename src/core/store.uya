@@ -146,6 +146,66 @@ export fn store_list_keys(d: &Db, uid: i64, out: &StoreKeyRow, cap: usize) !usiz
 }
 
 /// 撤销某用户自己的 Key；返回是否命中（越权/不存在都是 false）。
+// ---- A4 快路径：最近一次校验成功的 Key 做单槽缓存（默认 2s）----
+const KEY_CACHE_TTL: i64 = 2;
+
+var g_kc_used: bool = false;
+var g_kc_token: [byte: 128] = [0: 128];
+var g_kc_token_len: usize = 0;
+var g_kc_key: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
+var g_kc_until: i64 = 0;
+
+export fn store_key_cache_flush() void {
+    g_kc_used = false;
+    g_kc_token_len = 0;
+    g_kc_until = 0;
+}
+
+fn store_key_cache_hit(token: &[byte], now: i64) bool {
+    if !g_kc_used || now >= g_kc_until || token.len != g_kc_token_len || token.len > 128 {
+        return false;
+    }
+    var i: usize = 0;
+    while i < token.len {
+        if g_kc_token[i] != token[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn store_key_cache_put(token: &[byte], k: &const StoreKey, now: i64) void {
+    if token.len == 0 || token.len > 128 {
+        return;
+    }
+    var i: usize = 0;
+    while i < token.len {
+        g_kc_token[i] = token[i];
+        i = i + 1;
+    }
+    g_kc_token_len = i;
+    g_kc_key.key_id = k.key_id;
+    g_kc_key.user_id = k.user_id;
+    g_kc_key.rpm = k.rpm;
+    g_kc_key.tpm = k.tpm;
+    g_kc_until = now +% KEY_CACHE_TTL;
+    g_kc_used = true;
+}
+
+/// 同 `store_verify_key`，但命中单槽缓存时跳过 DB（热路径）。
+export fn store_verify_key_fast(d: &Db, token: &[byte], now: i64, out: &StoreKey) !void {
+    if store_key_cache_hit(token, now) {
+        out.key_id = g_kc_key.key_id;
+        out.user_id = g_kc_key.user_id;
+        out.rpm = g_kc_key.rpm;
+        out.tpm = g_kc_key.tpm;
+        return;
+    }
+    try store_verify_key(d, token, out);
+    store_key_cache_put(token, out, now);
+}
+
 export fn store_revoke_key_owned(d: &Db, key_id: i64, uid: i64, now: i64) !bool {
     var st: DbStmt = dbx_prepare(d,
         "update api_keys set revoked_at = ? where id = ? and user_id = ? and revoked_at = 0" as &const byte) catch {
@@ -164,6 +224,7 @@ export fn store_revoke_key_owned(d: &Db, key_id: i64, uid: i64, now: i64) !bool 
     if dbx_step(&st) != 0 {
         return error.StoreFailed;
     }
+    store_key_cache_flush();
     return dbx_changes(d) == 1;
 }
 

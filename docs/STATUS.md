@@ -84,7 +84,8 @@
   （created/delta/completed）已通；reasoning/tools 仍未透传。
 - A4（已完成）：JSON DOM/构造器、providers/路由、billing 结算、chat 编排、serve 接线
   （非流/流式 SSE、tools 透传、失败转移、无 DOM 快路径、512 行/200ms 批量落库）、
-  上游等待事件驱动（`src/core/upwait.uya`，epoll 等 waker fd，不再忙轮询）。
+  上游等待事件驱动（`src/core/upwait.uya`，epoll 等 waker fd，不再忙轮询）、
+  Key 校验单槽缓存（`store_verify_key_fast`，TTL 2s，撤销即失效）。
 - B1（已落地）：meta.db + `elect.uya` + controller 控制面（register/heartbeat/
   config/status，`--meta`/`--node-id`，standby 不备份）。
 - B2（进行中）：`uplink.uya` + `--uplink` 已通（node 注册/心跳）；config 快照与

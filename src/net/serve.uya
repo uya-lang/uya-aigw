@@ -1286,7 +1286,8 @@ fn srv_usage(c: &SrvConn, stats: &ServeStats) void {
         return;
     }
     var key: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
-    store_verify_key(runtime_db(), tok[0: tn], &key) catch {
+    // A4 快路径：同一 Key 的连续请求走单槽缓存（TTL 2s），省一次 DB 校验。
+    store_verify_key_fast(runtime_db(), tok[0: tn], store_now(), &key) catch {
         srv_static(c, 401, SRV_JSON_401, keep);
         return;
     };
@@ -1400,7 +1401,8 @@ fn srv_chat(c: &SrvConn, stats: &ServeStats) void {
         return;
     }
     var key: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
-    store_verify_key(runtime_db(), tok[0: tn], &key) catch {
+    // A4 快路径：同一 Key 的连续请求走单槽缓存（TTL 2s），省一次 DB 校验。
+    store_verify_key_fast(runtime_db(), tok[0: tn], store_now(), &key) catch {
         srv_static(c, 401, SRV_JSON_401, keep);
         return;
     };
@@ -2897,7 +2899,8 @@ fn srv_responses(c: &SrvConn, stats: &ServeStats) void {
         return;
     }
     var key: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
-    store_verify_key(runtime_db(), tok[0: tn], &key) catch {
+    // A4 快路径：同一 Key 的连续请求走单槽缓存（TTL 2s），省一次 DB 校验。
+    store_verify_key_fast(runtime_db(), tok[0: tn], store_now(), &key) catch {
         srv_static(c, 401, SRV_JSON_401, keep);
         return;
     };
@@ -4305,7 +4308,8 @@ fn srv_usage_csv(c: &SrvConn, stats: &ServeStats) void {
         return;
     }
     var key: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
-    store_verify_key(runtime_db(), tok[0: tn], &key) catch {
+    // A4 快路径：同一 Key 的连续请求走单槽缓存（TTL 2s），省一次 DB 校验。
+    store_verify_key_fast(runtime_db(), tok[0: tn], store_now(), &key) catch {
         srv_static(c, 401, SRV_JSON_401, keep);
         return;
     };
@@ -4381,7 +4385,8 @@ fn srv_estimate(c: &SrvConn, stats: &ServeStats) void {
         return;
     }
     var key: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
-    store_verify_key(runtime_db(), tok[0: tn], &key) catch {
+    // A4 快路径：同一 Key 的连续请求走单槽缓存（TTL 2s），省一次 DB 校验。
+    store_verify_key_fast(runtime_db(), tok[0: tn], store_now(), &key) catch {
         srv_static(c, 401, SRV_JSON_401, keep);
         return;
     };
@@ -4942,7 +4947,8 @@ fn srv_requests(c: &SrvConn, stats: &ServeStats) void {
         return;
     }
     var key: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
-    store_verify_key(runtime_db(), tok[0: tn], &key) catch {
+    // A4 快路径：同一 Key 的连续请求走单槽缓存（TTL 2s），省一次 DB 校验。
+    store_verify_key_fast(runtime_db(), tok[0: tn], store_now(), &key) catch {
         srv_static(c, 401, SRV_JSON_401, keep);
         return;
     };
