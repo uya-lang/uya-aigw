@@ -95,8 +95,8 @@ B3（epoch/fencing/drain、421、批量迁移/清零、stale 自动迁移），�
 1. ~~TLS-01 → … → TLS-05A~~（已完成，见 `TODO_DONE.md`）
 2. 并行：A0 spike（SQLite + money）
 3. TLS-06 → TLS-07 → TLS-08 → TLS-09 → TLS-10 → TLS-11
-4. ~~A1 → A2 → A3 → A6 → A7 → A9~~ → A4/A5/A8 收尾
-5. ~~B1 → B2 → B3 → B6~~ → B4 → B5
+4. ~~A1 → A2 → A3 → A6 → A7 → A9~~ → A5 流式工具事件 → A8 插件重绑 → A4 快路径/批量落库
+5. ~~B1 → B2 → B3 → B6~~ → B4 edge→node 流式转发 → B5 usage 分片/journal 全量重放
 6. ~~C1 → C2 → C3 → C4 → C5 → C6~~ → C5 审计日志 → C4 通知
 
 ---
