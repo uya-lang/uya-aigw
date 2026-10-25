@@ -356,7 +356,7 @@ fn journal_field(line: &[byte], f: &JournalFields, idx: usize) &[byte] {
 }
 
 /// 应用一行到账本。返回 1=新增，0=重复，-1=坏行。
-fn journal_apply_line(d: &Db, st: &DbStmt, line: &[byte]) i32 {
+fn journal_apply_line(d: &Db, line: &[byte]) i32 {
     var f: JournalFields = JournalFields{ starts: [], ends: [], count: 0 };
     journal_split(line, &f);
     if f.count != 13 {
@@ -378,47 +378,56 @@ fn journal_apply_line(d: &Db, st: &DbStmt, line: &[byte]) i32 {
     if nums[0] < 0 {
         return 0 - 1;
     }
-    dbx_reset(st);
-    dbx_bind_text(st, 1, journal_field(line, &f, 1)) catch {
+    // B5：分片模式下按 user_id 路由到 usage-<k>.db；否则落传入的库。
+    var sdb: &Db = d;
+    if shard_active() {
+        sdb = shard_db_for(nums[0]);
+    }
+    var st: DbStmt = dbx_prepare(sdb,
+        "insert or ignore into usage_ledger(request_id, user_id, ts, model, provider, input_tokens, output_tokens, cache_read_tokens, cost_nano, price_nano, period, rate_version) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)" as &const byte) catch {
         return 0 - 1;
     };
-    dbx_bind_i64(st, 2, nums[0]) catch {
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, journal_field(line, &f, 1)) catch {
         return 0 - 1;
     };
-    dbx_bind_i64(st, 3, nums[1]) catch {
+    dbx_bind_i64(&st, 2, nums[0]) catch {
         return 0 - 1;
     };
-    dbx_bind_text(st, 4, journal_field(line, &f, 10)) catch {
+    dbx_bind_i64(&st, 3, nums[1]) catch {
         return 0 - 1;
     };
-    dbx_bind_text(st, 5, journal_field(line, &f, 11)) catch {
+    dbx_bind_text(&st, 4, journal_field(line, &f, 10)) catch {
         return 0 - 1;
     };
-    dbx_bind_i64(st, 6, nums[2]) catch {
+    dbx_bind_text(&st, 5, journal_field(line, &f, 11)) catch {
         return 0 - 1;
     };
-    dbx_bind_i64(st, 7, nums[3]) catch {
+    dbx_bind_i64(&st, 6, nums[2]) catch {
         return 0 - 1;
     };
-    dbx_bind_i64(st, 8, nums[4]) catch {
+    dbx_bind_i64(&st, 7, nums[3]) catch {
         return 0 - 1;
     };
-    dbx_bind_i64(st, 9, nums[5]) catch {
+    dbx_bind_i64(&st, 8, nums[4]) catch {
         return 0 - 1;
     };
-    dbx_bind_i64(st, 10, nums[6]) catch {
+    dbx_bind_i64(&st, 9, nums[5]) catch {
         return 0 - 1;
     };
-    dbx_bind_text(st, 11, journal_field(line, &f, 12)) catch {
+    dbx_bind_i64(&st, 10, nums[6]) catch {
         return 0 - 1;
     };
-    dbx_bind_i64(st, 12, nums[7]) catch {
+    dbx_bind_text(&st, 11, journal_field(line, &f, 12)) catch {
         return 0 - 1;
     };
-    if dbx_step(st) != 0 {
+    dbx_bind_i64(&st, 12, nums[7]) catch {
+        return 0 - 1;
+    };
+    if dbx_step(&st) != 0 {
         return 0 - 1;
     }
-    if dbx_changes(d) == 1 {
+    if dbx_changes(sdb) == 1 {
         return 1;
     }
     return 0;
@@ -441,13 +450,6 @@ export fn journal_replay(d: &Db, path: &[byte], stats: &JournalStats) !void {
         // 没有当天文件（或目录还不存在）不是错误
         return;
     };
-    var st: DbStmt = dbx_prepare(d,
-        "insert or ignore into usage_ledger(request_id, user_id, ts, model, provider, input_tokens, output_tokens, cache_read_tokens, cost_nano, price_nano, period, rate_version) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)" as &const byte) catch {
-        _ = sys_close(fd) catch {};
-        return error.JournalFailed;
-    };
-    defer { dbx_finalize(&st); }
-
     var buf: [byte: JOURNAL_READ_CHUNK] = [0: JOURNAL_READ_CHUNK];
     var line: [byte: JOURNAL_LINE_MAX] = [0: JOURNAL_LINE_MAX];
     var line_len: usize = 0;
@@ -469,7 +471,7 @@ export fn journal_replay(d: &Db, path: &[byte], stats: &JournalStats) !void {
                 if overflow {
                     stats.bad = stats.bad +% 1;
                 } else {
-                    const rc: i32 = journal_apply_line(d, &st, line[0: line_len]);
+                    const rc: i32 = journal_apply_line(d, line[0: line_len]);
                     if rc == 1 {
                         stats.applied = stats.applied +% 1;
                     } else if rc == 0 {

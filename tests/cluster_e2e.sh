@@ -19,7 +19,7 @@ mkdir -p "$TMP/c" "$TMP/n"
 UYA_ROOT=/home/winger/uya/uya/lib /home/winger/uya/uya/bin/uya build \
   src/foundation/buf.uya src/net/httpsrv.uya src/net/tcpx.uya src/net/serve.uya \
   src/core/money.uya src/core/reqlog.uya src/core/dbx.uya src/cluster/meta.uya src/cluster/elect.uya \
-  src/cluster/uplink.uya src/cluster/ingest.uya src/cluster/edge.uya src/cluster/spool.uya src/net/ui.uya src/net/rsav.uya \
+  src/cluster/uplink.uya src/cluster/ingest.uya src/cluster/shard.uya src/cluster/edge.uya src/cluster/spool.uya src/net/ui.uya src/net/rsav.uya \
   src/core/schema.uya src/core/store.uya src/core/budget.uya src/core/backup.uya src/core/journal.uya \
   src/core/runtime.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/rollup.uya \
   src/core/billing.uya src/core/batch.uya src/core/notify.uya src/core/lb.uya src/core/responses.uya src/core/chat.uya src/providers/upstream.uya \
@@ -192,6 +192,17 @@ I1=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer ck' --data "$IB" "$B
 echo "$I1" | grep -q '"applied":1' || { echo "$I1" >&2; fail "ingest 1"; }
 I2=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer ck' --data "$IB" "$BASE/controller/ingest")
 echo "$I2" | grep -q '"duplicate":1' || { echo "$I2" >&2; fail "ingest dup"; }
+# B5：usage 分片（uid 1 → usage-1.db、uid 2 → usage-2.db；admin billing 跨分片合并）
+IB2='{"day":20302,"rows":[{"request_id":"r3","user_id":1,"ts":1754096400,"model":"m","provider":"mock","input_tokens":10,"output_tokens":5,"cost_nano":1000,"price_nano":1500},{"request_id":"r4","user_id":2,"ts":1754096400,"model":"m","provider":"mock","input_tokens":7,"output_tokens":3,"cost_nano":700,"price_nano":900}]}'
+I3=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer ck' --data "$IB2" "$BASE/controller/ingest")
+echo "$I3" | grep -q '"applied":2' || { echo "$I3" >&2; fail "shard ingest"; }
+I4=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer ck' --data "$IB2" "$BASE/controller/ingest")
+echo "$I4" | grep -q '"duplicate":2' || { echo "$I4" >&2; fail "shard ingest dup"; }
+AB=$(curl -s --max-time 5 -H 'Authorization: Bearer ck' "$BASE/admin/billing?from_day=20302&to_day=20302")
+echo "$AB" | grep -q '"user_id":1' || { echo "$AB" >&2; fail "shard billing uid1"; }
+echo "$AB" | grep -q '"user_id":2' || { echo "$AB" >&2; fail "shard billing uid2"; }
+[ -f "$TMP/c/usage-1.db" ] || fail "shard file usage-1"
+[ -f "$TMP/c/usage-2.db" ] || fail "shard file usage-2"
 ok ingest
 
 # 8) B5：节点断网先落 spool，恢复后自动重放（人工触发一次 flush 由 tick 轮询完成）

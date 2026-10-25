@@ -1,0 +1,141 @@
+// tests/test_shard.uya — B5 usage 分片：路由纯函数、路径、按 uid 落不同分片、幂等
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_i64;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+use libc.syscall;
+
+const T0: i64 = 1700000000;
+const DIR: &[byte] = &"/tmp/aigw_shard_test"[0: 20];
+
+fn prep() void {
+    _ = sys_mkdir("/tmp/aigw_shard_test" as *const byte, 493) catch { 0; };
+}
+
+fn wipe() void {
+    var k: i32 = 0;
+    while k < SHARD_K {
+        var p: [byte: 512] = [0: 512];
+        const pn: usize = shard_path(DIR, k, &p[0], 512);
+        if pn > 0 {
+            _ = sys_unlink(&p[0] as *const byte) catch { 0; };
+        }
+        k = k + 1;
+    }
+}
+
+fn has(hay: &[byte], needle: &[byte]) bool {
+    if needle.len == 0 || hay.len < needle.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i + needle.len <= hay.len {
+        var j: usize = 0;
+        var same: bool = true;
+        while j < needle.len {
+            if hay[i + j] != needle[j] {
+                same = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if same {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn count_in(k: i32, sql: &[byte]) i64 {
+    var n: i64 = 0;
+    if dbx_scalar_i64(shard_db(k), sql, &n) != 0 {
+        return 0 - 1;
+    }
+    return n;
+}
+
+fn row(w: &JsonW, rid: &[byte], uid: i64) void {
+    jsonw_obj(w);
+    jsonw_key(w, &"request_id"[0: 10]);
+    jsonw_str(w, rid);
+    jsonw_key(w, &"user_id"[0: 7]);
+    jsonw_i64(w, uid);
+    jsonw_key(w, &"ts"[0: 2]);
+    jsonw_i64(w, T0);
+    jsonw_key(w, &"model"[0: 5]);
+    jsonw_str(w, &"m"[0: 1]);
+    jsonw_key(w, &"provider"[0: 8]);
+    jsonw_str(w, &"p"[0: 1]);
+    jsonw_key(w, &"input_tokens"[0: 12]);
+    jsonw_i64(w, 10);
+    jsonw_key(w, &"output_tokens"[0: 13]);
+    jsonw_i64(w, 5);
+    jsonw_key(w, &"cache_read_tokens"[0: 17]);
+    jsonw_i64(w, 0);
+    jsonw_key(w, &"cost_nano"[0: 9]);
+    jsonw_i64(w, 1);
+    jsonw_key(w, &"price_nano"[0: 10]);
+    jsonw_i64(w, 2);
+    jsonw_key(w, &"period"[0: 6]);
+    jsonw_str(w, &""[0: 0]);
+    jsonw_key(w, &"rate_version"[0: 12]);
+    jsonw_i64(w, 1);
+    jsonw_end_obj(w);
+}
+
+fn build(w: &JsonW) void {
+    jsonw_init(w);
+    jsonw_obj(w);
+    jsonw_key(w, &"rows"[0: 4]);
+    jsonw_arr(w);
+    row(w, &"s1"[0: 2], 1);
+    row(w, &"s2"[0: 2], 2);
+    jsonw_end_arr(w);
+    jsonw_end_obj(w);
+}
+
+fn test_map() !void {
+    prep();
+    try assert_eq_i32(shard_of(1), 1);
+    try assert_eq_i32(shard_of(2), 2);
+    try assert_eq_i32(shard_of(3), 3);
+    try assert_eq_i32(shard_of(4), 0);
+    try assert_eq_bool(shard_of(1) >= 0 && shard_of(1) < SHARD_K, true);
+    var p: [byte: 512] = [0: 512];
+    const pn: usize = shard_path(DIR, 2, &p[0], 512);
+    try assert_eq_bool(pn > 0, true);
+    try assert_eq_bool(has(p[0: pn], &"/usage-2.db"[0: 11]), true);
+}
+
+fn test_routed() !void {
+    prep();
+    wipe();
+    try shard_begin(DIR);
+    try assert_eq_bool(shard_active(), true);
+    var w: JsonW = JsonW{};
+    build(&w);
+    var st: IngestStats = try ingest_apply_routed(shard_db(0), jsonw_span(&w), T0);
+    try assert_eq_i64(st.applied, 2);
+    try assert_eq_i64(st.duplicate, 0);
+    try assert_eq_i64(st.bad, 0);
+    // uid 1 → 分片 1，uid 2 → 分片 2，其余分片为空
+    try assert_eq_i64(count_in(1, &"select count(*) from usage_ledger"[0: 33]), 1);
+    try assert_eq_i64(count_in(2, &"select count(*) from usage_ledger"[0: 33]), 1);
+    try assert_eq_i64(count_in(0, &"select count(*) from usage_ledger"[0: 33]), 0);
+    try assert_eq_i64(count_in(3, &"select count(*) from usage_ledger"[0: 33]), 0);
+    // usage_daily 也落在同一分片
+    try assert_eq_i64(count_in(1, &"select count(*) from usage_daily"[0: 32]), 1);
+    try assert_eq_i64(count_in(2, &"select count(*) from usage_daily"[0: 32]), 1);
+    // 幂等：重复 batch 只记 duplicate
+    st = try ingest_apply_routed(shard_db(0), jsonw_span(&w), T0);
+    try assert_eq_i64(st.applied, 0);
+    try assert_eq_i64(st.duplicate, 2);
+    try assert_eq_i64(count_in(1, &"select count(*) from usage_ledger"[0: 33]), 1);
+    shard_end();
+    try assert_eq_bool(shard_active(), false);
+    wipe();
+}
+
+test "map" { run_test("map", test_map); }
+test "routed" { run_test("routed", test_routed); }

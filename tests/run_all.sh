@@ -35,7 +35,8 @@ run src/core/dbx.uya src/cluster/meta.uya tests/test_meta.uya
 run src/core/dbx.uya src/cluster/meta.uya tests/test_epoch.uya
 run src/core/dbx.uya src/cluster/meta.uya tests/test_rebalance.uya
 run src/core/dbx.uya src/cluster/meta.uya tests/test_rebalance_auto.uya
-run src/core/dbx.uya src/core/schema.uya src/core/json.uya src/core/rollup.uya src/cluster/ingest.uya tests/test_ingest.uya
+run src/core/dbx.uya src/core/schema.uya src/core/json.uya src/core/rollup.uya src/cluster/ingest.uya src/cluster/shard.uya tests/test_ingest.uya
+run src/core/dbx.uya src/core/schema.uya src/core/json.uya src/core/rollup.uya src/cluster/ingest.uya src/cluster/shard.uya tests/test_shard.uya
 run src/core/dbx.uya src/cluster/meta.uya src/cluster/edge.uya tests/test_edge.uya
 run src/cluster/spool.uya tests/test_spool.uya
 run src/core/dbx.uya src/core/schema.uya src/core/store.uya tests/test_keys.uya
@@ -44,14 +45,14 @@ run src/core/dbx.uya src/core/schema.uya src/core/store.uya tests/test_admin_lis
 run src/core/json.uya src/core/dbx.uya src/core/schema.uya src/core/responses.uya tests/test_responses.uya
 run src/core/dbx.uya src/cluster/meta.uya src/cluster/elect.uya tests/test_elect.uya
 run src/core/dbx.uya src/core/schema.uya src/core/backup.uya tests/test_backup.uya
-run src/core/dbx.uya src/core/schema.uya src/core/backup.uya src/core/journal.uya tests/test_journal.uya
-run src/core/dbx.uya src/core/schema.uya src/core/money.uya src/core/schedule.uya src/core/store.uya src/core/backup.uya src/core/journal.uya src/core/runtime.uya tests/test_runtime.uya
+run src/core/dbx.uya src/core/schema.uya src/core/backup.uya src/core/journal.uya src/cluster/shard.uya tests/test_journal.uya
+run src/core/dbx.uya src/core/schema.uya src/core/money.uya src/core/schedule.uya src/core/store.uya src/core/backup.uya src/core/journal.uya src/core/runtime.uya src/cluster/shard.uya tests/test_runtime.uya
 run src/plugins/pool.uya tests/test_pool.uya
 run src/core/json.uya tests/test_json.uya
-run src/core/dbx.uya src/core/schema.uya src/core/money.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/backup.uya src/core/journal.uya src/core/billing.uya tests/test_billing.uya
-run src/core/dbx.uya src/core/schema.uya src/core/store.uya src/core/money.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/backup.uya src/core/journal.uya src/core/billing.uya src/core/batch.uya tests/test_batch.uya
+run src/core/dbx.uya src/core/schema.uya src/core/money.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/backup.uya src/core/journal.uya src/core/billing.uya src/cluster/shard.uya tests/test_billing.uya
+run src/core/dbx.uya src/core/schema.uya src/core/store.uya src/core/money.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/backup.uya src/core/journal.uya src/core/billing.uya src/core/batch.uya src/cluster/shard.uya tests/test_batch.uya
 run src/core/notify.uya src/cluster/spool.uya src/core/json.uya tests/test_notify.uya
-run src/core/dbx.uya src/core/schema.uya src/core/store.uya src/core/money.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/backup.uya src/core/journal.uya src/core/billing.uya src/core/batch.uya src/core/lb.uya src/core/responses.uya src/core/chat.uya tests/test_chat.uya
+run src/core/dbx.uya src/core/schema.uya src/core/store.uya src/core/money.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/backup.uya src/core/journal.uya src/core/billing.uya src/core/batch.uya src/core/lb.uya src/core/responses.uya src/core/chat.uya src/cluster/shard.uya tests/test_chat.uya
 run src/foundation/buf.uya src/net/httpsrv.uya tests/test_httpsrv.uya
 run src/foundation/buf.uya src/core/money.uya src/core/reqlog.uya tests/test_reqlog.uya
 

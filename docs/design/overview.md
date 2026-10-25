@@ -135,7 +135,7 @@
 | 数据 | 位置 |
 |---|---|
 | 元数据（用户/密钥/模型/价目/分配） | controller `meta.db` |
-| 计费明细 + rollup | controller `usage-<k>.db`，`hash(user_id) % K`，K=4 |
+| 计费明细 + rollup | controller `usage-<k>.db`，`hash(user_id) % K`，K=4；journal 重放/ingest/查询都按 uid 路由或合并（已落地） |
 | 节点本地日志/待上报 | node `node-<id>.db` |
 
 - SQLite 3（`@c_import` 编入二进制），WAL、`synchronous=NORMAL`、`busy_timeout=5000`。

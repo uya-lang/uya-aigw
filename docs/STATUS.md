@@ -57,8 +57,8 @@
 - B4（已完成）：edge 路由核心 + `GET /edge/route`、`/edge/fail`、`GET /edge/proxy`（节点代理 +
   失败清亲和重试）+ `stream=1` SSE 流式转发（chunked 增量解码，cluster e2e 实测首事件 0.000s、
   总时长 0.389s）+ 1k 并发压测（`make load-sse`）。
-- B5（进行中）：幂等 ingest、区间重算、spool 重放循环（`POST /node/spool` + tick 2s 重放，
-  全成功才清空）、Key 吊销已落地；usage 分片与 journal 全量重放待做。
+- B5（已完成）：幂等 ingest、区间重算、spool 重放循环、Key 吊销、journal 重放 +
+  usage 分片（controller `usage-<k>.db`，`hash(user_id)%4`，journal/ingest/查询按 uid 路由与合并）。
 - B6（已完成）：`make cluster-e2e` 全绿（1 controller + 3 node、epoch/fencing、config 快照、
   edge 路由/亲和/归属、代理、drain 迁移、ingest 幂等、spool 重放）+ `deploy/nginx.conf`、`docs/deploy.md`。
 - C6（已完成）：CSP/nosniff/Referrer-Policy/XFO 安全头、XSS/越权断言、`make ui-e2e`、
@@ -113,8 +113,8 @@
 - B4（已完成）：edge 路由核心 + `GET /edge/route`、`/edge/fail`、`GET /edge/proxy`（节点代理 +
   失败清亲和重试）+ `stream=1` SSE 流式转发（chunked 增量解码，cluster e2e 实测首事件 0.000s、
   总时长 0.389s）+ 1k 并发压测（`make load-sse`）。
-- B5（进行中）：幂等 ingest、区间重算、spool 重放循环（`POST /node/spool` + tick 2s 重放，
-  全成功才清空）、Key 吊销已落地；usage 分片与 journal 全量重放待做。
+- B5（已完成）：幂等 ingest、区间重算、spool 重放循环、Key 吊销、journal 重放 +
+  usage 分片（controller `usage-<k>.db`，`hash(user_id)%4`，journal/ingest/查询按 uid 路由与合并）。
 - B6（已完成）：`make cluster-e2e` 全绿（1 controller + 3 node、epoch/fencing、config 快照、
   edge 路由/亲和/归属、代理、drain 迁移、ingest 幂等、spool 重放）+ `deploy/nginx.conf`、`docs/deploy.md`。
 - C6（已完成）：CSP/nosniff/Referrer-Policy/XFO 安全头、XSS/越权断言、`make ui-e2e`、
@@ -166,6 +166,8 @@
 - spike 只验证 TLS 1.2（`s_server -tls1_2`）；TLS 1.3 待补测
 - 不做 HTTP/2/3、gzip、入站 TLS（建议 nginx/caddy）
 - 上游请求仍走 `block_on`（忙轮询），事件循环内的异步化（A4 p99）待做
+- controller 每日自动备份只覆盖 runtime DB；usage 分片需用 `aigw backup --db data/usage-<k>.db`
+  或外部快照（见 `docs/runbooks/restore.md`）
 
 ## 性能基线（本机实测）
 

@@ -1213,6 +1213,64 @@ fn srv_query_day(path: &const byte, n: usize, key: &const byte, kn: usize) i64 {
 }
 
 /// A6：/v1/usage 读 usage_daily 汇总（按天，用户级）。
+/// B5：把一行 rollup 拷到目标（结构体含数组，逐字段/逐字节复制）。
+fn srv_rollup_copy(dst: &RollupRow, src: &RollupRow) void {
+    dst.day = src.day;
+    dst.user_id = src.user_id;
+    dst.model_len = src.model_len;
+    dst.provider_len = src.provider_len;
+    dst.period_len = src.period_len;
+    dst.requests = src.requests;
+    dst.input_tokens = src.input_tokens;
+    dst.output_tokens = src.output_tokens;
+    dst.cache_read_tokens = src.cache_read_tokens;
+    dst.cost_nano = src.cost_nano;
+    dst.price_nano = src.price_nano;
+    var i: usize = 0;
+    while i < ROLLUP_MODEL_MAX {
+        dst.model[i] = src.model[i];
+        i = i + 1;
+    }
+    i = 0;
+    while i < ROLLUP_PROVIDER_MAX {
+        dst.provider[i] = src.provider[i];
+        i = i + 1;
+    }
+    i = 0;
+    while i < ROLLUP_PERIOD_MAX {
+        dst.period[i] = src.period[i];
+        i = i + 1;
+    }
+}
+
+/// B5：controller 分片模式下合并各分片；node/单机直接查 runtime DB。
+fn srv_rollup_query(uid: i64, from_day: i64, to_day: i64, out: &RollupRow,
+    cap: usize) usize {
+    if !shard_active() {
+        return rollup_query(runtime_db(), uid, from_day, to_day, out, cap) catch {
+            0 as usize;
+        };
+    }
+    var n: usize = 0;
+    var k: i32 = 0;
+    while k < SHARD_K {
+        if uid <= 0 || shard_of(uid) == k {
+            var part: [RollupRow: 64] = [];
+            const pn: usize = rollup_query(shard_db(k), uid, from_day, to_day, &part[0], 64) catch {
+                0 as usize;
+            };
+            var j: usize = 0;
+            while j < pn && j < 64 && n < cap {
+                srv_rollup_copy(&out[n], &part[j]);
+                n = n + 1;
+                j = j + 1;
+            }
+        }
+        k = k + 1;
+    }
+    return n;
+}
+
 fn srv_usage(c: &SrvConn, stats: &ServeStats) void {
     const keep: bool = c.keep;
     srv_batch_sync();
@@ -1247,10 +1305,7 @@ fn srv_usage(c: &SrvConn, stats: &ServeStats) void {
     }
     var rows: [RollupRow: 64] = [];
     var n: usize = 0;
-    n = rollup_query(runtime_db(), key.user_id, from_day, to_day, &rows[0], 64) catch {
-        srv_static(c, 502, SRV_JSON_502, keep);
-        return;
-    };
+    n = srv_rollup_query(key.user_id, from_day, to_day, &rows[0], 64);
     var w: JsonW = JsonW{};
     jsonw_init(&w);
     jsonw_obj(&w);
@@ -2757,10 +2812,7 @@ fn srv_admin_billing(c: &SrvConn, stats: &ServeStats) void {
     }
     var rows: [RollupRow: 64] = [];
     var n: usize = 0;
-    n = rollup_query(runtime_db(), uid, from_day, to_day, &rows[0], 64) catch {
-        srv_static(c, 502, SRV_JSON_502, keep);
-        return;
-    };
+    n = srv_rollup_query(uid, from_day, to_day, &rows[0], 64);
     var w: JsonW = JsonW{};
     jsonw_init(&w);
     jsonw_obj(&w);
@@ -3220,9 +3272,7 @@ fn srv_mcp(c: &SrvConn, stats: &ServeStats) void {
             }
             var rows: [RollupRow: 64] = [];
             var rn: usize = 0;
-            rn = rollup_query(runtime_db(), uid, from_day, to_day, &rows[0], 64) catch {
-                0 as usize;
-            };
+            rn = srv_rollup_query(uid, from_day, to_day, &rows[0], 64);
             jsonw_obj(&iw);
             jsonw_key(&iw, &"rows"[0: 4]);
             jsonw_arr(&iw);
@@ -4186,7 +4236,7 @@ fn srv_ctl_ingest(c: &SrvConn, stats: &ServeStats) void {
     }
     const now: i64 = store_now();
     var st: IngestStats = IngestStats{ applied: 0, duplicate: 0, bad: 0 };
-    st = ingest_apply(runtime_db(), c.body[0: c.body_len], now) catch {
+    st = ingest_apply_routed(runtime_db(), c.body[0: c.body_len], now) catch {
         srv_static(c, 400, SRV_JSON_400, keep);
         return;
     };
@@ -4274,10 +4324,7 @@ fn srv_usage_csv(c: &SrvConn, stats: &ServeStats) void {
     }
     var rows: [RollupRow: 64] = [];
     var n: usize = 0;
-    n = rollup_query(runtime_db(), key.user_id, from_day, to_day, &rows[0], 64) catch {
-        srv_static(c, 502, SRV_JSON_502, keep);
-        return;
-    };
+    n = srv_rollup_query(key.user_id, from_day, to_day, &rows[0], 64);
     var b: Buf = buf_new(8192);
     defer { buf_free(&b); }
     if !buf_valid(&b) {

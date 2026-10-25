@@ -43,17 +43,8 @@ A4 进度（子项已完成记录见 `TODO_DONE.md`）：
 
 | ID | 任务 | 验收 | 依赖 |
 |---|---|---|---|
-| B5 | ingest 幂等 + 金额/时段重算 + usage 分片 + spool + 吊销 + journal 重放 | 断网 30s 不丢不重；恢复对账一致 | B1/B3 |
-| B6 | 集群 e2e + 部署（1 controller + 3 node + 2 edge + nginx） | `cluster_e2e.sh` 全绿 | B1–B5 |
-
-进度（子项完成记录见 `TODO_DONE.md`）：
-- B5：幂等 ingest（`POST /controller/ingest`，重复批 `duplicate`）、区间重算、本地 spool
-  （`POST /node/spool` + tick 每 2s 重放，失败保留）、Key 吊销、journal 重放（`journal_replay`/
-  `journal_replay_days` 幂等，`tests/test_journal.uya` 5 组）已完成；usage 分片待做。
-- B6 已完成：`make cluster-e2e` 全绿 + `deploy/nginx.conf`、`docs/deploy.md`（见 `TODO_DONE.md`）。
-
-已完成：B1（meta.db/选主/控制面）、B2（uplink、注册/心跳、config 快照、归属校验）、
-B3（epoch/fencing/drain、421、批量迁移/清零、stale 自动迁移），详见 `TODO_DONE.md`。
+全部完成（B1…B6：meta.db/选主、uplink、epoch/fencing/drain、edge 路由与 SSE 流式转发、
+ingest 幂等 + usage 分片 `hash(user_id)%4`、spool、journal 重放、集群 e2e 与部署，见 `TODO_DONE.md`）。
 
 ---
 
@@ -71,7 +62,7 @@ B3（epoch/fencing/drain、421、批量迁移/清零、stale 自动迁移），�
 2. 并行：A0 spike（SQLite + money）
 3. TLS-06 → TLS-07 → TLS-08 → TLS-09 → TLS-10 → TLS-11
 4. ~~A1 → A2 → A3 → A6 → A7 → A9 → A8 插件重绑 → A4 快路径/批量落库 → A5 流式工具事件~~ → A4 上游异步化
-5. ~~B1 → B2 → B3 → B6 → B4 edge→node 流式转发~~ → B5 usage 分片/journal 全量重放
+5. ~~B1 → B2 → B3 → B6 → B4 edge→node 流式转发 → B5 usage 分片~~（Phase B 全部完成）
 6. ~~C1 → C2 → C3 → C4 → C5 → C6~~（Phase C 全部完成）
 
 ---
