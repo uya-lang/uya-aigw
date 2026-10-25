@@ -29,7 +29,10 @@
   （`tests/test_backup.uya` 41 断言，快照可独立打开读回）、`price.uya` 版本化价目 +
   用户覆盖 + 分时金额、`journal.uya` 每日分片 journal + fsync + 幂等重放
   （`tests/test_price.uya` 28 断言、`tests/test_journal.uya` 50 断言）。
-  **剩余**：把 store/backup/journal/价目接到 `aigw serve` 的启动流程与请求路径（A4 起）。
+  **已接线**：`runtime.uya` 把建目录 / `schema_open` / journal 重放与清理 / 每日备份
+  接到 `aigw serve`（`--db`、`--data-dir`）；`tests/test_runtime.uya` 14 断言，
+  `serve_smoke.sh` 断言启动建库。**剩余**：请求路径（鉴权 → 调用 → usage 落库/journal）
+  在 A4 接上。
 - A1（服务端）：`src/net/serve.uya` 单线程 epoll 状态机（1024 槽）、64 MiB 包体流式排空、
   chunked SSE、SIGTERM 优雅停机；`tests/serve_smoke.sh` 断言 512 并发 SSE、线程数=1、
   停机退出码 0（`SERVE-ALL-OK`）。
