@@ -258,6 +258,14 @@ kill "$NB_PID" 2>/dev/null || true
 wait "$NB_PID" 2>/dev/null || true
 NB_PID=""
 
+# 4k) C3：费用估算（价格来自 seed 的 sell 价目）
+EST=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $TOKEN" \
+  --data '{"model":"mock-model","provider":"mock","prompt_tokens":1000,"completion_tokens":500}' "$BASE/v1/estimate")
+echo "$EST" | grep -q '"price_nano"' || { echo "$EST" >&2; fail "estimate"; }
+EST2=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $TOKEN" \
+  --data '{"model":"nope-model","provider":"mock","prompt_tokens":1,"completion_tokens":1}' "$BASE/v1/estimate")
+echo "$EST2" | grep -q '"error"' || { echo "$EST2" >&2; fail "estimate 404"; }
+
 # 4j) C2：用量 CSV 导出
 CSVH=$(curl -s --max-time 5 -D - -o /dev/null -H "Authorization: Bearer $TOKEN" "$BASE/v1/usage.csv")
 echo "$CSVH" | grep -qi 'content-type: text/csv' || { echo "$CSVH" >&2; fail "csv ctype"; }
@@ -274,6 +282,8 @@ echo "$UIJS" | grep -q '/v1/keys/revoke' || { echo "$UIJS" >&2; fail "ui js"; }
 echo "$UI" | grep -q 'id="overview"' || { echo "$UI" >&2; fail "ui overview"; }
 echo "$UIJS" | grep -q '/v1/usage' || { echo "$UIJS" >&2; fail "ui usage"; }
 echo "$UIJS" | grep -q 'usage-table' || { echo "$UIJS" >&2; fail "ui usage table"; }
+echo "$UI" | grep -q 'id="estimate"' || { echo "$UI" >&2; fail "ui estimate"; }
+echo "$UIJS" | grep -q '/v1/estimate' || { echo "$UIJS" >&2; fail "ui estimate js"; }
 CT=$(curl -s --max-time 5 -o /dev/null -w '%{content_type}' "$BASE/")
 case "$CT" in text/html*) ;; *) fail "ui content-type=$CT";; esac
 

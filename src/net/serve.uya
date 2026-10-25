@@ -82,6 +82,7 @@ const ROUTE_RESPONSES: i32 = 14;
 const ROUTE_MCP: i32 = 15;
 const ROUTE_KEY_REVOKE: i32 = 24;
 const ROUTE_CTL_INGEST: i32 = 25;
+const ROUTE_ESTIMATE: i32 = 29;
 const ROUTE_USAGE_CSV: i32 = 28;
 const ROUTE_UI: i32 = 26;
 const ROUTE_UI_JS: i32 = 27;
@@ -589,6 +590,9 @@ fn srv_route_of(req: &HsrvReq) i32 {
     }
     if srv_path_is(req, &"/v1/me"[0: 6]) {
         return ROUTE_ME;
+    }
+    if srv_path_is(req, &"/v1/estimate"[0: 12]) {
+        return ROUTE_ESTIMATE;
     }
     if srv_path_is(req, &"/v1/usage.csv"[0: 13]) {
         return ROUTE_USAGE_CSV;
@@ -1167,6 +1171,10 @@ fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
     }
     if c.route == ROUTE_ME {
         srv_me(c, stats);
+        return;
+    }
+    if c.route == ROUTE_ESTIMATE {
+        srv_estimate(c, stats);
         return;
     }
     if c.route == ROUTE_USAGE_CSV {
@@ -3484,4 +3492,86 @@ fn srv_usage_csv(c: &SrvConn, stats: &ServeStats) void {
         return;
     }
     srv_static_ct(c, 200, b.ptr[0: b.len], keep, SRV_CTYPE_CSV[0: 22], 22);
+}
+
+
+// C3：费用估算（不落账，只按当前价目/时段算一遍）。
+fn srv_estimate(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    if !runtime_ready() {
+        srv_static(c, 503, SRV_JSON_503, keep);
+        return;
+    }
+    var tok: [byte: 256] = [0: 256];
+    const tn: usize = chat_bearer_span(&c.auth[0], c.auth_len, &tok[0], 256);
+    if tn == 0 {
+        srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    }
+    var key: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
+    store_verify_key(runtime_db(), tok[0: tn], &key) catch {
+        srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    };
+    if c.body_overflow {
+        srv_static(c, 413, SRV_JSON_413, keep);
+        return;
+    }
+    var d: JsonDoc = JsonDoc{};
+    json_parse(&d, c.body[0: c.body_len]) catch {
+        srv_static(c, 400, SRV_JSON_400, keep);
+        return;
+    };
+    const root: i32 = json_root(&d);
+    var model: [byte: 128] = [0: 128];
+    var mn: usize = json_str(&d, json_get(&d, root, &"model"[0: 5]), &model[0], 128);
+    if mn == 0 {
+        const def: &[byte] = &"default"[0: 7];
+        var k: usize = 0;
+        while k < 7 {
+            model[k] = def[k];
+            k = k + 1;
+        }
+        mn = 7;
+    }
+    var prov: [byte: 128] = [0: 128];
+    const pn: usize = json_str(&d, json_get(&d, root, &"provider"[0: 8]), &prov[0], 128);
+    const in_t: i64 = json_i64(&d, json_get(&d, root, &"prompt_tokens"[0: 13]));
+    const out_t: i64 = json_i64(&d, json_get(&d, root, &"completion_tokens"[0: 15]));
+    const cache_t: i64 = json_i64(&d, json_get(&d, root, &"cached_tokens"[0: 13]));
+    if in_t < 0 || out_t < 0 || cache_t < 0 {
+        srv_static(c, 400, SRV_JSON_400, keep);
+        return;
+    }
+    var usage: PriceUsage = PriceUsage{ input_tokens: in_t, output_tokens: out_t, cache_read_tokens: cache_t };
+    var res: BillingResult = BillingResult{ cost_nano: 0, price_nano: 0, rate_version: 0, duplicate: false, found: false };
+    billing_quote(runtime_db(), model[0: mn], prov[0: pn], key.user_id, store_now(), 0,
+        &usage, &res) catch {
+        srv_static(c, 502, SRV_JSON_502, keep);
+        return;
+    };
+    if !res.found {
+        srv_static(c, 404, SRV_JSON_404, keep);
+        return;
+    }
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"model"[0: 5]);
+    jsonw_str(&w, model[0: mn]);
+    jsonw_key(&w, &"input_tokens"[0: 12]);
+    jsonw_i64(&w, in_t);
+    jsonw_key(&w, &"output_tokens"[0: 13]);
+    jsonw_i64(&w, out_t);
+    jsonw_key(&w, &"cost_nano"[0: 9]);
+    jsonw_i64(&w, res.cost_nano);
+    jsonw_key(&w, &"price_nano"[0: 10]);
+    jsonw_i64(&w, res.price_nano);
+    jsonw_key(&w, &"profit_nano"[0: 11]);
+    jsonw_i64(&w, res.price_nano -% res.cost_nano);
+    jsonw_key(&w, &"rate_version"[0: 12]);
+    jsonw_i64(&w, res.rate_version);
+    jsonw_end_obj(&w);
+    srv_static(c, 200, jsonw_span(&w), keep);
 }
