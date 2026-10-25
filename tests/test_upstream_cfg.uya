@@ -1,0 +1,54 @@
+// tests/test_upstream_cfg.uya — ChatPlan → HttppConfig 映射（脱网）
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+fn contains(hay: &[byte], needle: &[byte]) bool {
+    if needle.len == 0 || hay.len < needle.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i + needle.len <= hay.len {
+        var j: usize = 0;
+        var same: bool = true;
+        while j < needle.len {
+            if hay[i + j] != needle[j] {
+                same = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if same {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn test_config() !void {
+    var cfg: HttppConfig = httpp_empty();
+    try assert_eq_bool(upstream_config("localhost" as &const byte, 9, 18080, 1,
+        "literal:sk-test" as &const byte, 15, &cfg), true);
+    try assert_eq_i32(cfg.port as i32, 18080);
+    try assert_eq_i32(cfg.auth_type as i32, 1);
+    try assert_eq_i32(cfg.host_len as i32, 9);
+    try assert_eq_i32(cfg.host[0] as i32, 'l' as i32);
+    try assert_eq_i32(cfg.secret_len as i32, 7);
+
+    var b: Buf = buf_new(256);
+    defer { buf_free(&b); }
+    try assert_eq_bool(httpp_auth_line(&cfg, &b), true);
+    try assert_eq_bool(contains(b.ptr[0: b.len], &"Authorization: Bearer sk-test\r\n"[0: 31]), true);
+}
+
+fn test_bad() !void {
+    var cfg: HttppConfig = httpp_empty();
+    try assert_eq_bool(upstream_config("h" as &const byte, 1, 0, 1, "" as &const byte, 0, &cfg), false);
+    try assert_eq_bool(upstream_config("h" as &const byte, 1, 70000, 1, "" as &const byte, 0, &cfg), false);
+    try assert_eq_bool(upstream_config("" as &const byte, 0, 80, 1, "" as &const byte, 0, &cfg), false);
+    try assert_eq_bool(upstream_config("h" as &const byte, 1, 80, 4, "" as &const byte, 0, &cfg), false);
+}
+
+test "config" { run_test("config", test_config); }
+test "bad" { run_test("bad", test_bad); }

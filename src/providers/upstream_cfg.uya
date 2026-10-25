@@ -1,0 +1,30 @@
+// src/providers/upstream_cfg.uya — ChatPlan 字段 → HttppConfig 的纯映射（无网络/无 TLS）
+//
+// 单独成模块，是为了让映射逻辑能脱网单测：serve 拿到 ChatPlan 后调用这里，
+// 再把 cfg 交给 upstream_post。`cfg` 必须是 `httpp_empty()` 的初值。
+
+export fn upstream_config(host: &const byte, host_len: usize, port: i32,
+    auth_type: i32, secret: &const byte, secret_len: usize, cfg: &HttppConfig) bool {
+    if port <= 0 || port > 65535 || auth_type < 0 || auth_type > 3
+        || host_len == 0 || host_len > HTTPP_HOST_MAX || secret_len > HTTPP_SECRET_MAX {
+        return false;
+    }
+    cfg.port = port as u16;
+    cfg.auth_type = auth_type as u8;
+    cfg.host_len = 0;
+    cfg.secret_len = 0;
+    cfg.base_path_len = 0;
+    cfg.alias_count = 0;
+    cfg.tls_mode = 0;
+    cfg.allow_plaintext = false;
+    cfg.allow_private = false;
+    if !httpp_set_host(cfg, host, host_len) {
+        return false;
+    }
+    if secret_len > 0 {
+        if !httpp_set_secret(cfg, secret, secret_len) {
+            return false;
+        }
+    }
+    return true;
+}
