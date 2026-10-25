@@ -1,0 +1,226 @@
+// src/core/chat.uya — A4 chat 请求编排：解析 → 路由 → 重写上游请求 → 结算
+//
+// 传输层（TLS 上游）不在这里：serve/A8 拿到 ChatPlan 后交给 htc_* 执行，
+// 再把响应体交给 chat_settle。这样路由/重写/金额都能脱离网络做单测。
+//
+// ChatPlan 全部用固定缓冲（无分配）：provider 字段 + 上游 path + 重写后的请求体。
+
+export const CHAT_MODEL_MAX: usize = 128;
+export const CHAT_HOST_MAX: usize = 256;
+export const CHAT_PATH_MAX: usize = 256;
+export const CHAT_AUTH_NAME_MAX: usize = 64;
+export const CHAT_SECRET_MAX: usize = 256;
+export const CHAT_PAYLOAD_MAX: usize = 32768;
+
+export error ChatBadRequest;
+export error ChatNoRoute;
+export error ChatNoUsage;
+export error ChatTooLarge;
+export error ChatFailed;
+
+export struct ChatPlan {
+    model: [byte: CHAT_MODEL_MAX],
+    model_len: usize,
+    upstream_model: [byte: CHAT_MODEL_MAX],
+    upstream_len: usize,
+    scheme: [byte: 8],
+    scheme_len: usize,
+    host: [byte: CHAT_HOST_MAX],
+    host_len: usize,
+    port: i32,
+    path: [byte: CHAT_PATH_MAX],
+    path_len: usize,
+    provider_name: [byte: 64],
+    provider_name_len: usize,
+    auth_type: i32,
+    auth_name: [byte: CHAT_AUTH_NAME_MAX],
+    auth_name_len: usize,
+    secret: [byte: CHAT_SECRET_MAX],
+    secret_len: usize,
+    timeout_ms: i32,
+    provider_id: i64,
+    stream: bool,
+    payload: [byte: CHAT_PAYLOAD_MAX],
+    payload_len: usize,
+}
+
+fn chat_copy(dst: &byte, cap: usize, src: &[byte]) usize {
+    var i: usize = 0;
+    while i < src.len && i < cap {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+    return i;
+}
+
+fn chat_put(out: &byte, cap: usize, off: &usize, data: &[byte]) bool {
+    var i: usize = 0;
+    while i < data.len {
+        if off[0] >= cap {
+            return false;
+        }
+        out[off[0]] = data[i];
+        off[0] = off[0] + 1;
+        i = i + 1;
+    }
+    return true;
+}
+
+fn chat_ws(c: byte) bool {
+    return c == (32 as byte) || c == (9 as byte) || c == (10 as byte) || c == (13 as byte);
+}
+
+/// 在请求体里定位顶层 `"model"` 的字符串值（不含引号）。
+fn chat_find_model_value(body: &[byte], vs: &usize, ve: &usize) bool {
+    var i: usize = 0;
+    while i + 7 <= body.len {
+        if body[i] == (34 as byte) && body[i + 1] == ('m' as byte)
+            && body[i + 2] == ('o' as byte) && body[i + 3] == ('d' as byte)
+            && body[i + 4] == ('e' as byte) && body[i + 5] == ('l' as byte)
+            && body[i + 6] == (34 as byte) {
+            var j: usize = i + 7;
+            while j < body.len && chat_ws(body[j]) {
+                j = j + 1;
+            }
+            if j < body.len && body[j] == (58 as byte) {
+                j = j + 1;
+                while j < body.len && chat_ws(body[j]) {
+                    j = j + 1;
+                }
+                if j < body.len && body[j] == (34 as byte) {
+                    var k: usize = j + 1;
+                    while k < body.len {
+                        if body[k] == (34 as byte) {
+                            vs[0] = j + 1;
+                            ve[0] = k;
+                            return true;
+                        }
+                        if body[k] == (92 as byte) && k + 1 < body.len {
+                            k = k + 2;
+                            continue;
+                        }
+                        k = k + 1;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// 把请求体里的 model 值换成上游模型名；没找到就原样拷贝。
+fn chat_rewrite_model(body: &[byte], model: &[byte], out: &byte, cap: usize) usize {
+    var vs: usize = 0;
+    var ve: usize = 0;
+    if !chat_find_model_value(body, &vs, &ve) {
+        if body.len > cap {
+            return 0;
+        }
+        var i: usize = 0;
+        while i < body.len {
+            out[i] = body[i];
+            i = i + 1;
+        }
+        return body.len;
+    }
+    var off: usize = 0;
+    if !chat_put(out, cap, &off, body[0: vs]) {
+        return 0;
+    }
+    if !chat_put(out, cap, &off, model) {
+        return 0;
+    }
+    if !chat_put(out, cap, &off, body[ve: body.len - ve]) {
+        return 0;
+    }
+    return off;
+}
+
+/// 解析请求 → 选 provider → 生成上游 path 与重写后的请求体。
+export fn chat_prepare(d: &Db, body: &[byte], now: i64, out: &ChatPlan) !void {
+    if body.len == 0 || body.len > CHAT_PAYLOAD_MAX {
+        return error.ChatTooLarge;
+    }
+    var doc: JsonDoc = JsonDoc{};
+    json_parse(&doc, body) catch {
+        return error.ChatBadRequest;
+    };
+    const root: i32 = json_root(&doc);
+    if json_kind(&doc, root) != JSON_OBJ {
+        return error.ChatBadRequest;
+    }
+    const m: i32 = json_get(&doc, root, &"model"[0: 5]);
+    if json_kind(&doc, m) != JSON_STR {
+        return error.ChatBadRequest;
+    }
+    var mbuf: [byte: CHAT_MODEL_MAX] = [0: CHAT_MODEL_MAX];
+    const mn: usize = json_str(&doc, m, &mbuf[0], CHAT_MODEL_MAX);
+    if mn == 0 {
+        return error.ChatBadRequest;
+    }
+    out.model_len = chat_copy(&out.model[0], CHAT_MODEL_MAX, mbuf[0: mn]);
+    out.stream = json_bool(&doc, json_get(&doc, root, &"stream"[0: 6]));
+
+    var prov: StoreProvider = StoreProvider{};
+    var up: [byte: CHAT_MODEL_MAX] = [0: CHAT_MODEL_MAX];
+    var upn: usize = 0;
+    const ok: bool = try store_provider_route(d, mbuf[0: mn], &prov, &up[0], CHAT_MODEL_MAX, &upn);
+    if !ok {
+        return error.ChatNoRoute;
+    }
+    out.provider_id = prov.id;
+    out.port = prov.port;
+    out.auth_type = prov.auth_type;
+    out.timeout_ms = prov.timeout_ms;
+    out.scheme_len = chat_copy(&out.scheme[0], 8, prov.scheme[0: prov.scheme_len]);
+    out.host_len = chat_copy(&out.host[0], CHAT_HOST_MAX, prov.host[0: prov.host_len]);
+    out.provider_name_len = chat_copy(&out.provider_name[0], 64, prov.name[0: prov.name_len]);
+    out.auth_name_len = chat_copy(&out.auth_name[0], CHAT_AUTH_NAME_MAX, prov.auth_name[0: prov.auth_name_len]);
+    out.secret_len = chat_copy(&out.secret[0], CHAT_SECRET_MAX, prov.secret[0: prov.secret_len]);
+    out.upstream_len = chat_copy(&out.upstream_model[0], CHAT_MODEL_MAX, up[0: upn]);
+
+    if prov.base_path_len == 0 {
+        out.path_len = chat_copy(&out.path[0], CHAT_PATH_MAX, &"/v1/chat/completions"[0: 20]);
+    } else {
+        var off: usize = 0;
+        if !chat_put(&out.path[0], CHAT_PATH_MAX, &off, prov.base_path[0: prov.base_path_len]) {
+            return error.ChatTooLarge;
+        }
+        if !chat_put(&out.path[0], CHAT_PATH_MAX, &off, &"/chat/completions"[0: 17]) {
+            return error.ChatTooLarge;
+        }
+        out.path_len = off;
+    }
+
+    const pn: usize = chat_rewrite_model(body, up[0: upn], &out.payload[0], CHAT_PAYLOAD_MAX);
+    if pn == 0 {
+        return error.ChatTooLarge;
+    }
+    out.payload_len = pn;
+    _ = now;
+    return;
+}
+
+/// 用上游响应结算：解析 usage → billing_settle（journal + ledger）。
+export fn chat_settle(d: &Db, dir: &[byte], request_id: &[byte], user_id: i64,
+    now: i64, tz_min: i32, plan: &ChatPlan, response: &[byte],
+    out: &BillingResult) !void {
+    if response.len == 0 {
+        return error.ChatFailed;
+    }
+    var doc: JsonDoc = JsonDoc{};
+    json_parse(&doc, response) catch {
+        return error.ChatFailed;
+    };
+    var usage: PriceUsage = PriceUsage{ input_tokens: 0, output_tokens: 0, cache_read_tokens: 0 };
+    if !billing_usage_parse(&doc, json_root(&doc), &usage) {
+        return error.ChatNoUsage;
+    }
+    billing_settle(d, dir, request_id, user_id, now, tz_min,
+        plan.model[0: plan.model_len], plan.provider_name[0: plan.provider_name_len],
+        &usage, out) catch {
+        return error.ChatFailed;
+    };
+    return;
+}
