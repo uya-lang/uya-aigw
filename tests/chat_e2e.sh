@@ -351,6 +351,12 @@ PLUG2=$(curl -s --max-time 20 -H "Authorization: Bearer $TOKEN" -H 'Content-Type
   --data '{"model":"plug-model","messages":[{"role":"user","content":"again"}]}' \
   "$BASE/v1/chat/completions")
 echo "$PLUG2" | grep -q 'hello-from-plugin' || { echo "$PLUG2" >&2; fail "plug-model 2"; }
+# 插件路径不支持流式：带 stream=true 也要拿到完整 JSON（回落为非流式）
+PLUGS=$(curl -s --max-time 20 -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  --data '{"model":"plug-model","stream":true,"messages":[{"role":"user","content":"s"}]}' \
+  "$BASE/v1/chat/completions")
+echo "$PLUGS" | grep -q 'hello-from-plugin' || { echo "$PLUGS" >&2; fail "plug-model stream fallback"; }
+echo "$PLUGS" | grep -q '^data:' && fail "plug-model returned SSE"
 PLUGPROCS=$(wc -l < "$TMP/plug.pids" 2>/dev/null | tr -d ' ')
 [ "$PLUGPROCS" = "1" ] || fail "plugin not reused: $PLUGPROCS processes"
 echo "CHAT-PLUG procs=$PLUGPROCS"
@@ -575,5 +581,5 @@ for db in "$SEED_DB" "$TMP/data"/usage-*.db; do
 done
 # D3 的 retry-model 请求也会落一条（32 + 1）
 # D5 的两次 plug-model 调用也落账（33 + 2）
-[ "$COUNT" = "35" ] || fail "usage_ledger count=$COUNT"
+[ "$COUNT" = "36" ] || fail "usage_ledger count=$COUNT"
 echo "CHAT-ALL-OK status=$CODE count=$COUNT"

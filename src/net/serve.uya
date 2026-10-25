@@ -1592,6 +1592,10 @@ fn srv_chat(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 400, SRV_JSON_400, keep);
         return;
     };
+    // D5：插件供应商暂不支持流式（JSONL 一行一响应），按非流式回落。
+    if plan.stdio {
+        plan.stream = false;
+    }
     srv_log_plan(&lg, &plan);
     var attempts: i32 = 0;
     var http_tries: i32 = 0;
@@ -1647,6 +1651,9 @@ fn srv_chat(c: &SrvConn, stats: &ServeStats) void {
                 srv_static(c, 502, SRV_JSON_502, keep);
                 return;
             };
+            if plan.stdio {
+                plan.stream = false;
+            }
             srv_log_plan(&lg, &plan);
             continue;
         }
