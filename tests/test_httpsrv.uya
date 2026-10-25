@@ -133,6 +133,13 @@ fn test_authorization() !void {
     big[335] = 10 as byte;
     var r3: HsrvReq = HsrvReq{};
     try assert_eq_i32(hsrv_parse_head(&big[0], 336, HSRV_HEAD_MAX, &r3), -1);
+
+    // reqlog：User-Agent 捕获（超长由上层截断，不因 UA 拒绝）
+    var r4: HsrvReq = HsrvReq{};
+    const raw4: &[byte] = &"GET /x HTTP/1.1\r\nUser-Agent: curl/8.0\r\n\r\n"[0: 41];
+    try assert_eq_i32(hsrv_parse_head(raw4.ptr, raw4.len, HSRV_HEAD_MAX, &r4), 1);
+    try assert_eq_i32(r4.user_agent_len as i32, 8);
+    try assert_eq_i32(r4.user_agent[0] as i32, 'c' as i32);
 }
 
 test "simple_get" { run_test("simple_get", test_simple_get); }

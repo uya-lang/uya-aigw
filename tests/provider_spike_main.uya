@@ -165,9 +165,10 @@ fn step_upstream(ctx: &HtcCtx, cfg: &const HttppConfig, now: u64) i32 {
     var out: [byte: 4096] = [0: 4096];
     var st: i32 = 0;
     var got: usize = 0;
+    var retry_after: u32 = 0;
     const payload: &[byte] = &"{\"model\":\"x\"}"[0: 14];
     const r: !void = upstream_post(ctx, cfg, &"/v1/chat/completions"[0: 20], payload,
-        now, now +% (5000 as u64), &out[0], 4096, &st, &got);
+        now, now +% (5000 as u64), &out[0], 4096, &st, &got, &retry_after);
     _ = r catch |_| {
         printf("UPSTREAM-FAIL post\n" as *byte);
         return 12;

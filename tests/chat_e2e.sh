@@ -2,6 +2,8 @@
 # A4 e2e：种子 Key/供应商/价目 → aigw serve → TLS mock 上游 → chat → usage 落账
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# D4：环境里的 HTTPS_PROXY/NO_PROXY 会让出站走代理，e2e 需要确定行为。
+unset HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy
 
 UYA=${UYA:-/home/winger/uya/uya/bin/uya}
 UYA_ROOT=${UYA_ROOT:-/home/winger/uya/uya/lib}
@@ -38,7 +40,9 @@ PY
 )
 cat > "$TMP/mock.py" <<'PY'
 import http.server, ssl, sys
-port, cert, key, reqfile = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+port, cert, key, reqfile, connfile, reretryfile = (int(sys.argv[1]), sys.argv[2],
+                                                  sys.argv[3], sys.argv[4],
+                                                  sys.argv[5], sys.argv[6])
 BODY = (b'{"id":"chatcmpl-e2e","object":"chat.completion",'
         b'"choices":[{"message":{"role":"assistant","content":"hello-from-mock"}}],'
         b'"usage":{"prompt_tokens":100000,"completion_tokens":50000,'
@@ -57,11 +61,35 @@ SSE_TOOL = (b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1"
 class H(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     def log_message(self, *a): pass
+    def setup(self):
+        super().setup()
+        # D2：每次 TCP accept 记一行，用于断言连接池复用（请求数 >> 连接数）
+        with open(connfile, "a") as f:
+            f.write("c\n")
     def do_POST(self):
         n = int(self.headers.get("Content-Length", "0"))
         data = self.rfile.read(n)
         with open(reqfile, "wb") as f:
             f.write(data)
+        # D3：retry-upstream 前两次回 503，用于验证网关按退避重试同一家
+        if b'"retry-upstream"' in data:
+            cnt = 0
+            try:
+                with open(reretryfile) as f:
+                    cnt = int((f.read().strip() or "0"))
+            except Exception:
+                cnt = 0
+            cnt += 1
+            with open(reretryfile, "w") as f:
+                f.write(str(cnt))
+            if cnt <= 2:
+                eb = b'{"error":"rate limited"}'
+                self.send_response(503)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(eb)))
+                self.end_headers()
+                self.wfile.write(eb); self.wfile.flush()
+                return
         if "text/event-stream" in (self.headers.get("Accept") or ""):
             data = SSE_TOOL if b'"tools"' in data else SSE
             self.send_response(200)
@@ -87,13 +115,16 @@ class H(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(BODY)))
         self.end_headers()
         self.wfile.write(BODY); self.wfile.flush()
-srv = http.server.HTTPServer(("127.0.0.1", port), H)
+# D2：连接池会长期占用 keep-alive 连接，单线程 HTTPServer 会让后续新连接饿死，
+# 因此 mock 用「每连接一线程」。
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), H)
+srv.daemon_threads = True
 sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 sctx.load_cert_chain(cert, key)
 srv.socket = sctx.wrap_socket(srv.socket, server_side=True)
 srv.serve_forever()
 PY
-python3 "$TMP/mock.py" "$MPORT" "$TMP/leaf.pem" "$TMP/leaf.key" "$TMP/req.json" >"$TMP/mock.log" 2>&1 &
+python3 "$TMP/mock.py" "$MPORT" "$TMP/leaf.pem" "$TMP/leaf.key" "$TMP/req.json" "$TMP/conns.txt" "$TMP/retry.txt" >"$TMP/mock.log" 2>&1 &
 MOCK_PID=$!
 sleep 0.3
 
@@ -118,12 +149,13 @@ UYA_ROOT="$UYA_ROOT" "$UYA" build \
   src/net/x509min.uya src/net/chainx.uya src/net/urlx.uya src/net/dnsx.uya \
   src/net/tlsx.uya src/net/tlsx_conn.uya src/net/httpc.uya src/net/ssex.uya \
   src/net/httpc_pool.uya src/net/proxyx.uya src/providers/http.uya \
-  src/providers/httpcall.uya src/cli/tls_cmd.uya src/app.uya \
+  src/providers/httpcall.uya src/plugins/pool.uya src/providers/plug.uya src/cli/tls_cmd.uya src/app.uya \
   -o build/aigw >"$TMP/build.log" 2>&1 || { cat "$TMP/build.log" >&2; fail "aigw build"; }
 
 ./build/aigw serve --host 127.0.0.1 --port 0 --db "$SEED_DB" --data-dir "$TMP/data" \
   --ca "$TMP/root.pem" --dev-otp --admin-key test-admin \
-  --meta "$TMP/data/meta.db" --node-id node-a >"$TMP/serve.log" 2>&1 &
+  --meta "$TMP/data/meta.db" --node-id node-a \
+  --plugin-cmd "python3 $PWD/tests/plugin_chat.py $TMP/plug.pids" >"$TMP/serve.log" 2>&1 &
 SRV_PID=$!
 PORT=""
 for _ in $(seq 1 200); do
@@ -298,6 +330,36 @@ echo "$FO" | grep -q 'hello-from-mock' || { echo "$FO" >&2; fail "failover"; }
 FD=$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   --data '{"model":"fail-model","messages":[{"role":"user","content":"hi"}]}' "$BASE/v1/chat/completions")
 [ "$FD" = "400" ] || [ "$FD" = "502" ] || [ "$FD" = "503" ] || fail "all-dead unexpected $FD"
+# 4q2) D3：HTTP 级重试——mock 先回 503 两次，网关按退避重试同一家后成功
+RT0=$(date +%s%N)
+RT=$(curl -s --max-time 20 -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  --data '{"model":"retry-model","messages":[{"role":"user","content":"hi"}]}' \
+  "$BASE/v1/chat/completions")
+RT1=$(date +%s%N)
+echo "$RT" | grep -q 'hello-from-mock' || { echo "$RT" >&2; fail "retry-model"; }
+RETRIES=$(cat "$TMP/retry.txt" 2>/dev/null || echo 0)
+[ "$RETRIES" = "3" ] || fail "expected 3 upstream attempts, got $RETRIES"
+ELAPSED_MS=$(( (RT1 - RT0) / 1000000 ))
+[ "$ELAPSED_MS" -ge 200 ] || fail "backoff too fast: ${ELAPSED_MS}ms"
+echo "CHAT-RETRY attempts=$RETRIES elapsed=${ELAPSED_MS}ms"
+# 4q3) D5：stdio 插件供应商（kind=stdio）——进程复用、响应与用量都落账
+PLUG1=$(curl -s --max-time 20 -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  --data '{"model":"plug-model","messages":[{"role":"user","content":"hi"}]}' \
+  "$BASE/v1/chat/completions")
+echo "$PLUG1" | grep -q 'hello-from-plugin' || { echo "$PLUG1" >&2; fail "plug-model"; }
+PLUG2=$(curl -s --max-time 20 -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  --data '{"model":"plug-model","messages":[{"role":"user","content":"again"}]}' \
+  "$BASE/v1/chat/completions")
+echo "$PLUG2" | grep -q 'hello-from-plugin' || { echo "$PLUG2" >&2; fail "plug-model 2"; }
+# 插件路径不支持流式：带 stream=true 也要拿到完整 JSON（回落为非流式）
+PLUGS=$(curl -s --max-time 20 -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  --data '{"model":"plug-model","stream":true,"messages":[{"role":"user","content":"s"}]}' \
+  "$BASE/v1/chat/completions")
+echo "$PLUGS" | grep -q 'hello-from-plugin' || { echo "$PLUGS" >&2; fail "plug-model stream fallback"; }
+echo "$PLUGS" | grep -q '^data:' && fail "plug-model returned SSE"
+PLUGPROCS=$(wc -l < "$TMP/plug.pids" 2>/dev/null | tr -d ' ')
+[ "$PLUGPROCS" = "1" ] || fail "plugin not reused: $PLUGPROCS processes"
+echo "CHAT-PLUG procs=$PLUGPROCS"
 # 熔断不影响其他模型
 MC=$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   --data '{"model":"mock-model","messages":[{"role":"user","content":"hi"}]}' "$BASE/v1/chat/completions")
@@ -473,12 +535,20 @@ echo "$I2" | grep -q '"duplicate":2' || { echo "$I2" >&2; fail "ingest duplicate
 # 4y) A4：上游事件驱动等待下的 p99（20 次顺序 chat；上游是本地 TLS mock）
 LAT="$TMP/lat.txt"
 : > "$LAT"
+# D2：连接池复用——这 20 次顺序请求不应各建一条 TCP/TLS 连接
+CONN0=$(wc -l < "$TMP/conns.txt" 2>/dev/null | tr -d ' ' || echo 0)
+[ -n "$CONN0" ] || CONN0=0
 for i in $(seq 1 20); do
   curl -s --max-time 10 -o /dev/null -w '%{time_total}\n' -X POST \
     -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
     --data '{"model":"mock-model","messages":[{"role":"user","content":"ping"}]}' \
     "$BASE/v1/chat/completions" >> "$LAT"
 done
+CONN1=$(wc -l < "$TMP/conns.txt" 2>/dev/null | tr -d ' ' || echo 0)
+[ -n "$CONN1" ] || CONN1=0
+CONND=$((CONN1 - CONN0))
+[ "$CONND" -le 2 ] || fail "pool not reusing: 20 chats opened $CONND conns"
+echo "CHAT-POOL reused conns_delta=$CONND"
 P99=$(sort -n "$LAT" | awk '{a[NR]=$1} END{print a[int(NR*0.99)]}')
 AVG=$(awk '{s+=$1} END{printf "%.4f", s/NR}' "$LAT")
 awk -v p="$P99" 'BEGIN{exit !(p>0 && p<1.0)}' || fail "chat p99=$P99"
@@ -488,6 +558,19 @@ echo "CHAT-LAT n=20 avg=${AVG}s p99=${P99}s"
 kill "$SRV_PID" 2>/dev/null || true
 wait "$SRV_PID" 2>/dev/null || true
 SRV_PID=""
+# A4：逐请求日志（reqlog 行追加到 <data_dir>/requests.log）
+REQLOG="$TMP/data/requests.log"
+[ -f "$REQLOG" ] || fail "reqlog missing"
+grep -q 'endpoint=/v1/chat/completions' "$REQLOG" || { head -3 "$REQLOG" >&2; fail "reqlog endpoint"; }
+grep -q 'endpoint=/v1/responses' "$REQLOG" || fail "reqlog responses endpoint"
+grep -q 'model=mock-model' "$REQLOG" || fail "reqlog model"
+grep -q 'provider=mock' "$REQLOG" || fail "reqlog provider"
+grep -q 'status=200' "$REQLOG" || fail "reqlog status"
+grep -q 'email=http@example.com' "$REQLOG" || fail "reqlog email"
+grep -q 'stream=1' "$REQLOG" || fail "reqlog stream"
+grep -q 'ua=curl' "$REQLOG" || fail "reqlog ua"
+grep -q 'toks_x100=' "$REQLOG" || fail "reqlog toks"
+echo "CHAT-REQLOG lines=$(wc -l < "$REQLOG")"
 # B5：controller 分片后账本在 usage-<k>.db；逐库求和（不含则不重复计）。
 COUNT=0
 for db in "$SEED_DB" "$TMP/data"/usage-*.db; do
@@ -496,5 +579,7 @@ for db in "$SEED_DB" "$TMP/data"/usage-*.db; do
   [ -n "$C" ] || fail "count db=$db"
   COUNT=$((COUNT + C))
 done
-[ "$COUNT" = "32" ] || fail "usage_ledger count=$COUNT"
+# D3 的 retry-model 请求也会落一条（32 + 1）
+# D5 的两次 plug-model 调用也落账（33 + 2）
+[ "$COUNT" = "36" ] || fail "usage_ledger count=$COUNT"
 echo "CHAT-ALL-OK status=$CODE count=$COUNT"

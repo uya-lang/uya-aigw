@@ -13,14 +13,13 @@
 
 ## 进行中
 
-- TLS-09E：流式**读超时**（两种写法实测失败，候选修法与证据见
-  `docs/design/tls-spike-findings.md` §9；当前靠 `[DONE]` 收尾 + 断开取消兜底）。
+（无。Phase A / B / C / D 已全部落地；逐项明细见 `TODO_DONE.md`。）
 
 ## Phase A 进展
 
 - A0（money 部分）：`src/core/money.c` + `src/core/money.uya`，nano-USD + `__int128` 助手，
-  `tests/test_money.uya` 全过。**SQLite 部分未做**：本机没有 `sqlite3.c/h`，需要 vendor
-  amalgamation（离线不可得），见 TODO A0。
+  `tests/test_money.uya` 全过。SQLite 部分在 `src/core/dbx.uya`（打开/迁移/预编译语句/
+  事务/journal），`tests/test_dbx.uya`、`tests/test_journal.uya`、`tests/test_backup.uya` 全过。
 - A4（日志部分）：`src/core/reqlog.uya`，一行 `k=v` 的每请求日志（含 cost/tok-s），
   `tests/test_reqlog.uya` 全过。
 - A5（流式工具事件）：`srv_responses_stream` 支持 `delta.tool_calls` 分片 →
@@ -34,15 +33,13 @@
   非阻塞 fd + poll 超时与按行分帧。`tests/test_pool.uya` 34 断言（`tests/plugin_echo.py` 作最小插件）。
 - B1（已落地）：meta.db + `elect.uya` + controller 控制面（register/heartbeat/
   config/status，`--meta`/`--node-id`，standby 不备份）。
-- B2（进行中）：`uplink.uya` + `--uplink` 已通（node 注册/心跳）；config 快照与
-  slug 归属待做。
+- B2（已落地）：`uplink.uya` + `--uplink`（node 注册/心跳）+ config 快照与 slug 归属校验。
 - B3（已落地）：epoch/fencing/drain + 控制面（421）+ 批量迁移/清零 + stale 自动
   迁移；controller tick 每 3s 触发 rebalance。
-- B2 收尾：config 快照与 slug 归属校验。
-- B5（进行中）：幂等 ingest（含 HTTP 入口）+ 区间重算 + 本地 spool + Key 吊销已通；
-  spool 自动消费循环待做。
-- C1（进行中）：静态壳 `/` + `/ui/app.js`（登录/资料/密钥/接入点 + curl 示例）已落地。
-- C2（进行中）：`/v1/usage.csv` + 概览/明细表 + CSV 导出已落地；请求列表/详情待做。
+- B5（已落地）：幂等 ingest（含 HTTP 入口）+ 区间重算 + 本地 spool（含自动消费循环）+
+  Key 吊销。
+- C1（已落地）：静态壳 `/` + `/ui/app.js`（登录/资料/密钥/接入点 + curl 示例）。
+- C2（已落地）：`/v1/usage.csv` + 概览/明细表 + CSV 导出 + 请求列表/详情。
 - C2（已完成）：`/v1/usage`、`/v1/usage.csv`、`/v1/requests`（列表/详情分页）与 UI 概览页。
 - C3（已完成）：Key 管理、估算器、改价（`/admin/price-entries`，含 `schedule` 分时规则校验与
   回显）、模型绑定、管理后台分时价编辑与价目表。
@@ -65,6 +62,19 @@
   `docs/ui.md`；API 全 Bearer、无 Cookie，故 CSRF 面为零（不做双提交 token）。
 - B4（已完成）：edge 路由核心（slug 归属 + session 亲和 + 失败清缓存）+ HTTP/SSE 代理。
 
+## Phase D（接线补完，2026-10-26）
+
+核对「模块 + 单测完成」与「serve 请求路径真的调用」后补齐的五项（逐项提交，明细见
+`TODO_DONE.md`）：
+
+- D1 每请求日志：`reqlog` 接进 serve 的 chat/responses（`<data_dir>/requests.log`，含
+  request_id/端点/模型/供应商/状态/首字耗时/用量/成本/UA/邮箱）。
+- D2 上游连接池：`HtcPool` 复用活连接（`(host,port,trust)` + 60s idle TTL + LRU 8 槽），
+  池内旧连接失效返回 `HtcStale` 后换新连接重试一次；chat e2e 20 次请求新开连接 0。
+- D3 重试退避：429/5xx + `Retry-After`，指数退避 base 100ms 封顶 30s，最多 3 次。
+- D4 代理 CONNECT：`HTTPS_PROXY`/`NO_PROXY` 或 `--proxy/--no-proxy`，隧道内仍做端到端 TLS。
+- D5 `kind=stdio` 插件供应商：`src/providers/plug.uya` + 插件池，JSONL 一行一条（≤8KB）。
+
 ## 开发命令（A9）
 
 - `make check`：全量类型检查
@@ -76,27 +86,25 @@
   `/v1/auth/login`、`/v1/keys`、`/v1/me`，e2e 用 HTTP 拿 Key 调 chat。
 - A6（已落地）：`usage_daily` 汇总 + `rollup` 重建/查询；billing 实时 upsert；
   `/v1/usage`（data+totals 含 profit）与 `/v1/models`；chat e2e 断言 models/usage/profit。
-- A8（进行中）：schema v6 priority/weight + `lb.uya`（优先级/加权/会话亲和/熔断），
-  serve 失败自动换 provider 重试；插件级重绑待接。
+- A8（已落地）：schema v6 priority/weight + `lb.uya`（优先级/加权/会话亲和/熔断），
+  serve 失败自动换 provider 重试；插件级重绑在 `plugin_pool_call` 内（同槽换进程重试一次）。
 - A7（已落地）：管理 REST（health/pricing GET+POST/billing/backup）+ MCP
   （initialize/tools/list/tools/call：pricing_get、billing_query、backup_status）。
-- A5（进行中）：`/v1/responses` 非流式 + previous_response_id 续轮 + 流式事件
-  （created/delta/completed）已通；reasoning/tools 仍未透传。
+- A5（已落地）：`/v1/responses` 非流式 + previous_response_id 续轮 + 流式事件
+  （created/delta/completed + tool_calls 分片）；reasoning 不单独透传。
 - A4（已完成）：JSON DOM/构造器、providers/路由、billing 结算、chat 编排、serve 接线
   （非流/流式 SSE、tools 透传、失败转移、无 DOM 快路径、512 行/200ms 批量落库）、
   上游等待事件驱动（`src/core/upwait.uya`，epoll 等 waker fd，不再忙轮询）、
   Key 校验单槽缓存（`store_verify_key_fast`，TTL 2s，撤销即失效）。
 - B1（已落地）：meta.db + `elect.uya` + controller 控制面（register/heartbeat/
   config/status，`--meta`/`--node-id`，standby 不备份）。
-- B2（进行中）：`uplink.uya` + `--uplink` 已通（node 注册/心跳）；config 快照与
-  slug 归属待做。
+- B2（已落地）：`uplink.uya` + `--uplink`（node 注册/心跳）+ config 快照与 slug 归属校验。
 - B3（已落地）：epoch/fencing/drain + 控制面（421）+ 批量迁移/清零 + stale 自动
   迁移；controller tick 每 3s 触发 rebalance。
 - B2 收尾：config 快照与 slug 归属校验。
-- B5（进行中）：幂等 ingest（含 HTTP 入口）+ 区间重算 + 本地 spool + Key 吊销已通；
-  spool 自动消费循环待做。
-- C1（进行中）：静态壳 `/` + `/ui/app.js`（登录/资料/密钥/接入点 + curl 示例）已落地。
-- C2（进行中）：`/v1/usage.csv` + 概览/明细表 + CSV 导出已落地；请求列表/详情待做。
+- B5（已落地）：幂等 ingest（含 HTTP 入口）+ 区间重算 + 本地 spool（含自动消费循环）+
+  Key 吊销。
+- C1（已落地）：静态壳 `/` + `/ui/app.js`（登录/资料/密钥/接入点 + curl 示例）。
 - C2（已完成）：`/v1/usage`、`/v1/usage.csv`、`/v1/requests`（列表/详情分页）与 UI 概览页。
 - C3（已完成）：Key 管理、估算器、改价（`/admin/price-entries`，含 `schedule` 分时规则校验与
   回显）、模型绑定、管理后台分时价编辑与价目表。
@@ -144,7 +152,7 @@
 
 0. ~~A1 事件循环~~（已完成：单线程 epoll + 512 并发 SSE + 优雅停机）
 
-1. ~~TLS-09 → TLS-10 → TLS-11~~（已完成；TLS-09E 流式读超时未落地，findings §9）
+1. ~~TLS-09 → TLS-10 → TLS-11~~（已完成，含 TLS-09E 流式读超时，findings §9）
 2. Phase A：A0 SQLite+money spike、A1 事件循环、A2 schema/认证/备份/journal、A3 插件池、A4 chat … A9 文档/e2e
 3. Phase B：controller/node/edge、lease/epoch、ingest/journal
 4. Phase C：用户端/管理端后台

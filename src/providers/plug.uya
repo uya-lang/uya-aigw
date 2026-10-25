@@ -1,0 +1,142 @@
+// src/providers/plug.uya — D5：`providers.kind='stdio'` 的插件供应商
+//
+// 走 `src/plugins/pool.uya` 的 stdio JSONL 子进程池：
+//   请求行  {"id":N,"method":"chat","params":{"model":"<upstream>","stream":false,"body":<原 payload>}}
+//   成功行  {"id":N,"event":"done","data":{"status":200,"body":"<响应体 JSON 字符串>"}}
+//   失败行  {"id":N,"event":"error","data":{"message":"..."}}（或 event 不是 done）
+//
+// body 用 JSON 字符串传出（转义由插件负责），这里用 `json_str` 还原。整行受
+// `PLUGIN_POOL_LINE_CAP`（8KB）限制：插件路径面向中小响应，大响应请用 kind=http。
+//
+// 只做「取一个进程 → 写一行 → 读一行 → 归还」；进程生命周期/崩溃重试都在池里。
+
+export const PLUG_REQ_MAX: usize = 9216;
+export const PLUG_RESP_MAX: usize = 8192;
+
+export error PlugNotReady;
+export error PlugBadRequest;
+export error PlugBadResponse;
+export error PlugTooLarge;
+export error PlugFailed;
+
+/// 组装请求行。`id` 用固定 1：一次调用独占一个进程，插件不必区分并发。
+export fn plug_build_req(model: &const byte, model_len: usize, payload: &[byte],
+    out: &byte, cap: usize) usize {
+    var b: Buf = buf_new(PLUG_REQ_MAX);
+    defer { buf_free(&b); }
+    if !buf_append(&b, &"{\"id\":1,\"method\":\"chat\",\"params\":{\"model\":\""[0: 43], 43) {
+        return 0;
+    }
+    if !buf_append(&b, model, model_len) {
+        return 0;
+    }
+    if !buf_append(&b, &"\",\"stream\":false,\"body\":"[0: 24], 24) {
+        return 0;
+    }
+    if payload.len == 0 {
+        if !buf_append(&b, &"{}"[0: 2], 2) {
+            return 0;
+        }
+    } else if !buf_append(&b, &payload[0], payload.len) {
+        return 0;
+    }
+    if !buf_append(&b, &"}}"[0: 2], 2) {
+        return 0;
+    }
+    // 行协议：每条请求以换行结束（插件按行读）
+    if !buf_append(&b, &"\n"[0: 1], 1) {
+        return 0;
+    }
+    if b.len > cap {
+        return 0;
+    }
+    var i: usize = 0;
+    while i < b.len {
+        out[i] = b.ptr[i];
+        i = i + 1;
+    }
+    return b.len;
+}
+
+/// 解析响应行：event 必须是 done，data.status（缺省 200）+ data.body（字符串）。
+/// 成功返回 true 并写 `status` / `out_len`；失败返回 false（调用方按 502 处理）。
+export fn plug_parse_resp(line: &[byte], out: &byte, cap: usize,
+    status: &i32, out_len: &usize) bool {
+    status[0] = 0;
+    out_len[0] = 0;
+    if line.len == 0 || line.len > PLUG_RESP_MAX {
+        return false;
+    }
+    var doc: JsonDoc = JsonDoc{};
+    json_parse(&doc, line) catch {
+        return false;
+    };
+    const root: i32 = json_root(&doc);
+    if json_kind(&doc, root) != JSON_OBJ {
+        return false;
+    }
+    if !json_get_str_eq(&doc, root, &"event"[0: 5], &"done"[0: 4]) {
+        return false;
+    }
+    const data: i32 = json_get(&doc, root, &"data"[0: 4]);
+    if data < 0 {
+        return false;
+    }
+    var st: i32 = 200;
+    const sn: i32 = json_get(&doc, data, &"status"[0: 6]);
+    if sn >= 0 && json_kind(&doc, sn) == JSON_NUM {
+        st = json_i64(&doc, sn) as i32;
+    }
+    const bn: i32 = json_get(&doc, data, &"body"[0: 4]);
+    if bn < 0 || json_kind(&doc, bn) != JSON_STR {
+        return false;
+    }
+    const n: usize = json_str(&doc, bn, out, cap);
+    if n == 0 || n >= cap {
+        // 0 = 空 body 或放不下（json_str 截断到 cap），都算失败
+        return false;
+    }
+    status[0] = st;
+    out_len[0] = n;
+    return true;
+}
+
+/// 一次插件调用：acquire → 写一行 → 读一行 → release。
+export fn plug_chat(model: &const byte, model_len: usize, payload: &[byte],
+    timeout_ms: i32, now_ms: i64, out: &byte, cap: usize,
+    status: &i32, out_len: &usize) !void {
+    status[0] = 0;
+    out_len[0] = 0;
+    if !plugin_pool_ready() {
+        return error.PlugNotReady;
+    }
+    var req: [byte: PLUG_REQ_MAX] = [0: PLUG_REQ_MAX];
+    const rn: usize = plug_build_req(model, model_len, payload, &req[0], PLUG_REQ_MAX);
+    if rn == 0 {
+        return error.PlugTooLarge;
+    }
+    var idx: i32 = plugin_pool_acquire(now_ms) catch {
+        return error.PlugNotReady;
+    };
+    var line: [byte: PLUG_RESP_MAX] = [0: PLUG_RESP_MAX];
+    var ln: usize = 0;
+    const r: !usize = plugin_pool_call(&idx, req[0: rn], &line[0], PLUG_RESP_MAX,
+        timeout_ms, now_ms);
+    const got: usize = r catch |_| {
+        plugin_pool_release(idx, now_ms);
+        return error.PlugFailed;
+    };
+    plugin_pool_release(idx, now_ms);
+    // 去掉行尾换行再解析
+    ln = got;
+    if ln > 0 && ln <= PLUG_RESP_MAX {
+        while ln > 0 && ln <= PLUG_RESP_MAX
+            && (line[ln - 1] == ('\n' as byte) || line[ln - 1] == ('\r' as byte)) {
+            ln = ln - 1;
+        }
+    }
+    if !plug_parse_resp(line[0: ln], out, cap, status, out_len) {
+        return error.PlugBadResponse;
+    }
+    return;
+}

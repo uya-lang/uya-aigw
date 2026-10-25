@@ -2,6 +2,8 @@
 # B6：集群端到端 —— controller + uplink 注册 + epoch/assign + edge 路由 + drain 重分配 + ingest 幂等
 set -u
 cd "$(dirname "$0")/.." || exit 1
+# D4：环境里的 HTTPS_PROXY/NO_PROXY 会让出站走代理，e2e 需要确定行为。
+unset HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy
 TMP=$(mktemp -d)
 PIDS=()
 cleanup() {
@@ -27,7 +29,7 @@ UYA_ROOT=/home/winger/uya/uya/lib /home/winger/uya/uya/bin/uya build \
   src/net/x509min.uya src/net/chainx.uya src/net/urlx.uya src/net/dnsx.uya \
   src/net/tlsx.uya src/net/tlsx_conn.uya src/net/httpc.uya src/net/ssex.uya \
   src/net/httpc_pool.uya src/net/proxyx.uya src/providers/http.uya \
-  src/providers/httpcall.uya src/cli/tls_cmd.uya src/app.uya \
+  src/providers/httpcall.uya src/plugins/pool.uya src/providers/plug.uya src/cli/tls_cmd.uya src/app.uya \
   -o build/aigw >"$TMP/build.log" 2>&1 || { cat "$TMP/build.log" >&2; fail "aigw build"; }
 
 # 2) controller

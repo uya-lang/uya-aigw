@@ -376,6 +376,22 @@ export fn store_find_user(d: &Db, email: &[byte], out: &StoreUser) !void {
     return;
 }
 
+/// 按 user id 取 email（reqlog 日志用）；找不到或出错返回 0。
+export fn store_user_email(d: &Db, user_id: i64, out: &byte, cap: usize) usize {
+    var st: DbStmt = dbx_prepare(d,
+        "select email from users where id = ?" as &const byte) catch {
+        return 0;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_i64(&st, 1, user_id) catch {
+        return 0;
+    };
+    if dbx_step(&st) != 1 {
+        return 0;
+    }
+    return dbx_col_text(&st, 0, out, cap);
+}
+
 /// 改用户状态（0=active 1=suspended）。
 export fn store_set_user_status(d: &Db, user_id: i64, status: i32) !void {
     var st: DbStmt = dbx_prepare(d, "update users set status = ? where id = ?" as &const byte) catch {
@@ -864,6 +880,31 @@ export fn store_provider_set_auth(d: &Db, id: i64, auth_type: i32,
     }
     if dbx_changes(d) == 0 {
         return error.ProviderNotFound;
+    }
+    return;
+}
+
+/// D5：设置供应商 kind（`stdio` 走插件池；其余走内置 HTTPS）。
+export fn store_provider_set_kind(d: &Db, id: i64, kind: &[byte], now: i64) !void {
+    if kind.len == 0 || kind.len > STORE_PROVIDER_KIND_MAX {
+        return error.StoreFailed;
+    }
+    var st: DbStmt = dbx_prepare(d,
+        "update providers set kind = ?, updated_at = ? where id = ?" as &const byte) catch {
+        return error.StoreFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, kind) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_i64(&st, 2, now) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_i64(&st, 3, id) catch {
+        return error.StoreFailed;
+    };
+    if dbx_step(&st) != 0 {
+        return error.StoreFailed;
     }
     return;
 }

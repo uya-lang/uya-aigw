@@ -10,6 +10,7 @@ export const HSRV_METHOD_MAX: usize = 16;
 export const HSRV_PATH_MAX: usize = 1024;
 export const HSRV_HEAD_MAX: usize = 65536;
 export const HSRV_AUTH_MAX: usize = 256;
+export const HSRV_UA_MAX: usize = 128;
 
 export struct HsrvReq {
     method: [byte: HSRV_METHOD_MAX],
@@ -24,6 +25,8 @@ export struct HsrvReq {
     head_len: usize,        // 头部总字节数（含结尾空行）
     auth: [byte: HSRV_AUTH_MAX], // Authorization 头的值（A4 chat 鉴权）
     auth_len: usize,
+    user_agent: [byte: HSRV_UA_MAX], // User-Agent（reqlog 用，超长截断）
+    user_agent_len: usize,
 }
 
 fn hsl_lower(c: byte) byte {
@@ -69,6 +72,7 @@ export fn hsrv_parse_head(buf: &const byte, n: usize, max_head: usize,
     out.expect_continue = false;
     out.head_len = 0;
     out.auth_len = 0;
+    out.user_agent_len = 0;
     out.minor = 1;
     out.method_len = 0;
     out.path_len = 0;
@@ -214,6 +218,14 @@ export fn hsrv_parse_head(buf: &const byte, n: usize, max_head: usize,
                 ai = ai + 1;
             }
             out.auth_len = val_len;
+        } else if hsl_eq_ci(&buf[n0], name_len, &"user-agent"[0: 10], 10) {
+            // reqlog 用；UA 可能很长，只保留前 HSRV_UA_MAX 字节（不因 UA 拒绝请求）。
+            var ui: usize = 0;
+            while ui < val_len && ui < HSRV_UA_MAX {
+                out.user_agent[ui] = buf[v0 + ui];
+                ui = ui + 1;
+            }
+            out.user_agent_len = ui;
         } else if hsl_eq_ci(&buf[n0], name_len, &"connection"[0: 10], 10) {
             if hsl_eq_ci(&buf[v0], val_len, &"close"[0: 5], 5) {
                 out.keep_alive = false;

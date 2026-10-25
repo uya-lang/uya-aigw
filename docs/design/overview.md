@@ -86,7 +86,7 @@
 | `stdio` | JSON-RPC/JSONL 子进程插件，一行一条消息 | 非标协议、私有 SDK、需要隔离的供应商 |
 | `http` | 内置 HTTPS 客户端，OpenAI 兼容 | OpenAI / DeepSeek / 兼容网关 / Azure 风格头 |
 
-插件协议（简版）：
+插件协议（实现见 `src/providers/plug.uya`，一行一条、`/bin/sh -c` 常量启动：
 
 ```json
 {"id":1,"method":"chat","params":{"model":"...","messages":[...],"stream":true}}

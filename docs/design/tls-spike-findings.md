@@ -108,7 +108,7 @@ TLS-SPIKE-OK n=31
 - `tests/tls_spike.sh`（s_server）已被 `tests/provider_spike.sh`（本机 Python TLS 上游，
   覆盖 非流式/ chunked / SSE）取代，后者进入 `tests/run_all.sh`。
 
-## 9. TLS-09E：流式读超时（未落地）
+## 9. TLS-09E：流式读超时（已落地）
 
 目标：上游半开（连接在但不发数据）时，`htc_next_event_async` 应返回而不是永久挂住。
 

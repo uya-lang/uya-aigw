@@ -1,0 +1,111 @@
+// tests/test_plug.uya — D5 插件供应商：请求行组装 + 响应行解析（不 spawn 进程）
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+/// 在 c[0:n]（n ≤ cap）里找字面量。
+fn has_at(c: &const byte, n: usize, cap: usize, lit: &const byte, ln: usize) bool {
+    if ln == 0 || ln > cap {
+        return false;
+    }
+    var i: usize = 0;
+    while i + ln <= n && i + ln <= cap {
+        var j: usize = 0;
+        var ok: bool = true;
+        while j < ln {
+            if c[i + j] != lit[j] {
+                ok = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if ok {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn test_build_req() !void {
+    var out: [byte: PLUG_REQ_MAX] = [0: PLUG_REQ_MAX];
+    const n: usize = plug_build_req(&"up-model"[0: 8], 8, &"{\"messages\":[]}"[0: 15],
+        &out[0], PLUG_REQ_MAX);
+    try assert_eq_bool(n > 0, true);
+    var c: [byte: 512] = [0: 512];
+    var i: usize = 0;
+    while i < n && i < 512 {
+        c[i] = out[i];
+        i = i + 1;
+    }
+    const bn: usize = i;
+    try assert_eq_bool(bn > 0, true);
+    try assert_eq_bool(has_at(&c[0], bn, 512, &"\"method\":\"chat\""[0: 15], 15), true);
+    try assert_eq_bool(has_at(&c[0], bn, 512, &"up-model"[0: 8], 8), true);
+    try assert_eq_bool(has_at(&c[0], bn, 512, &"\"body\":{\"messages\":[]}}"[0: 23], 23), true);
+    // 空 payload → body:{}
+    const n2: usize = plug_build_req(&"m"[0: 1], 1, &""[0: 0], &out[0], PLUG_REQ_MAX);
+    try assert_eq_bool(n2 > 0, true);
+    var c2: [byte: 512] = [0: 512];
+    var k: usize = 0;
+    while k < n2 && k < 512 {
+        c2[k] = out[k];
+        k = k + 1;
+    }
+    const b2: usize = k;
+    try assert_eq_bool(has_at(&c2[0], b2, 512, &"\"body\":{}}"[0: 10], 10), true);
+    // 容量不够 → 0
+    try assert_eq_i32(plug_build_req(&"m"[0: 1], 1, &"{}"[0: 2], &out[0], 8) as i32, 0);
+}
+
+/// 把 NUL 结尾的字面量拷进缓冲区（返回值即长度）。
+fn mk(src: &const byte, out: &byte, cap: usize) usize {
+    var i: usize = 0;
+    while i < cap && src[i] != (0 as byte) {
+        out[i] = src[i];
+        i = i + 1;
+    }
+    return i;
+}
+
+fn test_parse_ok() !void {
+    var line: [byte: 256] = [0: 256];
+    const ln: usize = mk(&"{\"id\":1,\"event\":\"done\",\"data\":{\"status\":200,\"body\":\"{\\\"ok\\\":true}\"}}"[0],
+        &line[0], 256);
+    var out: [byte: 256] = [0: 256];
+    var st: i32 = 0;
+    var n: usize = 0;
+    try assert_eq_bool(plug_parse_resp(line[0: ln], &out[0], 256, &st, &n), true);
+    try assert_eq_i32(st, 200);
+    try assert_eq_i32(n as i32, 11);
+    try assert_eq_bool(out[0] == ('{' as byte), true);
+    try assert_eq_bool(out[1] == ('"' as byte), true);
+    try assert_eq_bool(out[10] == ('}' as byte), true);
+}
+
+fn test_parse_bad() !void {
+    var out: [byte: 256] = [0: 256];
+    var st: i32 = 0;
+    var n: usize = 0;
+    var line: [byte: 256] = [0: 256];
+    // event 不是 done
+    var ln: usize = mk(&"{\"id\":1,\"event\":\"error\",\"data\":{\"message\":\"x\"}}"[0], &line[0], 256);
+    try assert_eq_bool(plug_parse_resp(line[0: ln], &out[0], 256, &st, &n), false);
+    // 不是 JSON
+    ln = mk(&"not json"[0], &line[0], 256);
+    try assert_eq_bool(plug_parse_resp(line[0: ln], &out[0], 256, &st, &n), false);
+    // 空行
+    try assert_eq_bool(plug_parse_resp(&"x"[0: 0], &out[0], 256, &st, &n), false);
+    // body 放不下
+    ln = mk(&"{\"id\":1,\"event\":\"done\",\"data\":{\"body\":\"abcdefghij\"}}"[0], &line[0], 256);
+    try assert_eq_bool(plug_parse_resp(line[0: ln], &out[0], 4, &st, &n), false);
+    // status 缺省 → 200
+    ln = mk(&"{\"id\":1,\"event\":\"done\",\"data\":{\"body\":\"hi\"}}"[0], &line[0], 256);
+    try assert_eq_bool(plug_parse_resp(line[0: ln], &out[0], 256, &st, &n), true);
+    try assert_eq_i32(st, 200);
+    try assert_eq_i32(n as i32, 2);
+}
+
+test "build_req" { run_test("build_req", test_build_req); }
+test "parse_ok" { run_test("parse_ok", test_parse_ok); }
+test "parse_bad" { run_test("parse_bad", test_parse_bad); }

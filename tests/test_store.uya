@@ -34,6 +34,13 @@ fn test_user_create_and_find() !void {
         missing = true;
     };
     try assert_eq_bool(missing, true);
+
+    // reqlog：按 user id 取 email
+    var email: [byte: 64] = [0: 64];
+    const en: usize = store_user_email(&d, u.id, &email[0], 64);
+    try assert_eq_i32(en as i32, 17);
+    try assert_eq_i32(email[0] as i32, 'a' as i32);
+    try assert_eq_i32(store_user_email(&d, 999, &email[0], 64) as i32, 0);
 }
 
 fn test_user_duplicate() !void {

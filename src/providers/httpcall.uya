@@ -6,18 +6,50 @@
 //   3) htc_next_event_async：流式（SSE），一次返回一个事件。
 //
 // 信任：SAN + 四档（pin/tofu/chain/none），由 ctx.mode 决定；SSRF 私网默认拒绝。
+//
+// D2：`ctx.pool` 里存**活连接**（`(host, port, trust)` 键 + idle TTL + LRU），
+// 非流式请求读完且上游没要求关闭时归还，下一次同 key 请求直接跳过 DNS/TCP/TLS。
+// 复用连接若已失效（keep-alive 被对端关掉），本函数自动换新连接重试一次。
 
 use libc.heap;
+use libc.syscall;
 
 export error HtcNoAddress;
 export error HtcBlocked;
 export error HtcBadResponse;
 export error HtcConnectFailed;
+/// D2：池里的连接已失效（对端关了 keep-alive），调用方换新连接重试一次。
+export error HtcStale;
 
 export const HTC_RESOLV_MAX: usize = 512;
 export const HTC_BUNDLE_MAX: usize = 8192;
 export const HTC_PINS_MAX: usize = 256;
 export const HTC_BODY_INIT: usize = 8192;
+
+/// D2：活连接池。
+export const HTC_POOL_SLOTS: usize = 8;
+export const HTC_POOL_HOST_MAX: usize = 256;
+export const HTC_POOL_IDLE_MS: u64 = 60000;
+/// D4：代理（HTTPS_PROXY + NO_PROXY）。
+export const HTC_NOPROXY_MAX: usize = 512;
+
+struct HtcPoolSlot {
+    used: bool,
+    host: [byte: HTC_POOL_HOST_MAX],
+    host_len: usize,
+    port: u16,
+    trust: u8,
+    idle_since: u64,
+    conn: TlsxConn,
+}
+
+export struct HtcPool {
+    slots: [HtcPoolSlot: HTC_POOL_SLOTS],
+    hits: usize,
+    misses: usize,
+    puts: usize,
+    drops: usize,
+}
 
 export struct HtcCtx {
     cache: DnsxCache,
@@ -31,6 +63,310 @@ export struct HtcCtx {
     tofu: TlsxPins,
     allow_learn: bool,
     allow_private: bool,
+    pool: HtcPool,
+    proxy: ProxyCfg,
+    proxy_ready: bool,
+    no_proxy: [byte: HTC_NOPROXY_MAX],
+    no_proxy_len: usize,
+}
+
+fn htc_lower(b: byte) byte {
+    if b >= ('A' as byte) && b <= ('Z' as byte) {
+        return (b +% 32) as byte;
+    }
+    return b;
+}
+
+fn htc_host_eq(a: &const byte, an: usize, b: &const byte, bn: usize) bool {
+    if an != bn {
+        return false;
+    }
+    var i: usize = 0;
+    while i < an {
+        if htc_lower(a[i]) != htc_lower(b[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// 结构体没有移动语义：逐字段转移所有权（指针 + fd 只能落一边）。
+fn htc_conn_move(dst: &TlsxConn, src: &const TlsxConn) void {
+    dst.fd = src.fd;
+    dst.hs = src.hs;
+    dst.rec = src.rec;
+    dst.ctx = src.ctx;
+    var i: usize = 0;
+    while i < 64 {
+        dst.fingerprint[i] = src.fingerprint[i];
+        i = i + 1;
+    }
+    dst.fingerprint_ok = src.fingerprint_ok;
+    dst.verified = src.verified;
+}
+
+/// 把连接置空（不关闭 fd、不释放堆对象：所有权已经转走）。
+fn htc_conn_clear(c: &TlsxConn) void {
+    c.fd = 0 - 1;
+    c.hs = null as &HandshakeCtx;
+    c.rec = null as &RecordCtx;
+    c.ctx = null as &SslContext;
+    c.fingerprint_ok = false;
+    c.verified = false;
+}
+
+export fn htc_pool_init(p: &HtcPool) void {
+    var i: usize = 0;
+    while i < HTC_POOL_SLOTS {
+        p.slots[i].used = false;
+        p.slots[i].host_len = 0;
+        p.slots[i].port = 0;
+        p.slots[i].trust = 0;
+        p.slots[i].idle_since = 0;
+        p.slots[i].conn = tlsx_conn_empty();
+        i = i + 1;
+    }
+    p.hits = 0;
+    p.misses = 0;
+    p.puts = 0;
+    p.drops = 0;
+}
+
+fn htc_pool_close_slot(s: &HtcPoolSlot) void {
+    tlsx_conn_free(&s.conn);
+    s.conn = tlsx_conn_empty();
+    s.used = false;
+    s.host_len = 0;
+}
+
+/// 取一条可复用连接（所有权转到 `out`）。命中返回 true。
+export fn htc_pool_take(p: &HtcPool, host: &const byte, host_len: usize, port: u16,
+    trust: u8, now: u64, out: &TlsxConn) bool {
+    var i: usize = 0;
+    while i < HTC_POOL_SLOTS {
+        const s: &HtcPoolSlot = &p.slots[i];
+        if s.used {
+            if now >= s.idle_since +% HTC_POOL_IDLE_MS {
+                htc_pool_close_slot(s);
+            } else if s.port == port && s.trust == trust && s.host_len == host_len
+                && htc_host_eq(&s.host[0], s.host_len, host, host_len) {
+                htc_conn_move(out, &s.conn);
+                htc_conn_clear(&s.conn);
+                s.used = false;
+                s.host_len = 0;
+                p.hits = p.hits +% 1;
+                return true;
+            }
+        }
+        i = i + 1;
+    }
+    p.misses = p.misses +% 1;
+    return false;
+}
+
+/// 归还连接（所有权从 `conn` 转到池里，调用方的连接被置空）。
+/// 满时按 `idle_since` 最旧淘汰；返回 false 表示没收下（调用方照常 free）。
+export fn htc_pool_put(p: &HtcPool, host: &const byte, host_len: usize, port: u16,
+    trust: u8, now: u64, conn: &TlsxConn) bool {
+    if host_len == 0 || host_len > HTC_POOL_HOST_MAX || conn.fd < 0 {
+        return false;
+    }
+    var idx: usize = HTC_POOL_SLOTS;
+    var i: usize = 0;
+    while i < HTC_POOL_SLOTS {
+        if !p.slots[i].used {
+            idx = i;
+            break;
+        }
+        i = i + 1;
+    }
+    if idx == HTC_POOL_SLOTS {
+        idx = 0;
+        var oldest: u64 = p.slots[0].idle_since;
+        i = 1;
+        while i < HTC_POOL_SLOTS {
+            if p.slots[i].idle_since < oldest {
+                oldest = p.slots[i].idle_since;
+                idx = i;
+            }
+            i = i + 1;
+        }
+        if idx < HTC_POOL_SLOTS {
+            htc_pool_close_slot(&p.slots[idx]);
+        }
+        p.drops = p.drops +% 1;
+    }
+    if idx >= HTC_POOL_SLOTS {
+        return false;
+    }
+    const s: &HtcPoolSlot = &p.slots[idx];
+    s.used = true;
+    s.host_len = host_len;
+    var k: usize = 0;
+    while k < host_len {
+        s.host[k] = htc_lower(host[k]);
+        k = k + 1;
+    }
+    s.port = port;
+    s.trust = trust;
+    s.idle_since = now;
+    htc_conn_move(&s.conn, conn);
+    htc_conn_clear(conn);
+    p.puts = p.puts +% 1;
+    return true;
+}
+
+/// 清理过期连接，返回关闭数量。
+export fn htc_pool_prune(p: &HtcPool, now: u64) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while i < HTC_POOL_SLOTS {
+        const s: &HtcPoolSlot = &p.slots[i];
+        if s.used && now >= s.idle_since +% HTC_POOL_IDLE_MS {
+            htc_pool_close_slot(s);
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// 池内空闲连接数（状态/测试用）。
+export fn htc_pool_count(p: &const HtcPool) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while i < HTC_POOL_SLOTS {
+        if p.slots[i].used {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn htc_copy(dst: &byte, cap: usize, src: &const byte, n: usize) usize {
+    var i: usize = 0;
+    while i < n && i < cap {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+    return i;
+}
+
+fn htc_cstr_len(p: &const byte) usize {
+    var i: usize = 0;
+    while i < 4096 && p[i] != (0 as byte) {
+        i = i + 1;
+    }
+    return i;
+}
+
+/// D4：显式配置代理（`--proxy http://host:port` + `--no-proxy a,b`）。
+export fn htc_proxy_set(ctx: &HtcCtx, url: &const byte, url_len: usize,
+    nop: &const byte, nop_len: usize) bool {
+    ctx.proxy_ready = false;
+    ctx.no_proxy_len = 0;
+    if url_len > 0 {
+        if !proxy_parse(url, url_len, &ctx.proxy) {
+            return false;
+        }
+        ctx.proxy_ready = ctx.proxy.host_len > 0;
+    }
+    if nop_len > 0 {
+        ctx.no_proxy_len = htc_copy(&ctx.no_proxy[0], HTC_NOPROXY_MAX, nop, nop_len);
+    }
+    return true;
+}
+
+/// D4：从环境变量读代理（`HTTPS_PROXY` 优先，其次 `https_proxy`；`NO_PROXY` 同理）。
+export fn htc_proxy_load_env(ctx: &HtcCtx) bool {
+    var url: &byte = getenv(&"HTTPS_PROXY"[0] as &const byte);
+    if (url as usize) == 0 || url[0] == (0 as byte) {
+        url = getenv(&"https_proxy"[0] as &const byte);
+    }
+    var nop: &byte = getenv(&"NO_PROXY"[0] as &const byte);
+    if (nop as usize) == 0 || nop[0] == (0 as byte) {
+        nop = getenv(&"no_proxy"[0] as &const byte);
+    }
+    var un: usize = 0;
+    if (url as usize) != 0 {
+        un = htc_cstr_len(url);
+    }
+    var nn: usize = 0;
+    if (nop as usize) != 0 {
+        nn = htc_cstr_len(nop);
+        if nn > HTC_NOPROXY_MAX {
+            nn = HTC_NOPROXY_MAX;
+        }
+    }
+    if un == 0 {
+        ctx.proxy_ready = false;
+        ctx.no_proxy_len = 0;
+        return false;
+    }
+    return htc_proxy_set(ctx, url, un, nop, nn);
+}
+
+/// D4：这个目标要不要走代理（代理已配 && 不在 no_proxy 里）。
+export fn htc_proxy_for(ctx: &const HtcCtx, host: &const byte, host_len: usize) bool {
+    if !ctx.proxy_ready {
+        return false;
+    }
+    return !proxy_bypass(&ctx.no_proxy[0], ctx.no_proxy_len, &host[0], host_len);
+}
+
+/// D4：在已连通的 socket 上做 CONNECT 隧道（阻塞读写，调用方先清 O_NONBLOCK）。
+/// 只接受 200；其余（407 等）一律失败，交给上层报错。
+fn htc_proxy_tunnel(fd: i32, ctx: &const HtcCtx, host: &const byte, host_len: usize,
+    port: u16) bool {
+    var req: Buf = buf_new(512);
+    defer { buf_free(&req); }
+    if !proxy_build_connect(&ctx.proxy, host, host_len, port, &req) {
+        return false;
+    }
+    var off: usize = 0;
+    while off < req.len {
+        const r: !isize = sys_send(fd, &req.ptr[off], req.len - off, 0);
+        const n: isize = r catch |_| {
+            return false;
+        };
+        if n <= 0 {
+            return false;
+        }
+        off = off +% (n as usize);
+    }
+    var resp: [byte: 1024] = [0: 1024];
+    var have: usize = 0;
+    while have < 1024 {
+        const r: !isize = sys_read(fd, &resp[have], 1024 - have);
+        const n: isize = r catch |_| {
+            return false;
+        };
+        if n <= 0 {
+            return false;
+        }
+        have = have +% (n as usize);
+        var i: usize = 0;
+        while i + 3 < have {
+            if resp[i] == ('\r' as byte) && resp[i + 1] == ('\n' as byte)
+                && resp[i + 2] == ('\r' as byte) && resp[i + 3] == ('\n' as byte) {
+                // 头部结束：在头里找 " 200 "
+                var j: usize = 0;
+                while j + 5 <= i {
+                    if resp[j] == (' ' as byte) && resp[j + 1] == ('2' as byte)
+                        && resp[j + 2] == ('0' as byte) && resp[j + 3] == ('0' as byte)
+                        && resp[j + 4] == (' ' as byte) {
+                        return true;
+                    }
+                    j = j + 1;
+                }
+                return false;
+            }
+            i = i + 1;
+        }
+    }
+    return false;
 }
 
 export fn htc_ctx_init(ctx: &HtcCtx, mode: u8) void {
@@ -42,6 +378,9 @@ export fn htc_ctx_init(ctx: &HtcCtx, mode: u8) void {
     tlsx_pins_init(&ctx.tofu);
     ctx.allow_learn = true;
     ctx.allow_private = false;
+    htc_pool_init(&ctx.pool);
+    ctx.proxy_ready = false;
+    ctx.no_proxy_len = 0;
 }
 
 export struct HtcCall {
@@ -81,6 +420,68 @@ export fn htc_call_free(call: &HtcCall) void {
     buf_free(&call.plain);
 }
 
+/// 换连接重试前把响应侧状态清干净（不动已分配的缓冲）。
+fn htc_call_reset(call: &HtcCall) void {
+    call.header_count = 0;
+    call.head = HttpcHead{};
+    call.body.len = 0;
+    call.body_off = 0;
+    call.plain.len = 0;
+    call.plain_off = 0;
+    call.chunk_pos = 0;
+    call.chunk_eof = false;
+    call.done = false;
+    call.stream = false;
+    sse_init(&call.sse);
+}
+
+/// D3：响应头里的 `Retry-After`（秒）。缺失/非数字返回 0；上限 600s。
+export fn htc_retry_after_s(call: &const HtcCall) u32 {
+    var vo: usize = 0;
+    var vl: usize = 0;
+    if !httpc_header_find(&call.headers[0], call.header_count, call.body.ptr,
+        &"retry-after"[0: 11], 11, &vo, &vl) {
+        return 0;
+    }
+    var v: u32 = 0;
+    var i: usize = 0;
+    while i < vl {
+        const c: byte = call.body.ptr[vo + i];
+        if c < ('0' as byte) || c > ('9' as byte) {
+            return 0;
+        }
+        const nv: u32 = v *% (10 as u32) +% ((c -% (48 as byte)) as u32);
+        if nv < v {
+            return 600;
+        }
+        v = nv;
+        i = i + 1;
+    }
+    if v > (600 as u32) {
+        v = 600;
+    }
+    return v;
+}
+
+/// D2：这条连接能不能留给下一次请求。
+/// 条件：非流式、已读完、上游没写 `Connection: close`、没有多余字节（否则会串响应）。
+export fn htc_call_reusable(call: &const HtcCall) bool {
+    if call.stream || !call.done {
+        return false;
+    }
+    if call.head.connection_close || call.head.no_body {
+        return false;
+    }
+    if call.head.chunked {
+        return htc_chunk_terminated(call);
+    }
+    if call.head.content_length < 0 {
+        return false;
+    }
+    const need: usize = call.head.head_len +% (call.head.content_length as usize);
+    return call.body.len == need;
+}
+
 @async_fn fn htc_read_more_async(call: &HtcCall, deadline: u64) Future<!i32> {
     if !buf_reserve(&call.body, 4096) {
         return -1;
@@ -115,26 +516,68 @@ export @async_fn fn htc_open_async(cfg: &const HttppConfig, ctx: &HtcCtx,
     if !httpc_host_allowed(&cfg.host[0], cfg.host_len, ctx.allow_private) {
         return error.HtcBlocked;
     }
-    var addrs: DnsxAddrs = DnsxAddrs{};
-    const dnsf: Future<!i32> = dnsx_resolve_async(&cfg.host[0: cfg.host_len], &ctx.cache,
-        &ctx.resolv[0: ctx.resolv_len], now_ms, &addrs);
-    const dnsr: !i32 = @await dnsf;
-    var rr: i32 = 0;
-    rr = dnsr catch |_| {
-        return error.HtcNoAddress;
-    };
-    if rr != 1 || addrs.v4_n == 0 {
-        return error.HtcNoAddress;
+    // D2：非流式请求优先取池里的活连接（同 host/port/trust，未过 idle TTL）。
+    var reused: bool = false;
+    if !stream {
+        reused = htc_pool_take(&ctx.pool, &cfg.host[0], cfg.host_len, cfg.port,
+            ctx.mode, now_ms, &call.conn);
     }
-    const fd: i32 = try @await tcpx_connect_v4_async(&addrs.v4[0], cfg.port, deadline);
-    const tf: Future<!i32> = tlsx_conn_open_async(fd, &cfg.host[0: cfg.host_len],
-        ctx.mode, &ctx.pins[0], ctx.pin_count, &ctx.bundle[0], ctx.bundle_len,
-        &ctx.tofu, ctx.allow_learn, now_ms, &call.conn);
-    const tr: !i32 = @await tf;
-    var orr: i32 = 0;
-    orr = tr catch |_| {
-        return error.HtcConnectFailed;
-    };
+    // D4：配了代理且不在 no_proxy → 连代理、CONNECT 隧道，再在隧道里做 TLS。
+    const via_proxy: bool = htc_proxy_for(ctx, &cfg.host[0], cfg.host_len);
+    if !reused {
+        var addrs: DnsxAddrs = DnsxAddrs{};
+        var fd: i32 = 0;
+        if via_proxy {
+            const pdns: Future<!i32> = dnsx_resolve_async(
+                &ctx.proxy.host[0: ctx.proxy.host_len], &ctx.cache,
+                &ctx.resolv[0: ctx.resolv_len], now_ms, &addrs);
+            const pdr: !i32 = @await pdns;
+            var prr: i32 = 0;
+            prr = pdr catch |_| {
+                return error.HtcNoAddress;
+            };
+            if prr != 1 || addrs.v4_n == 0 {
+                return error.HtcNoAddress;
+            }
+            fd = try @await tcpx_connect_v4_async(&addrs.v4[0], ctx.proxy.port, deadline);
+            // CONNECT 是明文小包：临时切阻塞模式做同步读写，握手前恢复非阻塞。
+            const fl: !i32 = sys_fcntl(fd, 3, 0);
+            const flags: i32 = fl catch {
+                0;
+            };
+            if flags != 0 {
+                _ = sys_fcntl(fd, 4, flags & (0 -% 2049)) catch {};
+            }
+            const tun: bool = htc_proxy_tunnel(fd, ctx, &cfg.host[0], cfg.host_len, cfg.port);
+            if flags != 0 {
+                _ = sys_fcntl(fd, 4, flags) catch {};
+            }
+            if !tun {
+                _ = sys_close(fd) catch {};
+                return error.HtcConnectFailed;
+            }
+        } else {
+            const dnsf: Future<!i32> = dnsx_resolve_async(&cfg.host[0: cfg.host_len],
+                &ctx.cache, &ctx.resolv[0: ctx.resolv_len], now_ms, &addrs);
+            const dnsr: !i32 = @await dnsf;
+            var rr: i32 = 0;
+            rr = dnsr catch |_| {
+                return error.HtcNoAddress;
+            };
+            if rr != 1 || addrs.v4_n == 0 {
+                return error.HtcNoAddress;
+            }
+            fd = try @await tcpx_connect_v4_async(&addrs.v4[0], cfg.port, deadline);
+        }
+        const tf: Future<!i32> = tlsx_conn_open_async(fd, &cfg.host[0: cfg.host_len],
+            ctx.mode, &ctx.pins[0], ctx.pin_count, &ctx.bundle[0], ctx.bundle_len,
+            &ctx.tofu, ctx.allow_learn, now_ms, &call.conn);
+        const tr: !i32 = @await tf;
+        var orr: i32 = 0;
+        orr = tr catch |_| {
+            return error.HtcConnectFailed;
+        };
+    }
 
     var empty: [byte: 1] = [0: 1];
     var pptr: &const byte = &empty[0];
@@ -151,23 +594,33 @@ export @async_fn fn htc_open_async(cfg: &const HttppConfig, ctx: &HtcCtx,
     }
     const wf: Future<!usize> = tlsx_write_async(&call.conn, req.ptr as &const byte, req.len);
     const wr: !usize = @await wf;
+    var wfail: bool = false;
     var w: usize = 0;
     w = wr catch |_| {
-        return error.HtcBadResponse;
+        wfail = true;
+        0 as usize;
     };
-    if w != req.len {
+    if wfail || w != req.len {
+        if reused {
+            return error.HtcStale;
+        }
         return error.HtcBadResponse;
     }
-    call.stream = stream;
     if !buf_reserve(&call.body, HTC_BODY_INIT) {
         return error.HtcBadResponse;
     }
-    const hr: i32 = try @await httpc_read_head_async(&call.conn, call.body.ptr,
-        call.body.cap, &call.headers[0], &call.header_count, &call.head);
-    if hr == -3 {
-        return error.HtcBadResponse;
-    }
+    call.stream = stream;
+    var hr: i32 = 0;
+    hr = try @await httpc_read_head_async(&call.conn, call.body.ptr, call.body.cap,
+        &call.headers[0], &call.header_count, &call.head);
     if hr != 0 {
+        // 复用的旧连接可能刚好被上游关掉：交给调用方换新连接重试一次。
+        if reused {
+            return error.HtcStale;
+        }
+        if hr == -3 {
+            return error.HtcBadResponse;
+        }
         return error.HtcConnectFailed;
     }
     call.body.len = call.head.total;

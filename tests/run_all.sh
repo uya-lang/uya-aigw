@@ -19,6 +19,7 @@ run src/foundation/buf.uya src/net/rsav.uya src/net/x509min.uya src/net/chainx.u
 run src/foundation/buf.uya src/net/rsav.uya src/net/x509min.uya src/net/chainx.uya src/net/urlx.uya src/net/dnsx.uya src/net/tcpx.uya src/net/tlsx.uya src/net/tlsx_conn.uya src/net/httpc.uya tests/test_httpc.uya
 run src/foundation/buf.uya src/net/ssex.uya tests/test_ssex.uya
 run src/net/httpc_pool.uya tests/test_httpc_pool.uya
+run src/foundation/buf.uya src/net/rsav.uya src/net/x509min.uya src/net/chainx.uya src/net/urlx.uya src/net/dnsx.uya src/net/tcpx.uya src/net/tlsx.uya src/net/tlsx_conn.uya src/net/httpc.uya src/net/ssex.uya src/net/httpc_pool.uya src/net/proxyx.uya src/providers/http.uya src/providers/httpcall.uya tests/test_htcpool.uya
 run src/foundation/buf.uya src/providers/http.uya tests/test_provider_http.uya
 run src/foundation/buf.uya src/providers/http.uya src/providers/upstream_cfg.uya tests/test_upstream_cfg.uya
 run src/foundation/buf.uya src/net/proxyx.uya tests/test_proxyx.uya
@@ -48,6 +49,7 @@ run src/core/dbx.uya src/core/schema.uya src/core/backup.uya tests/test_backup.u
 run src/core/dbx.uya src/core/schema.uya src/core/backup.uya src/core/journal.uya src/cluster/shard.uya tests/test_journal.uya
 run src/core/dbx.uya src/core/schema.uya src/core/money.uya src/core/schedule.uya src/core/store.uya src/core/backup.uya src/core/journal.uya src/core/runtime.uya src/cluster/shard.uya tests/test_runtime.uya
 run src/plugins/pool.uya tests/test_pool.uya
+run src/foundation/buf.uya src/core/json.uya src/plugins/pool.uya src/providers/plug.uya tests/test_plug.uya
 run src/core/json.uya tests/test_json.uya
 run src/core/dbx.uya src/core/schema.uya src/core/money.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/backup.uya src/core/journal.uya src/core/billing.uya src/cluster/shard.uya tests/test_billing.uya
 run src/core/dbx.uya src/core/schema.uya src/core/store.uya src/core/money.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/backup.uya src/core/journal.uya src/core/billing.uya src/core/batch.uya src/cluster/shard.uya tests/test_batch.uya

@@ -28,7 +28,7 @@ fn arg_u16(p: &byte) u16 {
 }
 
 fn usage() i32 {
-    printf("usage:\n  aigw serve [--host 0.0.0.0] [--port 8080] [--db data/aigw.db] [--data-dir data] [--ca <pem>]\n  aigw tls probe <host> [--port N] [--ca <pem>]\n  aigw tls pin <host> <sha256hex> [--file <tsv>]\n" as *byte);
+    printf("usage:\n  aigw serve [--host 0.0.0.0] [--port 8080] [--db data/aigw.db] [--data-dir data] [--ca <pem>] [--proxy http://host:port] [--no-proxy a,b] [--plugin-cmd \"cmd args\"]\n  aigw tls probe <host> [--port N] [--ca <pem>]\n  aigw tls pin <host> <sha256hex> [--file <tsv>]\n" as *byte);
     return 2;
 }
 
@@ -36,7 +36,8 @@ fn usage() i32 {
 /// `--port 0` 让内核挑端口（回归脚本靠这条读取真实端口）。
 fn serve_main(host: &[byte], port: u16, db_path: &[byte], data_dir: &[byte],
     ca_path: &[byte], dev_otp: bool, admin_key: &[byte], meta_path: &[byte],
-    node_id: &[byte], uplink: &[byte]) i32 {
+    node_id: &[byte], uplink: &[byte], proxy: &[byte], no_proxy: &[byte],
+    plugin_cmd: &[byte]) i32 {
     // B5：controller 先打开 usage 分片，runtime 的 journal 重放与 ingest 才能按 user_id 路由。
     if meta_path.len > 0 {
         shard_begin(data_dir) catch {
@@ -62,8 +63,23 @@ fn serve_main(host: &[byte], port: u16, db_path: &[byte], data_dir: &[byte],
     srv_uplink_setup(uplink);
     htc_ctx_init(&g_up_ctx, TLSX_MODE_CHAIN);
     g_up_ctx.allow_private = true;
+    // D4：出站代理。环境变量（HTTPS_PROXY/NO_PROXY）打底，`--proxy/--no-proxy` 覆盖。
+    _ = htc_proxy_load_env(&g_up_ctx);
+    if proxy.len > 0 {
+        if !htc_proxy_set(&g_up_ctx, proxy.ptr, proxy.len, no_proxy.ptr, no_proxy.len) {
+            printf("invalid --proxy (only http://host:port)\n" as *byte);
+            return 1;
+        }
+    }
     if ca_path.len > 0 {
         _ = srv_load_ca(ca_path);
+    }
+    // D5：stdio 插件池（`--plugin-cmd` 或 AIGW_PLUGIN_CMD；不配则只能用 kind=http）
+    if plugin_cmd.len > 0 {
+        plugin_pool_init(plugin_cmd, 1, 4, 60000, 500) catch {
+            printf("plugin pool init failed\n" as *byte);
+            return 1;
+        };
     }
     const lfd: i32 = serve_listen(host, port) catch |_| {
         printf("listen failed\n" as *byte);
@@ -81,6 +97,9 @@ fn serve_main(host: &[byte], port: u16, db_path: &[byte], data_dir: &[byte],
     _ = batch_flush() catch {
         0 as usize;
     };
+    if plugin_pool_ready() {
+        plugin_pool_shutdown();
+    }
     return r;
 }
 
@@ -135,6 +154,12 @@ export fn main() i32 {
         var nidlen: usize = 0;
         var upl: [byte: 80] = [0: 80];
         var upllen: usize = 0;
+        var prx: [byte: 512] = [0: 512];
+        var prxlen: usize = 0;
+        var npx: [byte: 512] = [0: 512];
+        var npxlen: usize = 0;
+        var plg: [byte: 512] = [0: 512];
+        var plglen: usize = 0;
         var dat: [byte: 512] = [0: 512];
         dat[0] = 'd';
         dat[1] = 'a';
@@ -221,12 +246,48 @@ export fn main() i32 {
                     m = m + 1;
                 }
                 datlen = m;
+            } else if arg_eq(f, "--proxy" as &const byte) {
+                const vn: usize = arg_len(v);
+                var m: usize = 0;
+                while m < vn && m < 512 {
+                    prx[m] = v[m];
+                    m = m + 1;
+                }
+                prxlen = m;
+            } else if arg_eq(f, "--plugin-cmd" as &const byte) {
+                const vn: usize = arg_len(v);
+                var m: usize = 0;
+                while m < vn && m < 512 {
+                    plg[m] = v[m];
+                    m = m + 1;
+                }
+                plglen = m;
+            } else if arg_eq(f, "--no-proxy" as &const byte) {
+                const vn: usize = arg_len(v);
+                var m: usize = 0;
+                while m < vn && m < 512 {
+                    npx[m] = v[m];
+                    m = m + 1;
+                }
+                npxlen = m;
             }
             k = k + 2;
         }
+        if plglen == 0 {
+            // 没给开关就看环境变量（容器/编排里更好传）
+            const ev: &byte = getenv(&"AIGW_PLUGIN_CMD"[0] as &const byte);
+            if (ev as usize) != 0 {
+                var m: usize = 0;
+                while ev[m] != (0 as byte) && m < 512 {
+                    plg[m] = ev[m];
+                    m = m + 1;
+                }
+                plglen = m;
+            }
+        }
         return serve_main(host[0: host_len], port, dbf[0: dblen], dat[0: datlen],
             ca[0: calen], dev_otp, adm[0: admlen], meta[0: metalen], nid[0: nidlen],
-            upl[0: upllen]);
+            upl[0: upllen], prx[0: prxlen], npx[0: npxlen], plg[0: plglen]);
     }
 
     if argc < 4 {

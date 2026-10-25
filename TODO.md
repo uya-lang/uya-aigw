@@ -46,9 +46,15 @@ ingest 幂等 + usage 分片 `hash(user_id)%4`、spool、journal 重放、集群
 
 ---
 
+## Phase D：接线补完（已完成）
+
+> C 之后核对「模块 + 单测已完成」与「serve 生产请求路径实际调用」，发现的功能未接线
+> 已全部补完（D1 每请求日志、D2 连接池、D3 重试退避、D4 代理 CONNECT、
+> D5 `kind=stdio` 插件供应商），每项一次提交，明细见 `TODO_DONE.md`。
+
 ## 当前建议顺序
 
-全部阶段（T / A / B / C）已完成，逐项记录与提交提示见 `TODO_DONE.md`。
+全部阶段（T / A / B / C / D1）已完成；D2→D5 按上面顺序补接线。
 
 ---
 

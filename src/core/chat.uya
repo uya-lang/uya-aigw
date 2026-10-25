@@ -42,6 +42,9 @@ export struct ChatPlan {
     stream: bool,
     payload: [byte: CHAT_PAYLOAD_MAX],
     payload_len: usize,
+    kind: [byte: 16],
+    kind_len: usize,
+    stdio: bool,
 }
 
 fn chat_copy(dst: &byte, cap: usize, src: &[byte]) usize {
@@ -341,6 +344,10 @@ fn chat_route(d: &Db, model: &[byte], session: &[byte], now: i64, out: &ChatPlan
     out.auth_name_len = chat_copy(&out.auth_name[0], CHAT_AUTH_NAME_MAX, prov.auth_name[0: prov.auth_name_len]);
     out.secret_len = chat_copy(&out.secret[0], CHAT_SECRET_MAX, prov.secret[0: prov.secret_len]);
     out.upstream_len = chat_copy(&out.upstream_model[0], CHAT_MODEL_MAX, up[0: upn]);
+    out.kind_len = chat_copy(&out.kind[0], 16, prov.kind[0: prov.kind_len]);
+    out.stdio = out.kind_len == 5 && out.kind[0] == ('s' as byte)
+        && out.kind[1] == ('t' as byte) && out.kind[2] == ('d' as byte)
+        && out.kind[3] == ('i' as byte) && out.kind[4] == ('o' as byte);
     if prov.base_path_len == 0 {
         out.path_len = chat_copy(&out.path[0], CHAT_PATH_MAX, &"/v1/chat/completions"[0: 20]);
     } else {
