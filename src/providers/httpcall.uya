@@ -12,6 +12,7 @@
 // 复用连接若已失效（keep-alive 被对端关掉），本函数自动换新连接重试一次。
 
 use libc.heap;
+use libc.syscall;
 
 export error HtcNoAddress;
 export error HtcBlocked;
@@ -29,6 +30,8 @@ export const HTC_BODY_INIT: usize = 8192;
 export const HTC_POOL_SLOTS: usize = 8;
 export const HTC_POOL_HOST_MAX: usize = 256;
 export const HTC_POOL_IDLE_MS: u64 = 60000;
+/// D4：代理（HTTPS_PROXY + NO_PROXY）。
+export const HTC_NOPROXY_MAX: usize = 512;
 
 struct HtcPoolSlot {
     used: bool,
@@ -61,6 +64,10 @@ export struct HtcCtx {
     allow_learn: bool,
     allow_private: bool,
     pool: HtcPool,
+    proxy: ProxyCfg,
+    proxy_ready: bool,
+    no_proxy: [byte: HTC_NOPROXY_MAX],
+    no_proxy_len: usize,
 }
 
 fn htc_lower(b: byte) byte {
@@ -238,6 +245,130 @@ export fn htc_pool_count(p: &const HtcPool) usize {
     return n;
 }
 
+fn htc_copy(dst: &byte, cap: usize, src: &const byte, n: usize) usize {
+    var i: usize = 0;
+    while i < n && i < cap {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+    return i;
+}
+
+fn htc_cstr_len(p: &const byte) usize {
+    var i: usize = 0;
+    while i < 4096 && p[i] != (0 as byte) {
+        i = i + 1;
+    }
+    return i;
+}
+
+/// D4：显式配置代理（`--proxy http://host:port` + `--no-proxy a,b`）。
+export fn htc_proxy_set(ctx: &HtcCtx, url: &const byte, url_len: usize,
+    nop: &const byte, nop_len: usize) bool {
+    ctx.proxy_ready = false;
+    ctx.no_proxy_len = 0;
+    if url_len > 0 {
+        if !proxy_parse(url, url_len, &ctx.proxy) {
+            return false;
+        }
+        ctx.proxy_ready = ctx.proxy.host_len > 0;
+    }
+    if nop_len > 0 {
+        ctx.no_proxy_len = htc_copy(&ctx.no_proxy[0], HTC_NOPROXY_MAX, nop, nop_len);
+    }
+    return true;
+}
+
+/// D4：从环境变量读代理（`HTTPS_PROXY` 优先，其次 `https_proxy`；`NO_PROXY` 同理）。
+export fn htc_proxy_load_env(ctx: &HtcCtx) bool {
+    var url: &byte = getenv(&"HTTPS_PROXY"[0] as &const byte);
+    if (url as usize) == 0 || url[0] == (0 as byte) {
+        url = getenv(&"https_proxy"[0] as &const byte);
+    }
+    var nop: &byte = getenv(&"NO_PROXY"[0] as &const byte);
+    if (nop as usize) == 0 || nop[0] == (0 as byte) {
+        nop = getenv(&"no_proxy"[0] as &const byte);
+    }
+    var un: usize = 0;
+    if (url as usize) != 0 {
+        un = htc_cstr_len(url);
+    }
+    var nn: usize = 0;
+    if (nop as usize) != 0 {
+        nn = htc_cstr_len(nop);
+        if nn > HTC_NOPROXY_MAX {
+            nn = HTC_NOPROXY_MAX;
+        }
+    }
+    if un == 0 {
+        ctx.proxy_ready = false;
+        ctx.no_proxy_len = 0;
+        return false;
+    }
+    return htc_proxy_set(ctx, url, un, nop, nn);
+}
+
+/// D4：这个目标要不要走代理（代理已配 && 不在 no_proxy 里）。
+export fn htc_proxy_for(ctx: &const HtcCtx, host: &const byte, host_len: usize) bool {
+    if !ctx.proxy_ready {
+        return false;
+    }
+    return !proxy_bypass(&ctx.no_proxy[0], ctx.no_proxy_len, &host[0], host_len);
+}
+
+/// D4：在已连通的 socket 上做 CONNECT 隧道（阻塞读写，调用方先清 O_NONBLOCK）。
+/// 只接受 200；其余（407 等）一律失败，交给上层报错。
+fn htc_proxy_tunnel(fd: i32, ctx: &const HtcCtx, host: &const byte, host_len: usize,
+    port: u16) bool {
+    var req: Buf = buf_new(512);
+    defer { buf_free(&req); }
+    if !proxy_build_connect(&ctx.proxy, host, host_len, port, &req) {
+        return false;
+    }
+    var off: usize = 0;
+    while off < req.len {
+        const r: !isize = sys_send(fd, &req.ptr[off], req.len - off, 0);
+        const n: isize = r catch |_| {
+            return false;
+        };
+        if n <= 0 {
+            return false;
+        }
+        off = off +% (n as usize);
+    }
+    var resp: [byte: 1024] = [0: 1024];
+    var have: usize = 0;
+    while have < 1024 {
+        const r: !isize = sys_read(fd, &resp[have], 1024 - have);
+        const n: isize = r catch |_| {
+            return false;
+        };
+        if n <= 0 {
+            return false;
+        }
+        have = have +% (n as usize);
+        var i: usize = 0;
+        while i + 3 < have {
+            if resp[i] == ('\r' as byte) && resp[i + 1] == ('\n' as byte)
+                && resp[i + 2] == ('\r' as byte) && resp[i + 3] == ('\n' as byte) {
+                // 头部结束：在头里找 " 200 "
+                var j: usize = 0;
+                while j + 5 <= i {
+                    if resp[j] == (' ' as byte) && resp[j + 1] == ('2' as byte)
+                        && resp[j + 2] == ('0' as byte) && resp[j + 3] == ('0' as byte)
+                        && resp[j + 4] == (' ' as byte) {
+                        return true;
+                    }
+                    j = j + 1;
+                }
+                return false;
+            }
+            i = i + 1;
+        }
+    }
+    return false;
+}
+
 export fn htc_ctx_init(ctx: &HtcCtx, mode: u8) void {
     dnsx_cache_init(&ctx.cache);
     dnsx_load_resolv(&ctx.resolv[0], HTC_RESOLV_MAX, &ctx.resolv_len);
@@ -248,6 +379,8 @@ export fn htc_ctx_init(ctx: &HtcCtx, mode: u8) void {
     ctx.allow_learn = true;
     ctx.allow_private = false;
     htc_pool_init(&ctx.pool);
+    ctx.proxy_ready = false;
+    ctx.no_proxy_len = 0;
 }
 
 export struct HtcCall {
@@ -389,19 +522,53 @@ export @async_fn fn htc_open_async(cfg: &const HttppConfig, ctx: &HtcCtx,
         reused = htc_pool_take(&ctx.pool, &cfg.host[0], cfg.host_len, cfg.port,
             ctx.mode, now_ms, &call.conn);
     }
+    // D4：配了代理且不在 no_proxy → 连代理、CONNECT 隧道，再在隧道里做 TLS。
+    const via_proxy: bool = htc_proxy_for(ctx, &cfg.host[0], cfg.host_len);
     if !reused {
         var addrs: DnsxAddrs = DnsxAddrs{};
-        const dnsf: Future<!i32> = dnsx_resolve_async(&cfg.host[0: cfg.host_len], &ctx.cache,
-            &ctx.resolv[0: ctx.resolv_len], now_ms, &addrs);
-        const dnsr: !i32 = @await dnsf;
-        var rr: i32 = 0;
-        rr = dnsr catch |_| {
-            return error.HtcNoAddress;
-        };
-        if rr != 1 || addrs.v4_n == 0 {
-            return error.HtcNoAddress;
+        var fd: i32 = 0;
+        if via_proxy {
+            const pdns: Future<!i32> = dnsx_resolve_async(
+                &ctx.proxy.host[0: ctx.proxy.host_len], &ctx.cache,
+                &ctx.resolv[0: ctx.resolv_len], now_ms, &addrs);
+            const pdr: !i32 = @await pdns;
+            var prr: i32 = 0;
+            prr = pdr catch |_| {
+                return error.HtcNoAddress;
+            };
+            if prr != 1 || addrs.v4_n == 0 {
+                return error.HtcNoAddress;
+            }
+            fd = try @await tcpx_connect_v4_async(&addrs.v4[0], ctx.proxy.port, deadline);
+            // CONNECT 是明文小包：临时切阻塞模式做同步读写，握手前恢复非阻塞。
+            const fl: !i32 = sys_fcntl(fd, 3, 0);
+            const flags: i32 = fl catch {
+                0;
+            };
+            if flags != 0 {
+                _ = sys_fcntl(fd, 4, flags & (0 -% 2049)) catch {};
+            }
+            const tun: bool = htc_proxy_tunnel(fd, ctx, &cfg.host[0], cfg.host_len, cfg.port);
+            if flags != 0 {
+                _ = sys_fcntl(fd, 4, flags) catch {};
+            }
+            if !tun {
+                _ = sys_close(fd) catch {};
+                return error.HtcConnectFailed;
+            }
+        } else {
+            const dnsf: Future<!i32> = dnsx_resolve_async(&cfg.host[0: cfg.host_len],
+                &ctx.cache, &ctx.resolv[0: ctx.resolv_len], now_ms, &addrs);
+            const dnsr: !i32 = @await dnsf;
+            var rr: i32 = 0;
+            rr = dnsr catch |_| {
+                return error.HtcNoAddress;
+            };
+            if rr != 1 || addrs.v4_n == 0 {
+                return error.HtcNoAddress;
+            }
+            fd = try @await tcpx_connect_v4_async(&addrs.v4[0], cfg.port, deadline);
         }
-        const fd: i32 = try @await tcpx_connect_v4_async(&addrs.v4[0], cfg.port, deadline);
         const tf: Future<!i32> = tlsx_conn_open_async(fd, &cfg.host[0: cfg.host_len],
             ctx.mode, &ctx.pins[0], ctx.pin_count, &ctx.bundle[0], ctx.bundle_len,
             &ctx.tofu, ctx.allow_learn, now_ms, &call.conn);

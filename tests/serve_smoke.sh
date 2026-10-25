@@ -6,6 +6,8 @@
 # 避免脚本选端口与服务端绑定时序不一致。
 set -uo pipefail
 cd "$(dirname "$0")/.."
+# D4：环境里的 HTTPS_PROXY/NO_PROXY 会让出站走代理，e2e 需要确定行为。
+unset HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy
 
 UYA=${UYA:-/home/winger/uya/uya/bin/uya}
 UYA_ROOT=${UYA_ROOT:-/home/winger/uya/uya/lib}

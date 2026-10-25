@@ -140,4 +140,22 @@ test "key_isolation" { run_test("key_isolation", test_key_isolation); }
 test "ttl_and_prune" { run_test("ttl_and_prune", test_ttl_and_prune); }
 test "lru_evict" { run_test("lru_evict", test_lru_evict); }
 test "reusable_rules" { run_test("reusable_rules", test_reusable_rules); }
+fn test_proxy_config() !void {
+    var ctx: HtcCtx = HtcCtx{};
+    htc_ctx_init(&ctx, 0);
+    // 没配代理 → 一律直连
+    try assert_eq_bool(htc_proxy_for(&ctx, &"a.example"[0: 9], 9), false);
+    // 配了代理 + no_proxy
+    try assert_eq_bool(htc_proxy_set(&ctx, &"http://127.0.0.1:3128"[0: 21], 21,
+        &"localhost, .internal"[0: 20], 20), true);
+    try assert_eq_bool(ctx.proxy.port, 3128);
+    try assert_eq_bool(htc_proxy_for(&ctx, &"a.example"[0: 9], 9), true);
+    try assert_eq_bool(htc_proxy_for(&ctx, &"localhost"[0: 9], 9), false);
+    try assert_eq_bool(htc_proxy_for(&ctx, &"x.internal"[0: 10], 10), false);
+    // 非 http:// scheme 拒绝
+    try assert_eq_bool(htc_proxy_set(&ctx, &"socks5://h:1"[0: 12], 12, &""[0: 0], 0), false);
+    try assert_eq_bool(htc_proxy_for(&ctx, &"a.example"[0: 9], 9), false);
+}
+
 test "retry_after" { run_test("retry_after", test_retry_after); }
+test "proxy_config" { run_test("proxy_config", test_proxy_config); }

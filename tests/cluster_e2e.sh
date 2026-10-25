@@ -2,6 +2,8 @@
 # B6：集群端到端 —— controller + uplink 注册 + epoch/assign + edge 路由 + drain 重分配 + ingest 幂等
 set -u
 cd "$(dirname "$0")/.." || exit 1
+# D4：环境里的 HTTPS_PROXY/NO_PROXY 会让出站走代理，e2e 需要确定行为。
+unset HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy
 TMP=$(mktemp -d)
 PIDS=()
 cleanup() {

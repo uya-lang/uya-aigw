@@ -54,7 +54,7 @@ ingest 幂等 + usage 分片 `hash(user_id)%4`、spool、journal 重放、集群
 - D4 代理 CONNECT：`src/net/proxyx.uya` 接入出站（`HTTPS_PROXY` + `no_proxy`）。
 - D5 插件供应商：`providers.kind=stdio` 接 `src/plugins/pool.uya`（与内置 HTTP 二选一）。
 
-（D1 每请求日志、D2 连接池、D3 重试退避已落地，见 `TODO_DONE.md`。）
+（D1 每请求日志、D2 连接池、D3 重试退避、D4 代理 CONNECT 已落地，见 `TODO_DONE.md`。）
 
 ---
 

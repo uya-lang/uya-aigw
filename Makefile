@@ -26,6 +26,8 @@ selftest: check
 ui-e2e:
 	rm -rf .uyacache
 	./tests/chat_e2e.sh
+	rm -rf .uyacache
+	./tests/proxy_e2e.sh
 
 # 网关侧 SSE 并发（默认 1000 连接 × 20 事件）
 load-sse: check

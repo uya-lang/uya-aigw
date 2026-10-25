@@ -5,7 +5,8 @@
 //   - httpc_status_retryable / httpc_backoff_ms：只重试可重试的状态码；
 //   - ConnPool：按 (host, port, trust) 复用，idle TTL 过期清理，满时 LRU 淘汰。
 //
-// 代理 CONNECT 需要真实 TlsxConn，放在 TLS-09 的 provider 层接入（TODO 已注明）。
+// 本文件只有策略；**真实连接**的复用由 `src/providers/httpcall.uya` 的 `HtcPool` 承担
+// （TLS-09 的 provider 层，见 D2），代理 CONNECT 也已在那里接上（D4）。
 
 export const POOL_MAX_SLOTS: usize = 64;
 export const POOL_IDLE_TTL_MS: u64 = 60000;

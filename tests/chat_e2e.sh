@@ -2,6 +2,8 @@
 # A4 e2e：种子 Key/供应商/价目 → aigw serve → TLS mock 上游 → chat → usage 落账
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# D4：环境里的 HTTPS_PROXY/NO_PROXY 会让出站走代理，e2e 需要确定行为。
+unset HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy
 
 UYA=${UYA:-/home/winger/uya/uya/bin/uya}
 UYA_ROOT=${UYA_ROOT:-/home/winger/uya/uya/lib}

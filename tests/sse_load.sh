@@ -2,6 +2,8 @@
 # B4/A4：网关侧 SSE 并发（1000 条连接）与尾延迟基线。
 set -u
 cd "$(dirname "$0")/.." || exit 1
+# D4：环境里的 HTTPS_PROXY/NO_PROXY 会让出站走代理，e2e 需要确定行为。
+unset HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy
 TMP=$(mktemp -d)
 PID=""
 cleanup() { [ -n "$PID" ] && kill "$PID" 2>/dev/null; [ -n "$PID" ] && wait "$PID" 2>/dev/null; rm -rf "$TMP"; }
