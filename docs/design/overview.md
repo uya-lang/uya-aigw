@@ -94,7 +94,7 @@
 {"id":1,"event":"error","data":{"code":"upstream_error","message":"..."}}
 ```
 
-插件池：常驻、`min/max`、空闲回收、崩溃退避、取消、`ping/pong`；v1 每进程 1 条在飞。
+插件池：常驻、`min/max`、空闲回收、崩溃退避、取消、`ping/pong`、被杀后同槽重绑并重试一次；v1 每进程 1 条在飞。
 
 内置 HTTP 供应商：设计见 `docs/design/tls-provider.md`。
 

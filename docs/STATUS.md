@@ -26,9 +26,9 @@
 - A4（快路径/批量落库）：`chat_scan` 顶层扫描（不建 DOM）+ `src/core/batch.uya`
   （512 行/200ms 事务、journal 批追加、查询前 flush）；`tests/test_batch.uya` 与
   `tests/test_chat.uya` fast_path 组覆盖。
-- A3（已落地）：`src/plugins/pool.uya` 插件池（stdio JSONL 子进程）：预热 min、复用、
-  扩容到 max、空闲缩容到 min、崩溃指数退避、cancel、ping/pong；非阻塞 fd + poll 超时
-  与按行分帧。`tests/test_pool.uya` 24 断言（`tests/plugin_echo.py` 作最小插件）。
+- A3/A8（已落地）：`src/plugins/pool.uya` 插件池（stdio JSONL 子进程）：预热 min、复用、
+  扩容到 max、空闲缩容到 min、崩溃指数退避、cancel、ping/pong、进程被杀后同槽重绑并重试；
+  非阻塞 fd + poll 超时与按行分帧。`tests/test_pool.uya` 34 断言（`tests/plugin_echo.py` 作最小插件）。
 - B1（已落地）：meta.db + `elect.uya` + controller 控制面（register/heartbeat/
   config/status，`--meta`/`--node-id`，standby 不备份）。
 - B2（进行中）：`uplink.uya` + `--uplink` 已通（node 注册/心跳）；config 快照与

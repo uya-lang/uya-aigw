@@ -18,6 +18,11 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+/* 写已死插件的管道会触发 SIGPIPE；网关/测试进程不应因此退出。 */
+void aigw_pool_ignore_sigpipe(void) {
+    signal(SIGPIPE, SIG_IGN);
+}
+
 /* 返回 0 成功；-1 建管道失败；-2 fork 失败。错误原因留给 errno。 */
 int aigw_pool_spawn(const char *cmd, int *pid_out, int *in_fd, int *out_fd) {
     int inp[2] = {-1, -1};
