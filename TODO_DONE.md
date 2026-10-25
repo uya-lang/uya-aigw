@@ -98,3 +98,4 @@
 | B4 (load) | 2026-10-25 | `git log --grep='B4 (load)'` | `tests/sse_load.sh`（起 serve → `serve_sse_load.py` 开 1000 条 `/v1/_sse` 连接、各读 20 个事件、10s 内判定）+ `make load-sse` + 接入 `tests/run_all.sh`；实测 `SSE-OK conns=1000 events=20 elapsed=0.51s` |
 | B5 (journal 重放) | 2026-10-25 | `git log --grep='B5 (journal 重放)'` | 复核 journal 重放链路：`journal_append` + `journal_replay`（同 request_id 幂等，靠 `usage_ledger` 主键 + `insert or ignore`）、`journal_replay_days`（按天区间）+ 坏行/半截尾行容错，均由 `tests/test_journal.uya` 5 组覆盖并在 `make test` 中全绿；serve 启动时 `runtime_setup` 已自动重放数据目录 |
 | A8 (lb test) | 2026-10-25 | `git log --grep='A8 (lb test)'` | `tests/test_lb.uya` 新增 force_block 组：priority 0 首选、`lb_report(false)`+`lb_block_for` 后立刻改选次选、熔断窗口内保持、窗口外回切（`test_lb` 共 21 断言） |
+| C2 (ledger test) | 2026-10-25 | `git log --grep='C2 (ledger test)'` | `tests/test_admin_list.uya` 新增 ledger_paging 组：ts 倒序、按 user 隔离、limit/offset 分页、越界空页、详情字段（cost/period）、跨用户查详情返回 false（`test_admin_list` 共 26 断言） |

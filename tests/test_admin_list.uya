@@ -56,5 +56,66 @@ fn test_providers() !void {
     try assert_eq_i32(rows[1].port, 8080);
 }
 
+fn same(a: &[byte], b: &[byte]) bool {
+    if a.len != b.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < a.len {
+        if a[i] != b[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn mkledger(d: &Db, rid: &[byte], uid: i64, ts: i64, model: &[byte], cost: i64) !void {
+    var st: DbStmt = try dbx_prepare(d,
+        "insert into usage_ledger(request_id, user_id, ts, model, provider, input_tokens, output_tokens, cache_read_tokens, cost_nano, price_nano, period, rate_version) values(?, ?, ?, ?, 'p', 10, 5, 1, ?, 0, 'peak', 1)" as &const byte);
+    defer { dbx_finalize(&st); }
+    try dbx_bind_text(&st, 1, rid);
+    try dbx_bind_i64(&st, 2, uid);
+    try dbx_bind_i64(&st, 3, ts);
+    try dbx_bind_text(&st, 4, model);
+    try dbx_bind_i64(&st, 5, cost);
+    try assert_eq_i32(dbx_step(&st), 0);
+}
+
+fn test_ledger_paging() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    try mkledger(&d, &"r1"[0: 2], 1, 100, &"m1"[0: 2], 11);
+    try mkledger(&d, &"r2"[0: 2], 1, 300, &"m2"[0: 2], 22);
+    try mkledger(&d, &"r3"[0: 2], 1, 200, &"m3"[0: 2], 33);
+    try mkledger(&d, &"x1"[0: 2], 2, 400, &"m9"[0: 2], 44);
+    var rows: [StoreLedgerRow: 8] = [];
+    // 按 ts 倒序、只含本用户
+    const n: usize = try store_list_ledger(&d, 1, 8, 0, &rows[0], 8);
+    try assert_eq_i32(n as i32, 3);
+    try assert_eq_bool(same(rows[0].request_id[0: rows[0].request_id_len], &"r2"[0: 2]), true);
+    try assert_eq_bool(same(rows[1].request_id[0: rows[1].request_id_len], &"r3"[0: 2]), true);
+    try assert_eq_bool(same(rows[2].request_id[0: rows[2].request_id_len], &"r1"[0: 2]), true);
+    try assert_eq_i64(rows[0].cost_nano, 22);
+    // 分页
+    const p1: usize = try store_list_ledger(&d, 1, 1, 1, &rows[0], 8);
+    try assert_eq_i32(p1 as i32, 1);
+    try assert_eq_bool(same(rows[0].request_id[0: rows[0].request_id_len], &"r3"[0: 2]), true);
+    const p2: usize = try store_list_ledger(&d, 1, 8, 3, &rows[0], 8);
+    try assert_eq_i32(p2 as i32, 0);
+    // 详情
+    var one: StoreLedgerRow = StoreLedgerRow{};
+    try assert_eq_bool(try store_get_ledger(&d, 1, &"r1"[0: 2], &one), true);
+    try assert_eq_i64(one.cost_nano, 11);
+    try assert_eq_bool(same(one.period[0: one.period_len], &"peak"[0: 4]), true);
+    // 别人的 id 查不到
+    const other: bool = try store_get_ledger(&d, 2, &"r1"[0: 2], &one);
+    try assert_eq_bool(other, false);
+    const none: usize = try store_list_ledger(&d, 9, 8, 0, &rows[0], 8);
+    try assert_eq_i32(none as i32, 0);
+}
+
 test "users" { run_test("users", test_users); }
 test "providers" { run_test("providers", test_providers); }
+test "ledger_paging" { run_test("ledger_paging", test_ledger_paging); }
