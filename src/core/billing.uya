@@ -1,0 +1,151 @@
+// src/core/billing.uya — A4 结算：解析 usage → 查价 → 落账（usage_ledger + journal）
+//
+// 一次请求的收尾顺序：
+//   1. 从上游响应里取 usage（OpenAI `prompt_tokens` 或 Anthropic `input_tokens` 都认）；
+//   2. `price_lookup` 取进价（按 provider+model）与卖价（按 user 覆盖 / 默认）；
+//   3. 先写 journal（崩溃恢复的来源，request_id 幂等），再 `insert or ignore` 进
+//      usage_ledger（journal 重放的落点）；重放/重试都只有一行。
+//
+// 金额只走 money.uya 的整数运算；`price_amount` 的口径与 preview 完全一致。
+
+export error BillingFailed;
+
+export struct BillingResult {
+    cost_nano: i64,
+    price_nano: i64,
+    rate_version: i64,
+    duplicate: bool,
+    found: bool,
+}
+
+fn billing_json_i64(d: &JsonDoc, obj: i32, key: &[byte]) i64 {
+    const v: i32 = json_get(d, obj, key);
+    if json_kind(d, v) != JSON_NUM {
+        return 0;
+    }
+    return json_i64(d, v);
+}
+
+/// 从响应根节点解析 usage。返回 false 表示没有 usage 对象。
+export fn billing_usage_parse(d: &JsonDoc, root: i32, out: &PriceUsage) bool {
+    out.input_tokens = 0;
+    out.output_tokens = 0;
+    out.cache_read_tokens = 0;
+    const u: i32 = json_get(d, root, &"usage"[0: 5]);
+    if json_kind(d, u) != JSON_OBJ {
+        return false;
+    }
+    out.input_tokens = billing_json_i64(d, u, &"prompt_tokens"[0: 13]);
+    if out.input_tokens == 0 {
+        out.input_tokens = billing_json_i64(d, u, &"input_tokens"[0: 12]);
+    }
+    out.output_tokens = billing_json_i64(d, u, &"completion_tokens"[0: 17]);
+    if out.output_tokens == 0 {
+        out.output_tokens = billing_json_i64(d, u, &"output_tokens"[0: 13]);
+    }
+    const det: i32 = json_get(d, u, &"prompt_tokens_details"[0: 21]);
+    if json_kind(d, det) == JSON_OBJ {
+        out.cache_read_tokens = billing_json_i64(d, det, &"cached_tokens"[0: 13]);
+    }
+    if out.cache_read_tokens == 0 {
+        out.cache_read_tokens = billing_json_i64(d, u, &"cache_read_input_tokens"[0: 23]);
+    }
+    return true;
+}
+
+fn billing_zero_rates() PriceRates {
+    return PriceRates{
+        input_nano_per_mtok: 0,
+        output_nano_per_mtok: 0,
+        cache_read_nano_per_mtok: 0,
+        per_request_nano: 0,
+        permille: 1000,
+        card_id: 0,
+        version: 0,
+        found: false,
+    };
+}
+
+/// 只算钱不落账（preview / 校验用）。
+export fn billing_quote(d: &Db, model: &[byte], provider: &[byte], user_id: i64,
+    ts: i64, tz_min: i32, usage: &PriceUsage, out: &BillingResult) !void {
+    out.cost_nano = 0;
+    out.price_nano = 0;
+    out.rate_version = 0;
+    out.duplicate = false;
+    out.found = false;
+    var cost_rates: PriceRates = billing_zero_rates();
+    var sell_rates: PriceRates = billing_zero_rates();
+    try price_lookup(d, PRICE_KIND_COST, model, provider, 0, ts, tz_min, &cost_rates);
+    var no_provider: [byte: 1] = [0: 1];
+    try price_lookup(d, PRICE_KIND_SELL, model, no_provider[0: 0], user_id, ts, tz_min, &sell_rates);
+    out.cost_nano = price_amount(&cost_rates, usage);
+    out.price_nano = price_amount(&sell_rates, usage);
+    out.rate_version = sell_rates.version;
+    out.found = true;
+    return;
+}
+
+/// 结算一笔请求：journal → usage_ledger。重复 request_id 幂等（`duplicate = true`）。
+export fn billing_settle(d: &Db, dir: &[byte], request_id: &[byte], user_id: i64,
+    ts: i64, tz_min: i32, model: &[byte], provider: &[byte], usage: &PriceUsage,
+    out: &BillingResult) !void {
+    if request_id.len == 0 {
+        return error.BillingFailed;
+    }
+    try billing_quote(d, model, provider, user_id, ts, tz_min, usage, out);
+    var path: [byte: 512] = [0: 512];
+    const pn: usize = journal_path(dir, ts, &path[0], 512);
+    var empty: [byte: 1] = [0: 1];
+    journal_append(path[0: pn], request_id, user_id, model, provider, ts,
+        usage.input_tokens, usage.output_tokens, usage.cache_read_tokens,
+        out.cost_nano, out.price_nano, empty[0: 0], out.rate_version) catch {
+        return error.BillingFailed;
+    };
+    var st: DbStmt = dbx_prepare(d,
+        "insert or ignore into usage_ledger(request_id, user_id, ts, model, provider, input_tokens, output_tokens, cache_read_tokens, cost_nano, price_nano, period, rate_version) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)" as &const byte) catch {
+        return error.BillingFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, request_id) catch {
+        return error.BillingFailed;
+    };
+    dbx_bind_i64(&st, 2, user_id) catch {
+        return error.BillingFailed;
+    };
+    dbx_bind_i64(&st, 3, ts) catch {
+        return error.BillingFailed;
+    };
+    dbx_bind_text(&st, 4, model) catch {
+        return error.BillingFailed;
+    };
+    dbx_bind_text(&st, 5, provider) catch {
+        return error.BillingFailed;
+    };
+    dbx_bind_i64(&st, 6, usage.input_tokens) catch {
+        return error.BillingFailed;
+    };
+    dbx_bind_i64(&st, 7, usage.output_tokens) catch {
+        return error.BillingFailed;
+    };
+    dbx_bind_i64(&st, 8, usage.cache_read_tokens) catch {
+        return error.BillingFailed;
+    };
+    dbx_bind_i64(&st, 9, out.cost_nano) catch {
+        return error.BillingFailed;
+    };
+    dbx_bind_i64(&st, 10, out.price_nano) catch {
+        return error.BillingFailed;
+    };
+    dbx_bind_text(&st, 11, empty[0: 0]) catch {
+        return error.BillingFailed;
+    };
+    dbx_bind_i64(&st, 12, out.rate_version) catch {
+        return error.BillingFailed;
+    };
+    if dbx_step(&st) != 0 {
+        return error.BillingFailed;
+    }
+    out.duplicate = dbx_changes(d) != 1;
+    return;
+}

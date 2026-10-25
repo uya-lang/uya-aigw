@@ -1,0 +1,139 @@
+// tests/test_billing.uya — A4 结算：usage 解析、查价、journal + usage_ledger 幂等
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_i64;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+use libc.syscall;
+
+const T0: i64 = 1700000000;
+const DIR: &[byte] = &"/tmp/aigw_billing_test"[0: 22];
+const DIR2: &[byte] = &"/tmp/aigw_billing_replay"[0: 24];
+
+fn open_db(d: &Db) !void {
+    _ = try schema_open(d, &":memory:"[0: 8]);
+}
+
+fn prep(dir: &[byte], ts: i64) void {
+    var dbuf: [byte: 64] = [0: 64];
+    var i: usize = 0;
+    while i < dir.len && i < 63 {
+        dbuf[i] = dir[i];
+        i = i + 1;
+    }
+    dbuf[i] = 0 as byte;
+    _ = sys_mkdir(&dbuf[0] as *const byte, 493) catch {};
+    var p: [byte: 512] = [0: 512];
+    const pn: usize = journal_path(dir, ts, &p[0], 512);
+    _ = pn;
+    _ = sys_unlink(&p[0] as *const byte) catch {};
+}
+
+fn setup_prices(d: &Db) !void {
+    var sell: PriceCard = PriceCard{ id: 0, kind: 0, version: 0, effective_from: 0, found: false };
+    try price_card_create(d, PRICE_KIND_SELL, 1, 0, T0, &"v1"[0: 2], &sell);
+    try price_entry_put(d, sell.id, &""[0: 0], &"gpt-4o"[0: 6], 0, 1000, 2000, 500, 100, &""[0: 0]);
+    var cost: PriceCard = PriceCard{ id: 0, kind: 0, version: 0, effective_from: 0, found: false };
+    try price_card_create(d, PRICE_KIND_COST, 1, 0, T0, &"v1"[0: 2], &cost);
+    try price_entry_put(d, cost.id, &"mock"[0: 4], &"gpt-4o"[0: 6], 0, 600, 1200, 300, 50, &""[0: 0]);
+}
+
+fn ledger_count(d: &Db) i64 {
+    var n: i64 = 0;
+    if dbx_scalar_i64(d, &"select count(*) from usage_ledger"[0: 33], &n) != 0 {
+        return 0 - 1;
+    }
+    return n;
+}
+
+fn test_usage_parse() !void {
+    var d: JsonDoc = JsonDoc{};
+    try json_parse(&d, &"{\"usage\":{\"prompt_tokens\":100000,\"completion_tokens\":50000,\"prompt_tokens_details\":{\"cached_tokens\":10000}}}"[0: 108]);
+    var u: PriceUsage = PriceUsage{ input_tokens: 0, output_tokens: 0, cache_read_tokens: 0 };
+    try assert_eq_bool(billing_usage_parse(&d, json_root(&d), &u), true);
+    try assert_eq_i64(u.input_tokens, 100000);
+    try assert_eq_i64(u.output_tokens, 50000);
+    try assert_eq_i64(u.cache_read_tokens, 10000);
+
+    // Anthropic 风格
+    try json_parse(&d, &"{\"usage\":{\"input_tokens\":7,\"output_tokens\":3,\"cache_read_input_tokens\":2}}"[0: 74]);
+    try assert_eq_bool(billing_usage_parse(&d, json_root(&d), &u), true);
+    try assert_eq_i64(u.input_tokens, 7);
+    try assert_eq_i64(u.output_tokens, 3);
+    try assert_eq_i64(u.cache_read_tokens, 2);
+
+    // 没有 usage
+    try json_parse(&d, &"{\"id\":\"x\"}"[0: 10]);
+    try assert_eq_bool(billing_usage_parse(&d, json_root(&d), &u), false);
+}
+
+fn test_settle() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    try setup_prices(&d);
+    prep(DIR, T0);
+    var usage: PriceUsage = PriceUsage{ input_tokens: 100000, output_tokens: 50000, cache_read_tokens: 10000 };
+    var r: BillingResult = BillingResult{ cost_nano: 0, price_nano: 0, rate_version: 0, duplicate: false, found: false };
+    try billing_settle(&d, DIR, &"req-1"[0: 5], 7, T0, 0, &"gpt-4o"[0: 6], &"mock"[0: 4], &usage, &r);
+    try assert_eq_bool(r.found, true);
+    try assert_eq_bool(r.duplicate, false);
+    try assert_eq_i64(r.cost_nano, 173);
+    try assert_eq_i64(r.price_nano, 305);
+    try assert_eq_i64(r.rate_version, 1);
+
+    var st: DbStmt = dbx_prepare(&d,
+        "select user_id, input_tokens, output_tokens, cache_read_tokens, cost_nano, price_nano, rate_version from usage_ledger where request_id = ?" as &const byte) catch {
+        return error.TestFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, &"req-1"[0: 5]) catch {
+        return error.TestFailed;
+    };
+    try assert_eq_i32(dbx_step(&st), 1);
+    try assert_eq_i64(dbx_col_i64(&st, 0), 7);
+    try assert_eq_i64(dbx_col_i64(&st, 1), 100000);
+    try assert_eq_i64(dbx_col_i64(&st, 2), 50000);
+    try assert_eq_i64(dbx_col_i64(&st, 3), 10000);
+    try assert_eq_i64(dbx_col_i64(&st, 4), 173);
+    try assert_eq_i64(dbx_col_i64(&st, 5), 305);
+    try assert_eq_i64(dbx_col_i64(&st, 6), 1);
+
+    // 同一 request_id 重试：账本仍只有一行
+    try billing_settle(&d, DIR, &"req-1"[0: 5], 7, T0, 0, &"gpt-4o"[0: 6], &"mock"[0: 4], &usage, &r);
+    try assert_eq_bool(r.duplicate, true);
+    try assert_eq_i64(ledger_count(&d), 1);
+
+    // 没配价的模型：报错
+    var missing: bool = false;
+    _ = billing_settle(&d, DIR, &"req-2"[0: 5], 7, T0, 0, &"nope"[0: 4], &"mock"[0: 4], &usage, &r) catch |_| {
+        missing = true;
+    };
+    try assert_eq_bool(missing, true);
+}
+
+fn test_replay() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    try setup_prices(&d);
+    prep(DIR2, T0);
+    var usage: PriceUsage = PriceUsage{ input_tokens: 100000, output_tokens: 50000, cache_read_tokens: 10000 };
+    var r: BillingResult = BillingResult{ cost_nano: 0, price_nano: 0, rate_version: 0, duplicate: false, found: false };
+    try billing_settle(&d, DIR2, &"req-9"[0: 5], 3, T0, 0, &"gpt-4o"[0: 6], &"mock"[0: 4], &usage, &r);
+    try billing_settle(&d, DIR2, &"req-9"[0: 5], 3, T0, 0, &"gpt-4o"[0: 6], &"mock"[0: 4], &usage, &r);
+
+    var d2: Db = Db{ h: null };
+    defer { dbx_close(&d2); }
+    try open_db(&d2);
+    var stats: JournalStats = JournalStats{ lines: 0, applied: 0, duplicate: 0, bad: 0 };
+    try journal_replay_days(&d2, DIR2, T0, 8, &stats);
+    try assert_eq_i32(stats.lines, 2);
+    try assert_eq_i32(stats.applied, 1);
+    try assert_eq_i32(stats.duplicate, 1);
+    try assert_eq_i32(stats.bad, 0);
+    try assert_eq_i64(ledger_count(&d2), 1);
+}
+
+test "usage_parse" { run_test("usage_parse", test_usage_parse); }
+test "settle" { run_test("settle", test_settle); }
+test "replay" { run_test("replay", test_replay); }
