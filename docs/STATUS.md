@@ -33,8 +33,8 @@
 - B3（已落地）：epoch/fencing/drain + 控制面（421）+ 批量迁移/清零 + stale 自动
   迁移；controller tick 每 3s 触发 rebalance。
 - B2 收尾：config 快照与 slug 归属校验。
-- B5（进行中）：幂等 ingest + 区间重算 + 本地 spool + Key 吊销接口已通；
-  journal 重放/spool 消费循环待做。
+- B5（进行中）：幂等 ingest（含 HTTP 入口）+ 区间重算 + 本地 spool + Key 吊销已通；
+  spool 自动消费循环待做。
 - B4（进行中）：edge 路由核心（slug 归属 + session 亲和 + 失败清缓存，11 断言）；
   HTTP/SSE 代理待做。
 
@@ -68,8 +68,8 @@
 - B3（已落地）：epoch/fencing/drain + 控制面（421）+ 批量迁移/清零 + stale 自动
   迁移；controller tick 每 3s 触发 rebalance。
 - B2 收尾：config 快照与 slug 归属校验。
-- B5（进行中）：幂等 ingest + 区间重算 + 本地 spool + Key 吊销接口已通；
-  journal 重放/spool 消费循环待做。
+- B5（进行中）：幂等 ingest（含 HTTP 入口）+ 区间重算 + 本地 spool + Key 吊销已通；
+  spool 自动消费循环待做。
 - B4（进行中）：edge 路由核心（slug 归属 + session 亲和 + 失败清缓存，11 断言）；
   HTTP/SSE 代理待做。
 

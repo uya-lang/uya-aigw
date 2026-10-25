@@ -92,7 +92,7 @@ AIGW_MODE=seed AIGW_DB="$SEED_DB" AIGW_UPSTREAM_PORT="$MPORT" ./build/seed >/dev
 
 UYA_ROOT="$UYA_ROOT" "$UYA" build \
   src/foundation/buf.uya src/net/httpsrv.uya src/net/tcpx.uya src/net/serve.uya \
-  src/core/money.uya src/core/reqlog.uya src/core/dbx.uya src/cluster/meta.uya src/cluster/elect.uya src/cluster/uplink.uya src/net/rsav.uya \
+  src/core/money.uya src/core/reqlog.uya src/core/dbx.uya src/cluster/meta.uya src/cluster/elect.uya src/cluster/uplink.uya src/cluster/ingest.uya src/net/rsav.uya \
   src/core/schema.uya src/core/store.uya src/core/backup.uya src/core/journal.uya \
   src/core/runtime.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/rollup.uya \
   src/core/billing.uya src/core/lb.uya src/core/responses.uya src/core/chat.uya src/providers/upstream.uya \
@@ -258,10 +258,17 @@ kill "$NB_PID" 2>/dev/null || true
 wait "$NB_PID" 2>/dev/null || true
 NB_PID=""
 
+# 4h) B5：controller 幂等 ingest（重复批 duplicate=2）
+ING='{"rows":[{"request_id":"ing1","user_id":1,"ts":1700000000,"model":"mock-model","provider":"mock","input_tokens":10,"output_tokens":5,"cache_read_tokens":0,"cost_nano":2,"price_nano":3,"period":"","rate_version":1},{"request_id":"ing2","user_id":1,"ts":1700000060,"model":"mock-model","provider":"mock","input_tokens":20,"output_tokens":10,"cache_read_tokens":0,"cost_nano":4,"price_nano":6,"period":"","rate_version":1}]}'
+I1=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer test-admin' --data "$ING" "$BASE/controller/ingest")
+echo "$I1" | grep -q '"applied":2' || { echo "$I1" >&2; fail "ingest applied"; }
+I2=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer test-admin' --data "$ING" "$BASE/controller/ingest")
+echo "$I2" | grep -q '"duplicate":2' || { echo "$I2" >&2; fail "ingest duplicate"; }
+
 # 5) 停机后查账本
 kill "$SRV_PID" 2>/dev/null || true
 wait "$SRV_PID" 2>/dev/null || true
 SRV_PID=""
 COUNT=$(AIGW_MODE=count AIGW_DB="$SEED_DB" ./build/seed | sed -n 's/^COUNT=//p')
-[ "$COUNT" = "5" ] || fail "usage_ledger count=$COUNT"
+[ "$COUNT" = "7" ] || fail "usage_ledger count=$COUNT"
 echo "CHAT-ALL-OK status=$CODE count=$COUNT"

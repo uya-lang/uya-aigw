@@ -76,3 +76,4 @@
 | B5 (recompute) | 2026-10-25 | `git log --grep='B5 (recompute)'` | `ingest_recompute(from_day,to_day)` 复用 `rollup_rebuild_range` 从账本重建 usage_daily；`tests/test_ingest.uya` 增加重算幂等断言（sum requests=2，两次一致） |
 | B5 (spool) | 2026-10-25 | `git log --grep='B5 (spool)'` | `src/cluster/spool.uya`：`spool_append`（O_CREAT|O_APPEND，一行一个 batch）、`spool_read`（不存在返回 false）、`spool_clear`；`tests/test_spool.uya` 1 组断言（追加两行读回 16 字节、清空后不可读） |
 | B5 (revoke) | 2026-10-25 | `git log --grep='B5 (revoke)'` | `store_list_keys`（自己的 Key 列表，含 revoked_at）、`store_revoke_key_owned`（越权/不存在返回 false）；serve 新增 `GET /v1/keys` 与 `POST /v1/keys/revoke`（越权 → 404）；`tests/test_keys.uya` 2 组 13 断言（列表、撤销后 verify 失败、重复撤销 false、跨用户越权拒绝）+ chat e2e（列表→撤销→旧 Key 401、在用 Key 仍 200） |
+| B5 (ingest-http) | 2026-10-25 | `git log --grep='B5 (ingest-http)'` | `POST /controller/ingest`（admin Bearer）：调用 `ingest_apply` 幂等落账并返回 `applied/duplicate/bad`；chat e2e 断言首批 applied=2、重复批 duplicate=2，账本 7 行 |

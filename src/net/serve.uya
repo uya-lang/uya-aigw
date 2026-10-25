@@ -81,6 +81,7 @@ const ROUTE_ADMIN_BACKUP: i32 = 13;
 const ROUTE_RESPONSES: i32 = 14;
 const ROUTE_MCP: i32 = 15;
 const ROUTE_KEY_REVOKE: i32 = 24;
+const ROUTE_CTL_INGEST: i32 = 25;
 const ROUTE_CTL_EPOCH: i32 = 21;
 const ROUTE_CTL_ASSIGN: i32 = 22;
 const ROUTE_CTL_DRAIN: i32 = 23;
@@ -585,6 +586,9 @@ fn srv_route_of(req: &HsrvReq) i32 {
     }
     if srv_path_is(req, &"/v1/me"[0: 6]) {
         return ROUTE_ME;
+    }
+    if srv_path_is(req, &"/controller/ingest"[0: 18]) {
+        return ROUTE_CTL_INGEST;
     }
     if srv_path_is(req, &"/controller/epoch"[0: 17]) {
         return ROUTE_CTL_EPOCH;
@@ -1146,6 +1150,10 @@ fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
     }
     if c.route == ROUTE_ME {
         srv_me(c, stats);
+        return;
+    }
+    if c.route == ROUTE_CTL_INGEST {
+        srv_ctl_ingest(c, stats);
         return;
     }
     if c.route == ROUTE_CTL_EPOCH {
@@ -3295,6 +3303,42 @@ fn srv_ctl_drain(c: &SrvConn, stats: &ServeStats) void {
     jsonw_obj(&w);
     jsonw_key(&w, &"ok"[0: 2]);
     jsonw_bool(&w, true);
+    jsonw_end_obj(&w);
+    srv_static(c, 200, jsonw_span(&w), keep);
+}
+
+
+// B5：controller 幂等 ingest 入口（node 断网恢复后重放 journal/spool 用）。
+fn srv_ctl_ingest(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    if !runtime_ready() {
+        srv_static(c, 503, SRV_JSON_503, keep);
+        return;
+    }
+    if !srv_admin_ok(c) {
+        srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    }
+    if c.body_overflow {
+        srv_static(c, 413, SRV_JSON_413, keep);
+        return;
+    }
+    const now: i64 = store_now();
+    var st: IngestStats = IngestStats{ applied: 0, duplicate: 0, bad: 0 };
+    st = ingest_apply(runtime_db(), c.body[0: c.body_len], now) catch {
+        srv_static(c, 400, SRV_JSON_400, keep);
+        return;
+    };
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"applied"[0: 7]);
+    jsonw_i64(&w, st.applied);
+    jsonw_key(&w, &"duplicate"[0: 9]);
+    jsonw_i64(&w, st.duplicate);
+    jsonw_key(&w, &"bad"[0: 3]);
+    jsonw_i64(&w, st.bad);
     jsonw_end_obj(&w);
     srv_static(c, 200, jsonw_span(&w), keep);
 }
