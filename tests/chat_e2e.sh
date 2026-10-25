@@ -93,7 +93,7 @@ UYA_ROOT="$UYA_ROOT" "$UYA" build \
   src/foundation/buf.uya src/net/httpsrv.uya src/net/tcpx.uya src/net/serve.uya \
   src/core/money.uya src/core/reqlog.uya src/core/dbx.uya src/net/rsav.uya \
   src/core/schema.uya src/core/store.uya src/core/backup.uya src/core/journal.uya \
-  src/core/runtime.uya src/core/schedule.uya src/core/price.uya src/core/json.uya \
+  src/core/runtime.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/rollup.uya \
   src/core/billing.uya src/core/chat.uya src/providers/upstream.uya \
   src/providers/upstream_cfg.uya \
   src/net/x509min.uya src/net/chainx.uya src/net/urlx.uya src/net/dnsx.uya \
@@ -133,6 +133,12 @@ SCODE=$(curl -s -N --max-time 15 -o "$TMP/stream.txt" -w '%{http_code}' -X POST 
 [ "$SCODE" = "200" ] || { cat "$TMP/stream.txt" >&2; fail "stream status=$SCODE"; }
 grep -q 'data: {"i":0}' "$TMP/stream.txt" || fail "stream event missing"
 grep -q 'data: \[DONE\]' "$TMP/stream.txt" || fail "stream DONE missing"
+
+# 4c) 用量汇总（A6：billing 实时 upsert usage_daily）
+UJSON=$(curl -s --max-time 10 -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:$PORT/v1/usage?from_day=0&to_day=999999")
+echo "$UJSON" | grep -q '"mock-model"' || { echo "$UJSON" >&2; fail "usage model missing"; }
+echo "$UJSON" | grep -q '"requests":2' || { echo "$UJSON" >&2; fail "usage totals"; }
 
 # 5) 停机后查账本
 kill "$SRV_PID" 2>/dev/null || true

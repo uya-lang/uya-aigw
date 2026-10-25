@@ -69,6 +69,7 @@ const ROUTE_HEALTH: i32 = 1;
 const ROUTE_MODELS: i32 = 2;
 const ROUTE_SSE: i32 = 3;
 const ROUTE_CHAT: i32 = 4;
+const ROUTE_USAGE: i32 = 5;
 
 /// chat 请求体上限（与 CHAT_PAYLOAD_MAX 一致；超了回 413）。
 const SRV_BODY_CAP: usize = 32768;
@@ -120,6 +121,8 @@ struct SrvConn {
     // chat：Authorization 头 + 请求体（仅 ROUTE_CHAT 采集，其他路由只排空）
     auth: [byte: 256],
     auth_len: usize,
+    path: [byte: 1024],
+    path_len: usize,
     body: [byte: SRV_BODY_CAP],
     body_len: usize,
     body_overflow: bool,
@@ -454,6 +457,9 @@ fn srv_route_of(req: &HsrvReq) i32 {
     if srv_path_is(req, &"/v1/chat/completions"[0: 20]) {
         return ROUTE_CHAT;
     }
+    if srv_path_is(req, &"/v1/usage"[0: 9]) {
+        return ROUTE_USAGE;
+    }
     return ROUTE_404;
 }
 
@@ -619,6 +625,160 @@ fn srv_chat_stream(c: &SrvConn, plan: &ChatPlan, cfg: &const HttppConfig, nowu: 
     srv_chat_close(c);
 }
 
+/// 从 query 里取一个整数值（`?a=1&b=2`）；没有返回 -1。
+fn srv_query_day(path: &const byte, n: usize, key: &const byte, kn: usize) i64 {
+    var i: usize = 0;
+    while i < n && path[i] != (63 as byte) {
+        i = i + 1;
+    }
+    if i >= n {
+        return 0 - 1;
+    }
+    var j: usize = i + 1;
+    while j + kn + 1 <= n {
+        var same: bool = true;
+        var k: usize = 0;
+        while k < kn {
+            if path[j + k] != key[k] {
+                same = false;
+                break;
+            }
+            k = k + 1;
+        }
+        if same && path[j + kn] == (61 as byte) {
+            var v: i64 = 0;
+            var digits: usize = 0;
+            var m: usize = j + kn + 1;
+            while m < n {
+                const c: byte = path[m];
+                if c < ('0' as byte) || c > ('9' as byte) {
+                    break;
+                }
+                v = v *% (10 as i64) +% ((c as i64) -% 48);
+                digits = digits + 1;
+                m = m + 1;
+            }
+            if digits > 0 {
+                return v;
+            }
+            return 0 - 1;
+        }
+        j = j + 1;
+    }
+    return 0 - 1;
+}
+
+/// A6：/v1/usage 读 usage_daily 汇总（按天，用户级）。
+fn srv_usage(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    if !runtime_ready() {
+        srv_static(c, 503, SRV_JSON_503, keep);
+        return;
+    }
+    var tok: [byte: 256] = [0: 256];
+    const tn: usize = chat_bearer_span(&c.auth[0], c.auth_len, &tok[0], 256);
+    if tn == 0 {
+        srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    }
+    var key: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
+    store_verify_key(runtime_db(), tok[0: tn], &key) catch {
+        srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    };
+    const today: i64 = store_now() / (86400 as i64);
+    var from_day: i64 = srv_query_day(&c.path[0], c.path_len, &"from_day"[0: 8], 8);
+    if from_day < 0 {
+        from_day = today -% 6;
+    }
+    var to_day: i64 = srv_query_day(&c.path[0], c.path_len, &"to_day"[0: 6], 6);
+    if to_day < 0 {
+        to_day = today;
+    }
+    if from_day < 0 || to_day < from_day {
+        srv_static(c, 400, SRV_JSON_400, keep);
+        return;
+    }
+    var rows: [RollupRow: 64] = [];
+    var n: usize = 0;
+    n = rollup_query(runtime_db(), key.user_id, from_day, to_day, &rows[0], 64) catch {
+        srv_static(c, 502, SRV_JSON_502, keep);
+        return;
+    };
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"object"[0: 6]);
+    jsonw_str(&w, &"list"[0: 4]);
+    jsonw_key(&w, &"from_day"[0: 8]);
+    jsonw_i64(&w, from_day);
+    jsonw_key(&w, &"to_day"[0: 6]);
+    jsonw_i64(&w, to_day);
+    jsonw_key(&w, &"data"[0: 4]);
+    jsonw_arr(&w);
+    var t_req: i64 = 0;
+    var t_in: i64 = 0;
+    var t_out: i64 = 0;
+    var t_cache: i64 = 0;
+    var t_cost: i64 = 0;
+    var t_price: i64 = 0;
+    var i: usize = 0;
+    while i < n {
+        jsonw_obj(&w);
+        jsonw_key(&w, &"day"[0: 3]);
+        jsonw_i64(&w, rows[i].day);
+        jsonw_key(&w, &"model"[0: 5]);
+        jsonw_str(&w, rows[i].model[0: rows[i].model_len]);
+        jsonw_key(&w, &"provider"[0: 8]);
+        jsonw_str(&w, rows[i].provider[0: rows[i].provider_len]);
+        jsonw_key(&w, &"period"[0: 6]);
+        jsonw_str(&w, rows[i].period[0: rows[i].period_len]);
+        jsonw_key(&w, &"requests"[0: 8]);
+        jsonw_i64(&w, rows[i].requests);
+        jsonw_key(&w, &"input_tokens"[0: 12]);
+        jsonw_i64(&w, rows[i].input_tokens);
+        jsonw_key(&w, &"output_tokens"[0: 13]);
+        jsonw_i64(&w, rows[i].output_tokens);
+        jsonw_key(&w, &"cache_read_tokens"[0: 17]);
+        jsonw_i64(&w, rows[i].cache_read_tokens);
+        jsonw_key(&w, &"cost_nano"[0: 9]);
+        jsonw_i64(&w, rows[i].cost_nano);
+        jsonw_key(&w, &"price_nano"[0: 10]);
+        jsonw_i64(&w, rows[i].price_nano);
+        jsonw_end_obj(&w);
+        t_req = t_req +% rows[i].requests;
+        t_in = t_in +% rows[i].input_tokens;
+        t_out = t_out +% rows[i].output_tokens;
+        t_cache = t_cache +% rows[i].cache_read_tokens;
+        t_cost = t_cost +% rows[i].cost_nano;
+        t_price = t_price +% rows[i].price_nano;
+        i = i + 1;
+    }
+    jsonw_end_arr(&w);
+    jsonw_key(&w, &"totals"[0: 6]);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"requests"[0: 8]);
+    jsonw_i64(&w, t_req);
+    jsonw_key(&w, &"input_tokens"[0: 12]);
+    jsonw_i64(&w, t_in);
+    jsonw_key(&w, &"output_tokens"[0: 13]);
+    jsonw_i64(&w, t_out);
+    jsonw_key(&w, &"cache_read_tokens"[0: 17]);
+    jsonw_i64(&w, t_cache);
+    jsonw_key(&w, &"cost_nano"[0: 9]);
+    jsonw_i64(&w, t_cost);
+    jsonw_key(&w, &"price_nano"[0: 10]);
+    jsonw_i64(&w, t_price);
+    jsonw_end_obj(&w);
+    jsonw_end_obj(&w);
+    if !jsonw_ok(&w) {
+        srv_static(c, 502, SRV_JSON_502, keep);
+        return;
+    }
+    srv_static(c, 200, jsonw_span(&w), keep);
+}
+
 /// chat：鉴权 → 解析/路由 → 非流式结算 / 流式透传。
 fn srv_chat(c: &SrvConn, stats: &ServeStats) void {
     const keep: bool = c.keep;
@@ -724,6 +884,10 @@ fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
     }
     if c.route == ROUTE_CHAT {
         srv_chat(c, stats);
+        return;
+    }
+    if c.route == ROUTE_USAGE {
+        srv_usage(c, stats);
         return;
     }
     stats.requests = stats.requests +% 1;
@@ -891,6 +1055,13 @@ fn srv_drive(c: &SrvConn, stats: &ServeStats) void {
                 ai = ai + 1;
             }
             c.auth_len = ai;
+            c.path_len = 0;
+            var pi: usize = 0;
+            while pi < req.path_len && pi < 1024 {
+                c.path[pi] = req.path[pi];
+                pi = pi + 1;
+            }
+            c.path_len = pi;
             c.body_len = 0;
             c.body_overflow = false;
             c.in_pos = req.head_len;

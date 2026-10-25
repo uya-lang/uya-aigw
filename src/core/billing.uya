@@ -147,5 +147,25 @@ export fn billing_settle(d: &Db, dir: &[byte], request_id: &[byte], user_id: i64
         return error.BillingFailed;
     }
     out.duplicate = dbx_changes(d) != 1;
+    // 实时汇总（A6）：查询不扫明细；重复请求不重复计数，重建 rollup 可对账。
+    if !out.duplicate && ts >= 0 {
+        const day: i64 = ts / (86400 as i64);
+        var ud: DbStmt = dbx_prepare(d,
+            "insert into usage_daily(day, user_id, model, provider, period, requests, input_tokens, output_tokens, cache_read_tokens, cost_nano, price_nano) values(?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?) on conflict(day, user_id, model, provider, period) do update set requests = requests + 1, input_tokens = input_tokens + excluded.input_tokens, output_tokens = output_tokens + excluded.output_tokens, cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens, cost_nano = cost_nano + excluded.cost_nano, price_nano = price_nano + excluded.price_nano" as &const byte) catch {
+            return;
+        };
+        defer { dbx_finalize(&ud); }
+        dbx_bind_i64(&ud, 1, day) catch { return; };
+        dbx_bind_i64(&ud, 2, user_id) catch { return; };
+        dbx_bind_text(&ud, 3, model) catch { return; };
+        dbx_bind_text(&ud, 4, provider) catch { return; };
+        dbx_bind_text(&ud, 5, empty[0: 0]) catch { return; };
+        dbx_bind_i64(&ud, 6, usage.input_tokens) catch { return; };
+        dbx_bind_i64(&ud, 7, usage.output_tokens) catch { return; };
+        dbx_bind_i64(&ud, 8, usage.cache_read_tokens) catch { return; };
+        dbx_bind_i64(&ud, 9, out.cost_nano) catch { return; };
+        dbx_bind_i64(&ud, 10, out.price_nano) catch { return; };
+        _ = dbx_step(&ud);
+    }
     return;
 }

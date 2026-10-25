@@ -98,6 +98,14 @@ fn test_settle() !void {
     try assert_eq_i64(dbx_col_i64(&st, 5), 305);
     try assert_eq_i64(dbx_col_i64(&st, 6), 1);
 
+    // 实时汇总也有一行（A6）
+    var ud: i64 = 0;
+    try assert_eq_i32(dbx_scalar_i64(&d, &"select count(*) from usage_daily"[0: 32], &ud), 0);
+    try assert_eq_i64(ud, 1);
+    var uq: i64 = 0;
+    try assert_eq_i32(dbx_scalar_i64(&d, &"select requests from usage_daily"[0: 32], &uq), 0);
+    try assert_eq_i64(uq, 1);
+
     // 同一 request_id 重试：账本仍只有一行
     try billing_settle(&d, DIR, &"req-1"[0: 5], 7, T0, 0, &"gpt-4o"[0: 6], &"mock"[0: 4], &usage, &r);
     try assert_eq_bool(r.duplicate, true);

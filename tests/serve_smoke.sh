@@ -40,7 +40,7 @@ build_aigw() {
     src/foundation/buf.uya src/net/httpsrv.uya src/net/tcpx.uya src/net/serve.uya \
     src/core/money.uya src/core/reqlog.uya src/core/dbx.uya src/net/rsav.uya \
     src/core/schema.uya src/core/store.uya src/core/backup.uya src/core/journal.uya \
-    src/core/runtime.uya src/core/schedule.uya src/core/price.uya src/core/json.uya \
+    src/core/runtime.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/rollup.uya \
   src/core/billing.uya src/core/chat.uya src/providers/upstream.uya \
   src/providers/upstream_cfg.uya \
     src/net/x509min.uya src/net/chainx.uya src/net/urlx.uya src/net/dnsx.uya \
