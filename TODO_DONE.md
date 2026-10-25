@@ -74,3 +74,4 @@
 | B5 (ingest) | 2026-10-25 | `git log --grep='B5 (ingest)'` | `src/cluster/ingest.uya`：解析 `{"rows":[...]}`，按 request_id `insert or ignore` 幂等落 usage_ledger，应用成功的行同步 upsert usage_daily；统计 applied/duplicate/bad；`tests/test_ingest.uya` 2 组 11 断言（重复批 applied=0/duplicate=2、缺失 request_id 计 bad） |
 | B4 (route) | 2026-10-25 | `git log --grep='B4 (route)'` | `src/cluster/edge.uya`：`edge_route`（slug→meta assignment，session 非空时优先 256 槽 FNV 亲和缓存）、`edge_fail`（失败清缓存，下一跳按最新归属重解析）、`edge_reset`；`tests/test_edge.uya` 2 组 11 断言（亲和优先、归属迁移后仍回旧节点、失败后回新归属、未知 slug） |
 | B5 (recompute) | 2026-10-25 | `git log --grep='B5 (recompute)'` | `ingest_recompute(from_day,to_day)` 复用 `rollup_rebuild_range` 从账本重建 usage_daily；`tests/test_ingest.uya` 增加重算幂等断言（sum requests=2，两次一致） |
+| B5 (spool) | 2026-10-25 | `git log --grep='B5 (spool)'` | `src/cluster/spool.uya`：`spool_append`（O_CREAT|O_APPEND，一行一个 batch）、`spool_read`（不存在返回 false）、`spool_clear`；`tests/test_spool.uya` 1 组断言（追加两行读回 16 字节、清空后不可读） |

@@ -1,0 +1,92 @@
+// src/cluster/spool.uya — B5 本地 spool（断网时先落盘，恢复后再 ingest）
+//
+// 文件按“一行一个 batch JSON”追加；读取由调用方按行切分。路径由调用方给出。
+
+use libc.syscall;
+
+export error SpoolFailed;
+
+fn sp_make(path: &[byte], out: &byte, cap: usize) usize {
+    if path.len + 1 > cap {
+        return 0;
+    }
+    var i: usize = 0;
+    while i < path.len {
+        out[i] = path[i];
+        i = i + 1;
+    }
+    out[i] = 0 as byte;
+    return i + 1;
+}
+
+fn sp_write_all(fd: i32, data: &[byte]) bool {
+    var off: usize = 0;
+    while off < data.len {
+        const r: !isize = sys_write(fd, &data.ptr[off], data.len - off);
+        const n: isize = r catch |_| {
+            return false;
+        };
+        if n <= 0 {
+            return false;
+        }
+        off = off +% (n as usize);
+    }
+    return true;
+}
+
+/// 追加一行（body + '\n'）。
+export fn spool_append(path: &[byte], body: &[byte]) !void {
+    var p: [byte: 512] = [0: 512];
+    const pn: usize = sp_make(path, &p[0], 512);
+    if pn == 0 {
+        return error.SpoolFailed;
+    }
+    const fd: i32 = sys_open(&p[0] as *const byte, 1089 as i32, 384 as i32) catch {
+        return error.SpoolFailed;
+    };
+    defer { _ = sys_close(fd) catch {}; }
+    if !sp_write_all(fd, body) {
+        return error.SpoolFailed;
+    }
+    var nlb: [byte: 1] = [10];
+    if !sp_write_all(fd, nlb[0: 1]) {
+        return error.SpoolFailed;
+    }
+    return;
+}
+
+/// 读整个 spool；不存在返回 false（不算错误），内容写 out。
+export fn spool_read(path: &[byte], out: &byte, cap: usize, out_len: &usize) !bool {
+    out_len[0] = 0;
+    var p: [byte: 512] = [0: 512];
+    const pn: usize = sp_make(path, &p[0], 512);
+    if pn == 0 {
+        return false;
+    }
+    const fd: i32 = sys_open(&p[0] as *const byte, 0 as i32, 0) catch {
+        return false;
+    };
+    defer { _ = sys_close(fd) catch {}; }
+    var rn: usize = 0;
+    while rn < cap {
+        const r: !isize = sys_read(fd, &out[rn], cap - rn);
+        const n: isize = r catch |_| {
+            break;
+        };
+        if n <= 0 {
+            break;
+        }
+        rn = rn +% (n as usize);
+    }
+    out_len[0] = rn;
+    return true;
+}
+
+/// 清空 spool（成功或文件不存在都视为完成）。
+export fn spool_clear(path: &[byte]) void {
+    var p: [byte: 512] = [0: 512];
+    if sp_make(path, &p[0], 512) == 0 {
+        return;
+    }
+    _ = sys_unlink(&p[0] as *const byte) catch {};
+}
