@@ -114,3 +114,8 @@ export fn ingest_apply(d: &Db, body: &[byte], now: i64) !IngestStats {
     _ = now;
     return out;
 }
+
+/// 从账本重算某区间的 usage_daily（金额/时段按已落账数据重建，幂等）。
+export fn ingest_recompute(d: &Db, from_day: i64, to_day: i64) !void {
+    return rollup_rebuild_range(d, from_day, to_day);
+}

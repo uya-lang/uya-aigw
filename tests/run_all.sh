@@ -35,7 +35,7 @@ run src/core/dbx.uya src/cluster/meta.uya tests/test_meta.uya
 run src/core/dbx.uya src/cluster/meta.uya tests/test_epoch.uya
 run src/core/dbx.uya src/cluster/meta.uya tests/test_rebalance.uya
 run src/core/dbx.uya src/cluster/meta.uya tests/test_rebalance_auto.uya
-run src/core/dbx.uya src/core/schema.uya src/core/json.uya src/cluster/ingest.uya tests/test_ingest.uya
+run src/core/dbx.uya src/core/schema.uya src/core/json.uya src/core/rollup.uya src/cluster/ingest.uya tests/test_ingest.uya
 run src/core/dbx.uya src/cluster/meta.uya src/cluster/edge.uya tests/test_edge.uya
 run src/core/dbx.uya src/cluster/meta.uya src/cluster/elect.uya tests/test_elect.uya
 run src/core/dbx.uya src/core/schema.uya src/core/backup.uya tests/test_backup.uya

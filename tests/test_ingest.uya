@@ -93,5 +93,24 @@ fn test_bad() !void {
     try assert_eq_i64(s.applied, 0);
 }
 
+fn test_recompute() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    var w: JsonW = JsonW{};
+    build(&w, true);
+    _ = try ingest_apply(&d, jsonw_span(&w), T0);
+    const day: i64 = T0 / (86400 as i64);
+    try ingest_recompute(&d, day, day);
+    var rq: i64 = 0;
+    try assert_eq_i32(dbx_scalar_i64(&d, &"select sum(requests) from usage_daily"[0: 37], &rq), 0);
+    try assert_eq_i64(rq, 2);
+    // 再重算一次幂等
+    try ingest_recompute(&d, day, day);
+    try assert_eq_i32(dbx_scalar_i64(&d, &"select sum(requests) from usage_daily"[0: 37], &rq), 0);
+    try assert_eq_i64(rq, 2);
+}
+
 test "apply" { run_test("apply", test_apply); }
+test "recompute" { run_test("recompute", test_recompute); }
 test "bad" { run_test("bad", test_bad); }
