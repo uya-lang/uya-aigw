@@ -1,4 +1,4 @@
-# 项目状态快照（2026-10-24）
+# 项目状态快照（2026-10-25）
 
 ## 已完成（TLS 栈）
 
@@ -23,6 +23,9 @@
   amalgamation（离线不可得），见 TODO A0。
 - A4（日志部分）：`src/core/reqlog.uya`，一行 `k=v` 的每请求日志（含 cost/tok-s），
   `tests/test_reqlog.uya` 全过。
+- A4（快路径/批量落库）：`chat_scan` 顶层扫描（不建 DOM）+ `src/core/batch.uya`
+  （512 行/200ms 事务、journal 批追加、查询前 flush）；`tests/test_batch.uya` 与
+  `tests/test_chat.uya` fast_path 组覆盖。
 - A3（已落地）：`src/plugins/pool.uya` 插件池（stdio JSONL 子进程）：预热 min、复用、
   扩容到 max、空闲缩容到 min、崩溃指数退避、cancel、ping/pong；非阻塞 fd + poll 超时
   与按行分帧。`tests/test_pool.uya` 24 断言（`tests/plugin_echo.py` 作最小插件）。
@@ -159,7 +162,7 @@
 
 - spike 只验证 TLS 1.2（`s_server -tls1_2`）；TLS 1.3 待补测
 - 不做 HTTP/2/3、gzip、入站 TLS（建议 nginx/caddy）
-- 请求路径（chat → usage → 计费/journal）与集群/后台尚未实现（设计与 TODO 已就绪）
+- 上游请求仍走 `block_on`（忙轮询），事件循环内的异步化（A4 p99）待做
 
 ## 性能基线（本机实测）
 
@@ -169,4 +172,4 @@
 | 集群端到端 | `make cluster-e2e` | 1 controller + 3 node 注册/快照/路由/代理/drain/ingest/spool 全绿 |
 | 请求路径回归 | `make ui-e2e` | OTP→登录→建 Key→chat/responses（含 tools 透传与失败转移）→后台接口全绿 |
 
-> 说明：A4 的「批量落库 / 快路径 / p99 压测」尚未实现，上面只是当前实现的并发基线。
+> 说明：A4 的快路径与批量落库已落地；上游异步化与 p99 压测仍未做，上面只是当前实现的并发基线。

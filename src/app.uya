@@ -42,6 +42,12 @@ fn serve_main(host: &[byte], port: u16, db_path: &[byte], data_dir: &[byte],
         return 1;
     };
     defer { runtime_shutdown(); }
+    // A4：结算先入队，事件循环按 200ms/512 行批量落库
+    {
+        var bdir: [byte: 256] = [0: 256];
+        const bn: usize = runtime_dir_copy(&bdir[0], 256);
+        batch_configure(runtime_db(), bdir[0: bn], srv_now_ms());
+    }
     g_dev_otp = dev_otp;
     srv_admin_set(admin_key);
     srv_meta_setup(meta_path, node_id);
@@ -62,6 +68,10 @@ fn serve_main(host: &[byte], port: u16, db_path: &[byte], data_dir: &[byte],
     // serve_run 自己负责关闭 lfd（停机时先摘监听再关）
     const r: i32 = serve_run(lfd, &stats) catch |_| {
         1;
+    };
+    // 停机前把队列里剩下的账落下去；失败交给下次启动的 journal 重放兜底。
+    _ = batch_flush() catch {
+        0 as usize;
     };
     return r;
 }

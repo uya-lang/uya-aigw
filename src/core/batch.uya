@@ -1,0 +1,293 @@
+// src/core/batch.uya — A4 批量落库：请求路径只入队，事件循环按批提交
+//
+// 设计（overview §9「热路径不碰库；批量写 500 行/事务或 200ms」）：
+//   * `billing_settle_deferred` 只做查价（单表点查）并入队，不写 SQLite；
+//   * `batch_tick` 由事件循环每轮调用，达到时间（200ms）/条数（512）阈值时，在一个
+//     事务里把队列写进 `usage_ledger` + `usage_daily`；journal 按批追加、只 fsync 一次；
+//   * 查询接口（usage/requests/budget/CSV/admin billing）读之前先 `batch_flush()`，
+//     保证「刚请求完能查到」的语义不变；
+//   * 停机时 `batch_flush()`；失败保留队列，journal 重放兜底。
+//
+// 队列是固定容量（`BATCH_CAP`），满了先同步 flush 一次；单线程，无锁。
+
+export const BATCH_CAP: usize = 512;
+export const BATCH_DIR_MAX: usize = 256;
+export const BATCH_RID_MAX: usize = 64;
+export const BATCH_MODEL_MAX: usize = 96;
+export const BATCH_PROVIDER_MAX: usize = 64;
+export const BATCH_PERIOD_MAX: usize = 32;
+export const BATCH_JOURNAL_BUF: usize = 65536;
+/// 批量写的时间阈值（毫秒）。
+export const BATCH_FLUSH_MS: u64 = 200;
+
+export error BatchFailed;
+export error BatchTooLarge;
+
+/// 一行待落账的用量（请求收尾时只填这里，不碰 DB）。
+struct BatchRow {
+    request_id: [byte: BATCH_RID_MAX],
+    request_id_len: usize,
+    user_id: i64,
+    ts: i64,
+    day: i64,
+    model: [byte: BATCH_MODEL_MAX],
+    model_len: usize,
+    provider: [byte: BATCH_PROVIDER_MAX],
+    provider_len: usize,
+    period: [byte: BATCH_PERIOD_MAX],
+    period_len: usize,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    cost_nano: i64,
+    price_nano: i64,
+    rate_version: i64,
+}
+
+var g_b_ready: bool = false;
+var g_b_db: Db = Db{ h: null };
+var g_b_dir: [byte: BATCH_DIR_MAX] = [0: BATCH_DIR_MAX];
+var g_b_dir_len: usize = 0;
+var g_b_len: usize = 0;
+var g_b_last_ms: u64 = 0;
+var g_b_applied: i64 = 0;
+var g_b_duplicate: i64 = 0;
+var g_b_flushes: i64 = 0;
+var g_b_rows: [BatchRow: BATCH_CAP] = [];
+
+fn batch_copy(dst: &byte, cap: usize, src: &[byte]) usize {
+    var i: usize = 0;
+    while i < src.len && i < cap {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+    return i;
+}
+
+fn batch_exec(d: &Db, sql: &const byte) bool {
+    const r: !void = dbx_exec_cstr(d, sql);
+    var ok: bool = true;
+    _ = r catch |_| {
+        ok = false;
+    };
+    return ok;
+}
+
+/// 清空队列与统计（测试 / 重配置用）。
+export fn batch_reset() void {
+    g_b_ready = false;
+    g_b_db = Db{ h: null };
+    g_b_dir_len = 0;
+    g_b_len = 0;
+    g_b_last_ms = 0;
+    g_b_applied = 0;
+    g_b_duplicate = 0;
+    g_b_flushes = 0;
+}
+
+/// 绑定库与数据目录（serve 启动时调用）。重复调用会先 flush 旧队列。
+export fn batch_configure(d: &Db, dir: &[byte], now_ms: u64) void {
+    if g_b_ready && g_b_len > 0 {
+        _ = batch_flush() catch {
+            0 as usize;
+        };
+    }
+    g_b_db.h = d.h;
+    g_b_dir_len = batch_copy(&g_b_dir[0], BATCH_DIR_MAX, dir);
+    g_b_ready = true;
+    g_b_len = 0;
+    g_b_last_ms = now_ms;
+    g_b_applied = 0;
+    g_b_duplicate = 0;
+    g_b_flushes = 0;
+}
+
+export fn batch_ready() bool {
+    return g_b_ready;
+}
+
+export fn batch_pending() usize {
+    return g_b_len;
+}
+
+export fn batch_applied() i64 {
+    return g_b_applied;
+}
+
+export fn batch_duplicate() i64 {
+    return g_b_duplicate;
+}
+
+export fn batch_flushes() i64 {
+    return g_b_flushes;
+}
+
+/// 入队一行。队列满时先同步 flush；失败返回 BatchFailed。
+export fn batch_enqueue(request_id: &[byte], user_id: i64, ts: i64, model: &[byte],
+    provider: &[byte], input_tokens: i64, output_tokens: i64, cache_read_tokens: i64,
+    cost_nano: i64, price_nano: i64, period: &[byte], rate_version: i64) !void {
+    if !g_b_ready || request_id.len == 0 || request_id.len > BATCH_RID_MAX
+        || model.len > BATCH_MODEL_MAX || provider.len > BATCH_PROVIDER_MAX
+        || period.len > BATCH_PERIOD_MAX {
+        return error.BatchTooLarge;
+    }
+    if g_b_len >= BATCH_CAP {
+        _ = batch_flush() catch {
+            return error.BatchFailed;
+        };
+    }
+    const idx: usize = g_b_len;
+    if idx >= BATCH_CAP {
+        return error.BatchFailed;
+    }
+    const r: &BatchRow = &g_b_rows[idx];
+    r.request_id_len = batch_copy(&r.request_id[0], BATCH_RID_MAX, request_id);
+    r.user_id = user_id;
+    r.ts = ts;
+    r.day = ts / (86400 as i64);
+    if ts < 0 {
+        r.day = 0;
+    }
+    r.model_len = batch_copy(&r.model[0], BATCH_MODEL_MAX, model);
+    r.provider_len = batch_copy(&r.provider[0], BATCH_PROVIDER_MAX, provider);
+    r.period_len = batch_copy(&r.period[0], BATCH_PERIOD_MAX, period);
+    r.input_tokens = input_tokens;
+    r.output_tokens = output_tokens;
+    r.cache_read_tokens = cache_read_tokens;
+    r.cost_nano = cost_nano;
+    r.price_nano = price_nano;
+    r.rate_version = rate_version;
+    g_b_len = g_b_len + 1;
+    return;
+}
+
+fn batch_journal_flush(day: i64, data: &[byte], jn: &usize) bool {
+    if jn[0] == 0 {
+        return true;
+    }
+    // Uya 0.11 不能直接对模块级数组做运行时切片：先拷到局部。
+    var dircopy: [byte: BATCH_DIR_MAX] = [0: BATCH_DIR_MAX];
+    var dn: usize = 0;
+    while dn < g_b_dir_len && dn < BATCH_DIR_MAX {
+        dircopy[dn] = g_b_dir[dn];
+        dn = dn + 1;
+    }
+    var path: [byte: 512] = [0: 512];
+    const pn: usize = journal_path(dircopy[0: dn], day *% (86400 as i64), &path[0], 512);
+    if pn == 0 {
+        return false;
+    }
+    journal_append_bytes(path[0: pn], data) catch {
+        return false;
+    };
+    jn[0] = 0;
+    return true;
+}
+
+/// 把队列一次性提交：DB 一个事务 + journal 一批一次 fsync。返回 applied 行数。
+export fn batch_flush() !usize {
+    if !g_b_ready || g_b_len == 0 {
+        return 0 as usize;
+    }
+    if !batch_exec(&g_b_db, "begin immediate" as &const byte) {
+        return error.BatchFailed;
+    }
+    var applied: usize = 0;
+    var jn: usize = 0;
+    var jbuf: [byte: BATCH_JOURNAL_BUF] = [0: BATCH_JOURNAL_BUF];
+    var cur_day: i64 = 0 - 1;
+    var failed: bool = false;
+    var i: usize = 0;
+    while i < g_b_len && !failed {
+        const r: &BatchRow = &g_b_rows[i];
+        const ok: bool = billing_apply_ledger(&g_b_db, r.request_id[0: r.request_id_len],
+            r.user_id, r.ts, r.model[0: r.model_len], r.provider[0: r.provider_len],
+            r.input_tokens, r.output_tokens, r.cache_read_tokens, r.cost_nano,
+            r.price_nano, r.period[0: r.period_len], r.rate_version) catch {
+            failed = true;
+            false;
+        };
+        if !failed {
+            var line: [byte: 512] = [0: 512];
+            const ln: usize = journal_format(r.request_id[0: r.request_id_len], r.user_id,
+                r.model[0: r.model_len], r.provider[0: r.provider_len], r.ts,
+                r.input_tokens, r.output_tokens, r.cache_read_tokens, r.cost_nano,
+                r.price_nano, r.period[0: r.period_len], r.rate_version, &line[0], 512);
+            if ln == 0 || jn > (BATCH_JOURNAL_BUF -| ln) {
+                // 缓冲区不够（或单行异常）：先把已攒的落盘；单行超长按失败处理。
+                if ln == 0 || cur_day < 0 || !batch_journal_flush(cur_day, jbuf[0: jn], &jn) {
+                    failed = true;
+                }
+            }
+            if !failed {
+                if cur_day >= 0 && r.day != cur_day && !batch_journal_flush(cur_day, jbuf[0: jn], &jn) {
+                    failed = true;
+                }
+            }
+            if !failed {
+                var k: usize = 0;
+                while k < ln && jn < BATCH_JOURNAL_BUF {
+                    jbuf[jn] = line[k];
+                    jn = jn + 1;
+                    k = k + 1;
+                }
+                cur_day = r.day;
+                if ok {
+                    applied = applied +% 1;
+                } else {
+                    g_b_duplicate = g_b_duplicate +% 1;
+                }
+            }
+        }
+        if !failed {
+            i = i + 1;
+        }
+    }
+    if !failed && !batch_journal_flush(cur_day, jbuf[0: jn], &jn) {
+        failed = true;
+    }
+    if failed {
+        _ = batch_exec(&g_b_db, "rollback" as &const byte);
+        return error.BatchFailed;
+    }
+    if !batch_exec(&g_b_db, "commit" as &const byte) {
+        _ = batch_exec(&g_b_db, "rollback" as &const byte);
+        return error.BatchFailed;
+    }
+    g_b_applied = g_b_applied +% (applied as i64);
+    g_b_flushes = g_b_flushes +% 1;
+    g_b_len = 0;
+    return applied;
+}
+
+/// 事件循环每轮调用：到时间/条数阈值才真正提交；失败保留队列下一轮再试。
+export fn batch_tick(now_ms: u64) void {
+    if !g_b_ready || g_b_len == 0 {
+        return;
+    }
+    if g_b_len >= BATCH_CAP || now_ms >= g_b_last_ms +% BATCH_FLUSH_MS {
+        const r: !usize = batch_flush();
+        var ok: bool = true;
+        _ = r catch |_| {
+            ok = false;
+            0 as usize;
+        };
+        if ok {
+            g_b_last_ms = now_ms;
+        }
+    }
+}
+
+/// 结算但延迟落库（serve 的请求路径用）：查价 + 入队，不写 DB。
+export fn billing_settle_deferred(request_id: &[byte], user_id: i64, ts: i64,
+    tz_min: i32, model: &[byte], provider: &[byte], usage: &PriceUsage,
+    out: &BillingResult) !void {
+    if !g_b_ready || request_id.len == 0 {
+        return error.BatchFailed;
+    }
+    try billing_quote(&g_b_db, model, provider, user_id, ts, tz_min, usage, out);
+    try batch_enqueue(request_id, user_id, ts, model, provider, usage.input_tokens,
+        usage.output_tokens, usage.cache_read_tokens, out.cost_nano, out.price_nano,
+        &""[0: 0], out.rate_version);
+    return;
+}

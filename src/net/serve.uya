@@ -537,7 +537,17 @@ fn srv_stop_requested() i32 {
 }
 
 /// 单调时钟毫秒。取不到时返回 0（SSE 会退化成每轮都推，不影响正确性）。
-fn srv_now_ms() u64 {
+/// A4：查询账本前先刷批量队列，保证「刚请求完就能查到」。
+fn srv_batch_sync() void {
+    if !batch_ready() {
+        return;
+    }
+    _ = batch_flush() catch {
+        0 as usize;
+    };
+}
+
+export fn srv_now_ms() u64 {
     var ts: TimeSpec = TimeSpec{};
     const r: !i32 = sys_clock_gettime(SRV_CLOCK_MONOTONIC, &ts);
     _ = r catch {
@@ -1097,11 +1107,10 @@ fn srv_chat_stream(c: &SrvConn, plan: &ChatPlan, cfg: &const HttppConfig, nowu: 
             0 as usize;
         };
         if ridn > 0 {
-            var dirbuf: [byte: 256] = [0: 256];
-            const dn: usize = runtime_dir_copy(&dirbuf[0], 256);
             var settle: BillingResult = BillingResult{ cost_nano: 0, price_nano: 0, rate_version: 0, duplicate: false, found: false };
-            billing_settle(runtime_db(), dirbuf[0: dn], rid[0: ridn], user_id,
-                store_now(), 0, plan.model[0: plan.model_len],
+            // A4：只查价 + 入队，批量落库在事件循环里做
+            billing_settle_deferred(rid[0: ridn], user_id, store_now(), 0,
+                plan.model[0: plan.model_len],
                 plan.provider_name[0: plan.provider_name_len], &usage, &settle) catch {};
         }
     }
@@ -1202,6 +1211,7 @@ fn srv_query_day(path: &const byte, n: usize, key: &const byte, kn: usize) i64 {
 /// A6：/v1/usage 读 usage_daily 汇总（按天，用户级）。
 fn srv_usage(c: &SrvConn, stats: &ServeStats) void {
     const keep: bool = c.keep;
+    srv_batch_sync();
     stats.requests = stats.requests +% 1;
     if !runtime_ready() {
         srv_static(c, 503, SRV_JSON_503, keep);
@@ -1400,9 +1410,7 @@ fn srv_chat(c: &SrvConn, stats: &ServeStats) void {
             return;
         };
         var settle: BillingResult = BillingResult{ cost_nano: 0, price_nano: 0, rate_version: 0, duplicate: false, found: false };
-        var dirbuf: [byte: 256] = [0: 256];
-        const dn: usize = runtime_dir_copy(&dirbuf[0], 256);
-        chat_settle(runtime_db(), dirbuf[0: dn], rid[0: ridn], key.user_id, store_now(), 0,
+        chat_settle_deferred(rid[0: ridn], key.user_id, store_now(), 0,
             &plan, resp[0: rn], &settle) catch {
             srv_static(c, 502, SRV_JSON_502, keep);
             return;
@@ -2145,6 +2153,7 @@ export fn serve_run(lfd: i32, stats: &ServeStats) !i32 {
         }
     }
     runtime_tick();
+        batch_tick(srv_now_ms());
         if srv_stop_requested() != 0 && stopping == 0 {
             stopping = 1;
             stop_at = srv_now_ms() +% SRV_SHUTDOWN_MS;
@@ -2563,6 +2572,7 @@ fn srv_rates_out(w: &JsonW, label: &[byte], r: &PriceRates) void {
 
 fn srv_admin_health(c: &SrvConn, stats: &ServeStats) void {
     const keep: bool = c.keep;
+    srv_batch_sync();
     stats.requests = stats.requests +% 1;
     if !runtime_ready() {
         srv_static(c, 503, SRV_JSON_503, keep);
@@ -2711,6 +2721,7 @@ fn srv_admin_pricing_post(c: &SrvConn, stats: &ServeStats) void {
 
 fn srv_admin_billing(c: &SrvConn, stats: &ServeStats) void {
     const keep: bool = c.keep;
+    srv_batch_sync();
     stats.requests = stats.requests +% 1;
     if !runtime_ready() {
         srv_static(c, 503, SRV_JSON_503, keep);
@@ -2942,11 +2953,9 @@ fn srv_responses(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 502, SRV_JSON_502, keep);
         return;
     }
-    var dirbuf: [byte: 256] = [0: 256];
-    const dlen: usize = runtime_dir_copy(&dirbuf[0], 256);
     var settle: BillingResult = BillingResult{ cost_nano: 0, price_nano: 0, rate_version: 0, duplicate: false, found: false };
-    billing_settle(runtime_db(), dirbuf[0: dlen], rid[0: ridn], key.user_id, store_now(),
-        0, plan.model[0: plan.model_len], plan.provider_name[0: plan.provider_name_len],
+    billing_settle_deferred(rid[0: ridn], key.user_id, store_now(), 0,
+        plan.model[0: plan.model_len], plan.provider_name[0: plan.provider_name_len],
         &usage, &settle) catch {
         srv_static(c, 502, SRV_JSON_502, keep);
         return;
@@ -3431,9 +3440,7 @@ fn srv_responses_stream(c: &SrvConn, uid: i64, plan: &ChatPlan, cfg: &const Http
     }
     var settle: BillingResult = BillingResult{ cost_nano: 0, price_nano: 0, rate_version: 0, duplicate: false, found: false };
     if usage_found {
-        var dirbuf: [byte: 256] = [0: 256];
-        const dlen: usize = runtime_dir_copy(&dirbuf[0], 256);
-        billing_settle(runtime_db(), dirbuf[0: dlen], rid, uid, store_now(), 0,
+        billing_settle_deferred(rid, uid, store_now(), 0,
             plan.model[0: plan.model_len], plan.provider_name[0: plan.provider_name_len],
             &usage, &settle) catch {};
     }
@@ -4031,6 +4038,7 @@ fn csv_field(b: &Buf, s: &[byte]) void {
 
 fn srv_usage_csv(c: &SrvConn, stats: &ServeStats) void {
     const keep: bool = c.keep;
+    srv_batch_sync();
     stats.requests = stats.requests +% 1;
     if !runtime_ready() {
         srv_static(c, 503, SRV_JSON_503, keep);
@@ -4192,6 +4200,7 @@ fn srv_estimate(c: &SrvConn, stats: &ServeStats) void {
 // C4：预算（GET 读当前额度与当月已用；POST 设置，需会话或 Key）。
 fn srv_budget(c: &SrvConn, stats: &ServeStats) void {
     const keep: bool = c.keep;
+    srv_batch_sync();
     stats.requests = stats.requests +% 1;
     if !runtime_ready() {
         srv_static(c, 503, SRV_JSON_503, keep);
@@ -4578,6 +4587,7 @@ fn srv_node_spool(c: &SrvConn, stats: &ServeStats) void {
 /// C2：请求列表（分页）/ 详情（`?id=`）。
 fn srv_requests(c: &SrvConn, stats: &ServeStats) void {
     const keep: bool = c.keep;
+    srv_batch_sync();
     stats.requests = stats.requests +% 1;
     if !runtime_ready() {
         srv_static(c, 503, SRV_JSON_503, keep);

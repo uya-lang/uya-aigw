@@ -1,0 +1,209 @@
+// tests/test_batch.uya — A4 批量落库：延迟可见、批量事务、journal 批量追加、幂等
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_i64;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+use libc.syscall;
+
+const T0: i64 = 1700000000;
+const DAY: i64 = 86400;
+const DIR: &[byte] = &"/tmp/aigw_batch_test"[0: 20];
+
+fn open_db(d: &Db) !void {
+    _ = try schema_open(d, &":memory:"[0: 8]);
+}
+
+fn prep() void {
+    _ = sys_mkdir("/tmp/aigw_batch_test" as *const byte, 493) catch { 0; };
+}
+
+fn journal_of(ts: i64) usize {
+    var p: [byte: 512] = [0: 512];
+    const pn: usize = journal_path(DIR, ts, &p[0], 512);
+    _ = sys_unlink(&p[0] as *const byte) catch { 0; };
+    return pn;
+}
+
+fn setup(d: &Db) !void {
+    var p: StoreProvider = StoreProvider{};
+    try store_provider_create(d, &"mock"[0: 4], &"127.0.0.1"[0: 9], 18080, T0, &p);
+    try store_provider_model_put(d, p.id, &"gpt-4o"[0: 6], &"gpt-4o-2024"[0: 11], T0);
+    var sell: PriceCard = PriceCard{ id: 0, kind: 0, version: 0, effective_from: 0, found: false };
+    try price_card_create(d, PRICE_KIND_SELL, 1, 0, T0, &"v1"[0: 2], &sell);
+    try price_entry_put(d, sell.id, &""[0: 0], &"gpt-4o"[0: 6], 0, 1000, 2000, 500, 100, &""[0: 0]);
+    var cost: PriceCard = PriceCard{ id: 0, kind: 0, version: 0, effective_from: 0, found: false };
+    try price_card_create(d, PRICE_KIND_COST, 1, 0, T0, &"v1"[0: 2], &cost);
+    try price_entry_put(d, cost.id, &"mock"[0: 4], &"gpt-4o"[0: 6], 0, 600, 1200, 300, 50, &""[0: 0]);
+}
+
+fn count(d: &Db, sql: &[byte]) i64 {
+    var n: i64 = 0;
+    if dbx_scalar_i64(d, sql, &n) != 0 {
+        return 0 - 1;
+    }
+    return n;
+}
+
+fn usage() PriceUsage {
+    return PriceUsage{ input_tokens: 100000, output_tokens: 50000, cache_read_tokens: 10000 };
+}
+
+fn zero_result() BillingResult {
+    return BillingResult{ cost_nano: 0, price_nano: 0, rate_version: 0, duplicate: false, found: false };
+}
+
+/// 生成稳定 request_id：`b<digits>`。
+fn rid_of(i: i32, out: &byte) usize {
+    out[0] = 'b' as byte;
+    var tmp: [byte: 12] = [0: 12];
+    var n: usize = 0;
+    var x: i32 = i;
+    if x == 0 {
+        tmp[0] = '0' as byte;
+        n = 1;
+    }
+    while x > 0 {
+        tmp[n] = (48 as i32 + x % 10) as byte;
+        x = x / 10;
+        n = n + 1;
+    }
+    var k: usize = 0;
+    while k < n {
+        out[1 + k] = tmp[n - 1 - k];
+        k = k + 1;
+    }
+    return 1 + n;
+}
+
+fn test_deferred() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    try setup(&d);
+    prep();
+    _ = journal_of(T0);
+    batch_reset();
+    batch_configure(&d, DIR, 1000);
+
+    var u: PriceUsage = usage();
+    var r: BillingResult = zero_result();
+    try billing_settle_deferred(&"b1"[0: 2], 7, T0, 0, &"gpt-4o"[0: 6],
+        &"mock"[0: 4], &u, &r);
+    try assert_eq_bool(r.found, true);
+    try assert_eq_i64(r.cost_nano, 173);
+    try assert_eq_i64(r.price_nano, 305);
+    try assert_eq_i64(batch_pending() as i64, 1);
+    // 延迟落库：查询前不写账本
+    try assert_eq_i64(count(&d, &"select count(*) from usage_ledger"[0: 33]), 0);
+    try assert_eq_i64(count(&d, &"select sum(requests) from usage_daily"[0: 37]), 0);
+
+    const applied: usize = try batch_flush();
+    try assert_eq_i64(applied as i64, 1);
+    try assert_eq_i64(count(&d, &"select count(*) from usage_ledger"[0: 33]), 1);
+    try assert_eq_i64(count(&d, &"select sum(requests) from usage_daily"[0: 37]), 1);
+    try assert_eq_i64(batch_pending() as i64, 0);
+
+    // 重复 request_id：再入队再 flush，不重复记账
+    var r2: BillingResult = zero_result();
+    try billing_settle_deferred(&"b1"[0: 2], 7, T0, 0, &"gpt-4o"[0: 6],
+        &"mock"[0: 4], &u, &r2);
+    const d2: usize = try batch_flush();
+    try assert_eq_i64(d2 as i64, 0);
+    try assert_eq_i64(batch_duplicate(), 1);
+    try assert_eq_i64(count(&d, &"select count(*) from usage_ledger"[0: 33]), 1);
+    try assert_eq_i64(count(&d, &"select sum(requests) from usage_daily"[0: 37]), 1);
+    batch_reset();
+}
+
+fn test_journal_batch() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    try setup(&d);
+    prep();
+    _ = journal_of(T0);
+    batch_reset();
+    batch_configure(&d, DIR, 1000);
+    var u: PriceUsage = usage();
+    var i: i32 = 0;
+    while i < 3 {
+        var id: [byte: 16] = [0: 16];
+        const n: usize = rid_of(i, &id[0]);
+        var r: BillingResult = zero_result();
+        try billing_settle_deferred(id[0: n], 7, T0 + (i as i64), 0, &"gpt-4o"[0: 6],
+            &"mock"[0: 4], &u, &r);
+        i = i + 1;
+    }
+    const applied: usize = try batch_flush();
+    try assert_eq_i64(applied as i64, 3);
+    // 批里同一时间戳只追加一次，但三行都在文件里；重放到新库应全部新增。
+    var d2: Db = Db{ h: null };
+    defer { dbx_close(&d2); }
+    try open_db(&d2);
+    var path: [byte: 512] = [0: 512];
+    const pn: usize = journal_path(DIR, T0, &path[0], 512);
+    var stats: JournalStats = JournalStats{ lines: 0, applied: 0, duplicate: 0, bad: 0 };
+    try journal_replay(&d2, path[0: pn], &stats);
+    try assert_eq_i64(stats.lines, 3);
+    try assert_eq_i64(stats.applied, 3);
+    try assert_eq_i64(stats.bad, 0);
+    // 再重放一次：全部 duplicate
+    try journal_replay(&d2, path[0: pn], &stats);
+    try assert_eq_i64(stats.applied, 3);
+    try assert_eq_i64(stats.duplicate, 3);
+    batch_reset();
+}
+
+fn test_tick() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    try setup(&d);
+    prep();
+    _ = journal_of(T0);
+    batch_reset();
+    batch_configure(&d, DIR, 1000);
+    var u: PriceUsage = usage();
+    var r: BillingResult = zero_result();
+    try billing_settle_deferred(&"t1"[0: 2], 7, T0, 0, &"gpt-4o"[0: 6],
+        &"mock"[0: 4], &u, &r);
+    batch_tick(1199); // 199ms，不提交
+    try assert_eq_i64(count(&d, &"select count(*) from usage_ledger"[0: 33]), 0);
+    batch_tick(1200); // 200ms，到点提交
+    try assert_eq_i64(count(&d, &"select count(*) from usage_ledger"[0: 33]), 1);
+    try assert_eq_i64(batch_pending() as i64, 0);
+    batch_reset();
+}
+
+fn test_bulk() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    try setup(&d);
+    prep();
+    _ = journal_of(T0);
+    batch_reset();
+    batch_configure(&d, DIR, 1000);
+    var u: PriceUsage = usage();
+    var i: i32 = 0;
+    while i < 200 {
+        var id: [byte: 16] = [0: 16];
+        const n: usize = rid_of(i, &id[0]);
+        var r: BillingResult = zero_result();
+        try billing_settle_deferred(id[0: n], 7, T0 + (i as i64), 0, &"gpt-4o"[0: 6],
+            &"mock"[0: 4], &u, &r);
+        i = i + 1;
+    }
+    try assert_eq_i64(batch_pending() as i64, 200);
+    const applied: usize = try batch_flush();
+    try assert_eq_i64(applied as i64, 200);
+    try assert_eq_i64(count(&d, &"select count(*) from usage_ledger"[0: 33]), 200);
+    try assert_eq_i64(count(&d, &"select sum(requests) from usage_daily"[0: 37]), 200);
+    try assert_eq_i64(batch_flushes(), 1);
+    batch_reset();
+}
+
+test "deferred" { run_test("deferred", test_deferred); }
+test "journal_batch" { run_test("journal_batch", test_journal_batch); }
+test "tick" { run_test("tick", test_tick); }
+test "bulk" { run_test("bulk", test_bulk); }

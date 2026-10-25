@@ -103,7 +103,7 @@
 1. **接入**：edge 按 `/p/<slug>/v1/chat/completions` 解析 slug → node；或 node 直接接流量。
 2. **鉴权**：`Authorization: Bearer aigw_sk_...`；查内存快照（key → user/限额/模型权限）；slug 与 key 必须同用户。
 3. **限流**：节点本地令牌桶（RPM/TPM/并发），单属主保证精确。
-4. **规范**：chat 快路径只改 `model/stream/stream_options`；responses 做全量翻译。
+4. **规范**：chat 快路径不建 DOM（顶层扫描定位 `model`/`stream`，只按 span 改写 model），形态不安全才回退完整解析；responses 做全量翻译。
 5. **选路**：按模型取候选绑定，priority → 健康 → 权重/least-inflight → session 亲和；按会话哈希固定供应商。
 6. **调用**：插件池或内置 HTTP + TLS；记录首 token 时间。
 7. **转发**：流式逐事件写 SSE（chunked、逐事件 flush）；非流式聚合后一次写。
@@ -139,7 +139,7 @@
 | 节点本地日志/待上报 | node `node-<id>.db` |
 
 - SQLite 3（`@c_import` 编入二进制），WAL、`synchronous=NORMAL`、`busy_timeout=5000`。
-- 热路径不碰库；批量写（500 行/事务或 200ms）；读只走 rollup。
+- 热路径不碰库：`batch.uya` 队列 + 事件循环按 512 行/200ms 单事务写 `usage_ledger`/`usage_daily`，journal 批追加只 fsync 一次；查询前先 flush 保证可见；读只走 rollup。
 - **每天 03:00 备份**（`VACUUM INTO` 子进程），**保留 7 份**。
 - **计费 journal**：每批 ingest 后追加 + fsync，保留 8 天，恢复时重放，RPO ≈ 5s。
 - 恢复流程见 `docs/runbooks/restore.md`。

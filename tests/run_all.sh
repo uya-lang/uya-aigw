@@ -49,7 +49,8 @@ run src/core/dbx.uya src/core/schema.uya src/core/money.uya src/core/schedule.uy
 run src/plugins/pool.uya tests/test_pool.uya
 run src/core/json.uya tests/test_json.uya
 run src/core/dbx.uya src/core/schema.uya src/core/money.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/backup.uya src/core/journal.uya src/core/billing.uya tests/test_billing.uya
-run src/core/dbx.uya src/core/schema.uya src/core/store.uya src/core/money.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/backup.uya src/core/journal.uya src/core/billing.uya src/core/lb.uya src/core/responses.uya src/core/chat.uya tests/test_chat.uya
+run src/core/dbx.uya src/core/schema.uya src/core/store.uya src/core/money.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/backup.uya src/core/journal.uya src/core/billing.uya src/core/batch.uya tests/test_batch.uya
+run src/core/dbx.uya src/core/schema.uya src/core/store.uya src/core/money.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/backup.uya src/core/journal.uya src/core/billing.uya src/core/batch.uya src/core/lb.uya src/core/responses.uya src/core/chat.uya tests/test_chat.uya
 run src/foundation/buf.uya src/net/httpsrv.uya tests/test_httpsrv.uya
 run src/foundation/buf.uya src/core/money.uya src/core/reqlog.uya tests/test_reqlog.uya
 
