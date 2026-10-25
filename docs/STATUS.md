@@ -26,6 +26,9 @@
 - A3（已落地）：`src/plugins/pool.uya` 插件池（stdio JSONL 子进程）：预热 min、复用、
   扩容到 max、空闲缩容到 min、崩溃指数退避、cancel、ping/pong；非阻塞 fd + poll 超时
   与按行分帧。`tests/test_pool.uya` 24 断言（`tests/plugin_echo.py` 作最小插件）。
+- A4（进行中）：`src/core/json.uya` 有界 JSON DOM + 构造器（`tests/test_json.uya`
+  44 断言）已落地；下一步 schema v4 `providers`、`POST /v1/chat/completions`
+  （鉴权 → 上游 → usage → price → ledger/journal）、SSE 透传。
 - A2（已落地）：`schema.uya` 台阶式迁移（v1 身份、v2 价目、v3 用量账本）、`store.uya`
   用户/Key/OTP/会话（`tests/test_store.uya` 含登录→建 key→鉴权端到端）、`schedule.uya`
   分时规则（`tests/test_schedule.uya` 28 断言）、`backup.uya` VACUUM INTO 快照 + 保留

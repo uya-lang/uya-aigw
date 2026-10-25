@@ -1,0 +1,148 @@
+// tests/test_json.uya — A4 JSON：解析、转义、错误边界、构造器
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_i64;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+fn tj_eq(a: &[byte], lit: &[byte]) bool {
+    if a.len != lit.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < a.len {
+        if a[i] != lit[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn tj_bad(d: &JsonDoc, text: &[byte]) bool {
+    var failed: bool = false;
+    json_parse(d, text) catch |_| {
+        failed = true;
+    };
+    return failed && json_root(d) == (0 - 1);
+}
+
+fn test_parse_nested() !void {
+    var d: JsonDoc = JsonDoc{};
+    try json_parse(&d, &"{\"model\":\"gpt-4o\",\"stream\":true,\"n\":42,\"x\":-1.5,\"nil\":null,\"arr\":[1,2,3],\"o\":{\"k\":\"v\"}}"[0: 87]);
+    const root: i32 = json_root(&d);
+    try assert_eq_i32(json_kind(&d, root), JSON_OBJ);
+    try assert_eq_bool(json_get_str_eq(&d, root, &"model"[0: 5], &"gpt-4o"[0: 6]), true);
+    try assert_eq_bool(json_bool(&d, json_get(&d, root, &"stream"[0: 6])), true);
+    try assert_eq_i64(json_i64(&d, json_get(&d, root, &"n"[0: 1])), 42);
+    try assert_eq_i64(json_i64(&d, json_get(&d, root, &"x"[0: 1])), 0 - 1);
+    try assert_eq_bool(json_is_null(&d, json_get(&d, root, &"nil"[0: 3])), true);
+    const arr: i32 = json_get(&d, root, &"arr"[0: 3]);
+    try assert_eq_i32(json_kind(&d, arr), JSON_ARR);
+    try assert_eq_i32(json_arr_len(&d, arr) as i32, 3);
+    try assert_eq_i64(json_i64(&d, json_arr_at(&d, arr, 1)), 2);
+    try assert_eq_i32(json_arr_at(&d, arr, 3), 0 - 1);
+    const o: i32 = json_get(&d, root, &"o"[0: 1]);
+    try assert_eq_bool(json_get_str_eq(&d, o, &"k"[0: 1], &"v"[0: 1]), true);
+    try assert_eq_i32(json_get(&d, root, &"missing"[0: 7]), 0 - 1);
+    try assert_eq_i32(json_get(&d, arr, &"x"[0: 1]), 0 - 1);
+}
+
+fn test_escapes() !void {
+    var d: JsonDoc = JsonDoc{};
+    try json_parse(&d, &"{\"s\":\"a\\\"b\\\\c\\n\\t\\u0041\\u00e9\",\"u\":\"\\ud83d\\ude00\"}"[0: 50]);
+    const root: i32 = json_root(&d);
+    const s: i32 = json_get(&d, root, &"s"[0: 1]);
+    var buf: [byte: 64] = [0: 64];
+    const n: usize = json_str(&d, s, &buf[0], 64);
+    try assert_eq_i32(n as i32, 10);
+    try assert_eq_bool(buf[0] == ('a' as byte), true);
+    try assert_eq_bool(buf[1] == (34 as byte), true);
+    try assert_eq_bool(buf[3] == (92 as byte), true);
+    try assert_eq_bool(buf[5] == (10 as byte), true);
+    try assert_eq_bool(buf[6] == (9 as byte), true);
+    try assert_eq_bool(buf[7] == ('A' as byte), true);
+    try assert_eq_bool(buf[8] == (195 as byte), true); // é = C3 A9
+    try assert_eq_bool(buf[9] == (169 as byte), true);
+    const u: i32 = json_get(&d, root, &"u"[0: 1]);
+    const un: usize = json_str(&d, u, &buf[0], 64);
+    try assert_eq_i32(un as i32, 4); // 😀 = F0 9F 98 80
+    try assert_eq_bool(buf[0] == (240 as byte), true);
+    try assert_eq_bool(buf[3] == (128 as byte), true);
+    // 截断拷贝：cap 小于内容时只写 cap
+    try assert_eq_i32(json_str(&d, s, &buf[0], 3) as i32, 3);
+}
+
+fn test_errors() !void {
+    var d: JsonDoc = JsonDoc{};
+    try assert_eq_bool(tj_bad(&d, &"{"[0: 1]), true);
+    try assert_eq_bool(tj_bad(&d, &"{\"a\":}"[0: 6]), true);
+    try assert_eq_bool(tj_bad(&d, &"[1,]"[0: 4]), true);
+    try assert_eq_bool(tj_bad(&d, &"{}x"[0: 3]), true);
+    try assert_eq_bool(tj_bad(&d, &"\"\\q\""[0: 4]), true);
+    try assert_eq_bool(tj_bad(&d, &""[0: 0]), true);
+    // 未转义控制字符
+    var ctl: [byte: 5] = [0: 5];
+    ctl[0] = '"';
+    ctl[1] = 1 as byte;
+    ctl[2] = '"';
+    try assert_eq_bool(tj_bad(&d, &ctl[0: 3]), true);
+    // 深度 33 的数组
+    var deep: [byte: 70] = [0: 70];
+    var i: usize = 0;
+    while i < 33 {
+        deep[i] = '[';
+        deep[33 + i] = ']';
+        i = i + 1;
+    }
+    try assert_eq_bool(tj_bad(&d, &deep[0: 66]), true);
+    // 成功解析后 root 有效；再解析失败则 root 复位
+    try json_parse(&d, &"{\"a\":1}"[0: 7]);
+    try assert_eq_i32(json_root(&d), 0);
+    try assert_eq_bool(tj_bad(&d, &"{"[0: 1]), true);
+    try assert_eq_i32(json_root(&d), 0 - 1);
+}
+
+fn test_writer() !void {
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"a"[0: 1]);
+    jsonw_i64(&w, 1);
+    jsonw_key(&w, &"b"[0: 1]);
+    jsonw_arr(&w);
+    jsonw_str(&w, &"x"[0: 1]);
+    jsonw_bool(&w, true);
+    jsonw_null(&w);
+    jsonw_end_arr(&w);
+    jsonw_key(&w, &"c"[0: 1]);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"d"[0: 1]);
+    jsonw_str(&w, &"e\n"[0: 2]);
+    jsonw_end_obj(&w);
+    jsonw_end_obj(&w);
+    try assert_eq_bool(jsonw_ok(&w), true);
+    const n: usize = jsonw_len(&w);
+    try assert_eq_bool(tj_eq(jsonw_span(&w), &"{\"a\":1,\"b\":[\"x\",true,null],\"c\":{\"d\":\"e\\n\"}}"[0: 43]), true);
+    try assert_eq_i32(n as i32, 43);
+}
+
+fn test_writer_escape() !void {
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_str(&w, &"a\"b\\c\td"[0: 7]);
+    try assert_eq_bool(jsonw_ok(&w), true);
+    try assert_eq_bool(tj_eq(jsonw_span(&w), &"\"a\\\"b\\\\c\\td\""[0: 12]), true);
+    // 数字
+    jsonw_init(&w);
+    jsonw_i64(&w, 0 - 123456789);
+    try assert_eq_bool(tj_eq(jsonw_span(&w), &"-123456789"[0: 10]), true);
+    jsonw_init(&w);
+    jsonw_i64(&w, 0);
+    try assert_eq_bool(tj_eq(jsonw_span(&w), &"0"[0: 1]), true);
+}
+
+test "parse_nested" { run_test("parse_nested", test_parse_nested); }
+test "escapes" { run_test("escapes", test_escapes); }
+test "errors" { run_test("errors", test_errors); }
+test "writer" { run_test("writer", test_writer); }
+test "writer_escape" { run_test("writer_escape", test_writer_escape); }
