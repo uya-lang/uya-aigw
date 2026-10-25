@@ -26,6 +26,13 @@
 - A3（已落地）：`src/plugins/pool.uya` 插件池（stdio JSONL 子进程）：预热 min、复用、
   扩容到 max、空闲缩容到 min、崩溃指数退避、cancel、ping/pong；非阻塞 fd + poll 超时
   与按行分帧。`tests/test_pool.uya` 24 断言（`tests/plugin_echo.py` 作最小插件）。
+## 开发命令（A9）
+
+- `make check`：全量类型检查
+- `make selftest`：check + `tests/run_all.sh`（全部单测/端到端，末行 `ALL GREEN`）
+- `make e2e`：provider → TLS CLI → serve 冒烟 → chat/responses/admin e2e
+- `make db_bench`：SQLite 写入 + rollup 基准（5000 行 ≈41ms）
+
 - A2（已落地）：登录→建 key→调用闭环已通：`/v1/auth/otp`（dev 回显）、
   `/v1/auth/login`、`/v1/keys`、`/v1/me`，e2e 用 HTTP 拿 Key 调 chat。
 - A6（已落地）：`usage_daily` 汇总 + `rollup` 重建/查询；billing 实时 upsert；
@@ -42,6 +49,13 @@
   `src/core/chat.uya` 编排（解析/路由/上游请求重写/结算，23 断言）；
   `httpsrv` 已捕获 `Authorization` 头（chat 鉴权的前置）。
   下一步把 `ChatPlan` 接到 serve 的 `POST /v1/chat/completions`（含 SSE 透传）。
+## 开发命令（A9）
+
+- `make check`：全量类型检查
+- `make selftest`：check + `tests/run_all.sh`（全部单测/端到端，末行 `ALL GREEN`）
+- `make e2e`：provider → TLS CLI → serve 冒烟 → chat/responses/admin e2e
+- `make db_bench`：SQLite 写入 + rollup 基准（5000 行 ≈41ms）
+
 - A2（已落地）：`schema.uya` 台阶式迁移（v1 身份、v2 价目、v3 用量账本）、`store.uya`
   用户/Key/OTP/会话（`tests/test_store.uya` 含登录→建 key→鉴权端到端）、`schedule.uya`
   分时规则（`tests/test_schedule.uya` 28 断言）、`backup.uya` VACUUM INTO 快照 + 保留

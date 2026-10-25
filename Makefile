@@ -5,7 +5,7 @@ UYA_ROOT ?= /home/winger/uya/uya/lib
 SRC := $(shell find src -name '*.uya' | sort)
 export UYA_ROOT
 
-.PHONY: check test spike clean
+.PHONY: check test spike clean selftest e2e db_bench
 
 # 类型检查全部源文件（合并命名空间）
 check:
@@ -17,6 +17,28 @@ test:
 
 spike:
 	./tests/tls_spike.sh
+
+# 全量自检：类型检查 + 全部单测/端到端
+selftest: check
+	./tests/run_all.sh
+
+# 网关端到端：TLS 上游、CLI、事件循环、chat/responses/admin
+e2e:
+	./tests/provider_spike.sh
+	rm -rf .uyacache
+	./tests/tls_cli_spike.sh
+	rm -rf .uyacache
+	./tests/serve_smoke.sh
+	rm -rf .uyacache
+	./tests/chat_e2e.sh
+
+# SQLite 写入与汇总基准
+db_bench:
+	rm -rf .uyacache
+	mkdir -p build
+	$(UYA) build src/core/dbx.uya src/core/schema.uya src/core/rollup.uya tests/db_bench.uya -o build/db_bench
+	./build/db_bench
+	rm -rf .uyacache
 
 clean:
 	rm -rf build .uyacache

@@ -1,0 +1,78 @@
+// tests/db_bench.uya — A9 db_bench：SQLite 写入/汇总基准（进程内 :memory:）
+use std.time;
+
+extern "libc" fn printf(fmt: *byte, ...) i32;
+
+const N: i32 = 5000;
+const DAY: i64 = 19700;
+
+fn rid(i: i32, out: &byte) usize {
+    out[0] = 'r';
+    var v: i32 = i;
+    var pos: usize = 7;
+    while pos > 0 {
+        out[pos] = (48 + (v % 10)) as byte;
+        v = v / 10;
+        pos = pos - 1;
+    }
+    return 8;
+}
+
+export fn main() i32 {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    _ = schema_open(&d, &":memory:"[0: 8]) catch {
+        printf("DB-BENCH open failed\n" as *byte);
+        return 1;
+    };
+    const ts: i64 = DAY *% 86400 +% 3600;
+    const t0: u64 = now_ms() catch {
+        0 as u64;
+    };
+    _ = dbx_exec_cstr(&d, "begin" as &const byte) catch {};
+    var i: i32 = 0;
+    var idbuf: [byte: 16] = [0: 16];
+    while i < N {
+        const rn: usize = rid(i, &idbuf[0]);
+        var st: DbStmt = dbx_prepare(&d,
+            "insert into usage_ledger(request_id, user_id, ts, model, provider, input_tokens, output_tokens, cache_read_tokens, cost_nano, price_nano, period, rate_version) values(?, 1, ?, 'm', 'p', 100, 50, 10, 5, 9, 'peak', 1)" as &const byte) catch {
+            return 2;
+        };
+        dbx_bind_text(&st, 1, idbuf[0: rn]) catch {
+            return 2;
+        };
+        dbx_bind_i64(&st, 2, ts) catch {
+            return 2;
+        };
+        if dbx_step(&st) != 0 {
+            return 2;
+        }
+        dbx_finalize(&st);
+        i = i + 1;
+    }
+    _ = dbx_exec_cstr(&d, "commit" as &const byte) catch {};
+    const t1: u64 = now_ms() catch {
+        0 as u64;
+    };
+    rollup_rebuild_day(&d, DAY) catch {
+        printf("DB-BENCH rollup failed\n" as *byte);
+        return 3;
+    };
+    const t2: u64 = now_ms() catch {
+        0 as u64;
+    };
+    var cnt: i64 = 0;
+    if dbx_scalar_i64(&d, &"select count(*) from usage_ledger"[0: 33], &cnt) != 0 || cnt != (N as i64) {
+        printf("DB-BENCH count=%d\n" as *byte, cnt as i32);
+        return 4;
+    }
+    const ins_ms: u64 = t1 -% t0;
+    const roll_ms: u64 = t2 -% t1;
+    var rate: u64 = 0;
+    if ins_ms > 0 {
+        rate = ((N as u64) *% (1000 as u64)) / ins_ms;
+    }
+    printf("DB-BENCH rows=%d insert_ms=%llu rate_per_s=%llu rollup_ms=%llu\n" as *byte,
+        N, ins_ms, rate, roll_ms);
+    return 0;
+}
