@@ -314,6 +314,13 @@ echo "$APL" | grep -q '"model":"price-model"' || { echo "$APL" >&2; fail "price 
 echo "$APL" | grep -q '"input":1000000' || { echo "$APL" >&2; fail "price entry rate"; }
 AP401=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$BASE/admin/price-entries")
 [ "$AP401" = "401" ] || fail "price entries expected 401, got $AP401"
+# C5：审计日志记录改价与绑定
+AA=$(curl -s --max-time 5 -H 'Authorization: Bearer test-admin' "$BASE/admin/audit")
+echo "$AA" | grep -q '"action":"price.put"' || { echo "$AA" >&2; fail "audit price.put"; }
+echo "$AA" | grep -q '"action":"bind"' || { echo "$AA" >&2; fail "audit bind"; }
+echo "$AA" | grep -q '"target":"price-model"' || { echo "$AA" >&2; fail "audit target"; }
+AA401=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$BASE/admin/audit")
+[ "$AA401" = "401" ] || fail "audit expected 401, got $AA401"
 
 # 4n) C2：请求列表 / 详情（分页）
 RL=$(curl -s --max-time 5 -H "Authorization: Bearer $TOKEN" "$BASE/v1/requests?limit=5&offset=0")
@@ -337,6 +344,7 @@ echo "$AP" | grep -q '"name":"mock"' || { echo "$AP" >&2; fail "admin providers"
 AU401=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$BASE/admin/users")
 [ "$AU401" = "401" ] || fail "admin users expected 401, got $AU401"
 ADM=$(curl -s --max-time 5 "$BASE/admin")
+echo "$ADM" | grep -q 'id="admin-audit"' || { echo "$ADM" >&2; fail "admin audit section"; }
 echo "$ADM" | grep -q 'id="admin-users"' || { echo "$ADM" >&2; fail "admin page"; }
 ADMJ=$(curl -s --max-time 5 "$BASE/ui/admin.js")
 echo "$ADMJ" | grep -q '/admin/price-entries' || { echo "$ADMJ" >&2; fail "admin js pricing"; }

@@ -95,6 +95,7 @@ const ROUTE_REQUESTS: i32 = 40;
 const ROUTE_ADMIN_PRICES: i32 = 41;
 const ROUTE_ADMIN_MODELS: i32 = 42;
 const ROUTE_ADMIN_BIND: i32 = 43;
+const ROUTE_ADMIN_AUDIT: i32 = 44;
 const ROUTE_BUDGET: i32 = 30;
 const ROUTE_ESTIMATE: i32 = 29;
 const ROUTE_USAGE_CSV: i32 = 28;
@@ -916,6 +917,9 @@ fn srv_route_of(req: &HsrvReq) i32 {
     if srv_path_is(req, &"/admin/bind"[0: 11]) {
         return ROUTE_ADMIN_BIND;
     }
+    if srv_path_is(req, &"/admin/audit"[0: 12]) {
+        return ROUTE_ADMIN_AUDIT;
+    }
     if srv_path_is(req, &"/admin/billing"[0: 14]) {
         return ROUTE_ADMIN_BILLING;
     }
@@ -1475,6 +1479,10 @@ fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
         srv_admin_models(c, stats);
         return;
     }
+    if c.route == ROUTE_ADMIN_AUDIT {
+        srv_admin_audit(c, stats);
+        return;
+    }
     if c.route == ROUTE_ADMIN_BIND {
         srv_admin_bind(c, stats);
         return;
@@ -1513,6 +1521,10 @@ fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
     }
     if c.route == ROUTE_ADMIN_MODELS {
         srv_admin_models(c, stats);
+        return;
+    }
+    if c.route == ROUTE_ADMIN_AUDIT {
+        srv_admin_audit(c, stats);
         return;
     }
     if c.route == ROUTE_ADMIN_BIND {
@@ -3889,6 +3901,7 @@ fn srv_ctl_drain(c: &SrvConn, stats: &ServeStats) void {
             attempt = attempt + 1;
         }
     }
+    srv_audit(&"drain"[0: 5], id[0: idn]);
     var w: JsonW = JsonW{};
     jsonw_init(&w);
     jsonw_obj(&w);
@@ -4655,6 +4668,69 @@ fn srv_request_json(w: &JsonW, r: &StoreLedgerRow) void {
 }
 
 
+/// C5：审计日志（`<data_dir>/audit.jsonl`，一行一条，复用 spool 的追加/读取）。
+fn srv_audit_path(out: &byte, cap: usize) usize {
+    var d: [byte: 256] = [0: 256];
+    const dn: usize = runtime_dir_copy(&d[0], 256);
+    var n: usize = 0;
+    var i: usize = 0;
+    while i < dn && n < cap {
+        out[n] = d[i];
+        n = n + 1;
+        i = i + 1;
+    }
+    const suffix: &[byte] = &"/audit.jsonl"[0: 12];
+    i = 0;
+    while i < suffix.len && n < cap {
+        out[n] = suffix[i];
+        n = n + 1;
+        i = i + 1;
+    }
+    return n;
+}
+
+/// 追加一条审计：`{"ts":..,"actor":"admin","action":"..","target":".."}`。
+fn srv_audit(action: &[byte], target: &[byte]) void {
+    var path: [byte: 320] = [0: 320];
+    const pn: usize = srv_audit_path(&path[0], 320);
+    if pn == 0 {
+        return;
+    }
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"ts"[0: 2]);
+    jsonw_i64(&w, store_now());
+    jsonw_key(&w, &"actor"[0: 5]);
+    jsonw_str(&w, &"admin"[0: 5]);
+    jsonw_key(&w, &"action"[0: 6]);
+    jsonw_str(&w, action);
+    jsonw_key(&w, &"target"[0: 6]);
+    jsonw_str(&w, target);
+    jsonw_end_obj(&w);
+    _ = spool_try_append(path[0: pn], jsonw_span(&w));
+}
+
+/// C5：审计列表（最近 N 行，text/plain 的 JSONL）。
+fn srv_admin_audit(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    if !runtime_ready() {
+        srv_static(c, 503, SRV_JSON_503, keep);
+        return;
+    }
+    if !srv_admin_ok(c) {
+        srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    }
+    var path: [byte: 320] = [0: 320];
+    const pn: usize = srv_audit_path(&path[0], 320);
+    var buf: [byte: 16384] = [0: 16384];
+    var bn: usize = 0;
+    _ = spool_try_read(path[0: pn], &buf[0], 16384, &bn);
+    srv_static_ct(c, 200, buf[0: bn], keep, &"text/plain"[0: 10], 10);
+}
+
 /// C3：读取当前生效的价目卡 id（不存在则建一张）。
 fn srv_price_card() i64 {
     var card: PriceCard = PriceCard{ id: 0, kind: 0, version: 0, effective_from: 0 };
@@ -4714,6 +4790,7 @@ fn srv_admin_prices(c: &SrvConn, stats: &ServeStats) void {
             srv_static(c, 400, SRV_JSON_400, keep);
             return;
         };
+        srv_audit(&"price.put"[0: 9], model[0: mn]);
         srv_static(c, 200, SRV_JSON_OK, keep);
         return;
     }
@@ -4846,5 +4923,6 @@ fn srv_admin_bind(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 500, SRV_JSON_502, keep);
         return;
     };
+    srv_audit(&"bind"[0: 4], model[0: mn]);
     srv_static(c, 200, SRV_JSON_OK, keep);
 }
