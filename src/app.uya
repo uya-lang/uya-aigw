@@ -55,7 +55,9 @@ fn serve_main(host: &[byte], port: u16, db_path: &[byte], data_dir: &[byte],
         printf("listen failed\n" as *byte);
         return 1;
     };
-    printf("listen port=%d\n" as *byte, serve_port(lfd) as i32);
+    const lport: u16 = serve_port(lfd);
+    srv_addr_set(host, lport);
+    printf("listen port=%d\n" as *byte, lport as i32);
     var stats: ServeStats = ServeStats{};
     // serve_run 自己负责关闭 lfd（停机时先摘监听再关）
     const r: i32 = serve_run(lfd, &stats) catch |_| {

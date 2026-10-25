@@ -109,14 +109,36 @@ R2=$(curl -s --max-time 5 "$BASE/edge/route?slug=s1&session=sess-1")
 echo "$R2" | grep -q '"node":"node-b"' || { echo "$R2" >&2; fail "affinity"; }
 RF=$(curl -s --max-time 5 "$BASE/edge/fail?session=sess-1")
 echo "$RF" | grep -q '"ok":true' || { echo "$RF" >&2; fail "edge fail"; }
-# 归属校验：node-b 认为 s1 是自己的，node-c 认为不是
-MINE=$(curl -s --max-time 5 "http://127.0.0.1:$NPORT/edge/route?slug=s1&self=node-b")
+# 归属校验：node-b 认为 s1 是自己的，node-c 认为不是（等各自快照刷新）
+MINE=""
+i=0
+while [ $i -lt 80 ]; do
+  MINE=$(curl -s --max-time 5 "http://127.0.0.1:$NPORT/edge/route?slug=s1&self=node-b")
+  echo "$MINE" | grep -q '"mine":true' && break
+  i=$((i + 1)); sleep 0.1
+done
 echo "$MINE" | grep -q '"mine":true' || { echo "$MINE" >&2; fail "ownership mine"; }
 CPORT=$(sed -n 's/^listen port=\([0-9]*\).*/\1/p' "$TMP/node-c.log" | head -1)
-NOTMINE=$(curl -s --max-time 5 "http://127.0.0.1:$CPORT/edge/route?slug=s1&self=node-c")
+[ -n "$CPORT" ] || { cat "$TMP/node-c.log" >&2; fail "node-c port"; }
+NOTMINE=""
+i=0
+while [ $i -lt 80 ]; do
+  NOTMINE=$(curl -s --max-time 5 "http://127.0.0.1:$CPORT/edge/route?slug=s1&self=node-c")
+  echo "$NOTMINE" | grep -q '"mine":false' && break
+  i=$((i + 1)); sleep 0.1
+done
 echo "$NOTMINE" | grep -q '"mine":false' || { echo "$NOTMINE" >&2; fail "ownership not mine"; }
 R404=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$BASE/edge/route?slug=none")
 [ "$R404" = "404" ] || fail "edge unknown slug expected 404 got $R404"
+# B4：node-c 把请求代理给归属节点 node-b（节点代理 + 失败重试路径）
+PX=""
+i=0
+while [ $i -lt 80 ]; do
+  PX=$(curl -s --max-time 5 "http://127.0.0.1:$CPORT/edge/proxy?slug=s1&path=/node/status")
+  echo "$PX" | grep -q '"node":"node-b"' && break
+  i=$((i + 1)); sleep 0.1
+done
+echo "$PX" | grep -q '"node":"node-b"' || { echo "$PX" >&2; fail "edge proxy"; }
 ok edge
 
 # 6) drain node-b → 归属迁到 node-a，会话亲和失效后重新解析

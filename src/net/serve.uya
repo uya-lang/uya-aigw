@@ -89,6 +89,7 @@ const ROUTE_ADMIN_JS: i32 = 34;
 const ROUTE_EDGE_ROUTE: i32 = 35;
 const ROUTE_EDGE_FAIL: i32 = 36;
 const ROUTE_NODE_STATUS: i32 = 37;
+const ROUTE_EDGE_PROXY: i32 = 38;
 const ROUTE_BUDGET: i32 = 30;
 const ROUTE_ESTIMATE: i32 = 29;
 const ROUTE_USAGE_CSV: i32 = 28;
@@ -220,6 +221,8 @@ var g_uplink_ip_len: usize = 0;
 var g_uplink_port: u16 = 0;
 var g_uplink_last_ms: u64 = 0;
 var g_cfg_last_ms: u64 = 0;
+var g_self_addr: [byte: 128] = [0: 128];
+var g_self_addr_len: usize = 0;
 var g_cfg_version: i64 = 0;
 var g_cfg_epoch: i64 = 0;
 var g_rebalance_last_ms: u64 = 0;
@@ -246,6 +249,25 @@ fn srv_cfg_pull(ip: &[byte], node_id: &[byte]) void {
         return;
     }
     const n: usize = json_arr_len(&d, arr);
+    var nodes: [byte: 4096] = [0: 4096];
+    _ = nodes;
+    const narr: i32 = json_get(&d, root, &"nodes"[0: 5]);
+    if narr >= 0 {
+        const nn: usize = json_arr_len(&d, narr);
+        edge_addr_clear();
+        var k: usize = 0;
+        while k < nn && k < 32 {
+            const it2: i32 = json_arr_at(&d, narr, k);
+            var nid: [byte: 64] = [0: 64];
+            const nidl: usize = json_str(&d, json_get(&d, it2, &"id"[0: 2]), &nid[0], 64);
+            var nad: [byte: 128] = [0: 128];
+            const nadl: usize = json_str(&d, json_get(&d, it2, &"addr"[0: 4]), &nad[0], 128);
+            if nidl > 0 && nadl > 0 {
+                _ = edge_addr_put(nid[0: nidl], nad[0: nadl]);
+            }
+            k = k + 1;
+        }
+    }
     edge_snapshot_clear();
     var i: usize = 0;
     while i < n && i < 128 {
@@ -257,6 +279,95 @@ fn srv_cfg_pull(ip: &[byte], node_id: &[byte]) void {
         _ = edge_snapshot_put(sl[0: sln], nd[0: ndn]);
         i = i + 1;
     }
+}
+
+/// 记录本节点对外地址（`ip:port`），用于 uplink 注册上报与代理自环判定。
+export fn srv_addr_set(host: &[byte], port: u16) void {
+    g_self_addr_len = 0;
+    var i: usize = 0;
+    while i < host.len && i < 100 {
+        g_self_addr[i] = host[i];
+        i = i + 1;
+    }
+    g_self_addr_len = i;
+    if g_self_addr_len == 0 {
+        g_self_addr[0] = '1' as byte;
+        g_self_addr[1] = '2' as byte;
+        g_self_addr[2] = '7' as byte;
+        g_self_addr[3] = '.' as byte;
+        g_self_addr[4] = '0' as byte;
+        g_self_addr[5] = '.' as byte;
+        g_self_addr[6] = '0' as byte;
+        g_self_addr[7] = '.' as byte;
+        g_self_addr[8] = '1' as byte;
+        g_self_addr_len = 9;
+    }
+    if g_self_addr_len < 124 {
+        g_self_addr[g_self_addr_len] = ':' as byte;
+        g_self_addr_len = g_self_addr_len + 1;
+        var num: [byte: 8] = [0: 8];
+        var nn: usize = 0;
+        var v: u16 = port;
+        if v == 0 {
+            num[0] = '0' as byte;
+            nn = 1;
+        } else {
+            while v > 0 && nn < 8 {
+                num[nn] = (48 +% ((v % (10 as u16)) as u16)) as byte;
+                v = v / (10 as u16);
+                nn = nn + 1;
+            }
+        }
+        while nn > 0 && g_self_addr_len < 127 {
+            nn = nn - 1;
+            g_self_addr[g_self_addr_len] = num[nn];
+            g_self_addr_len = g_self_addr_len + 1;
+        }
+    }
+}
+
+fn srv_self_addr_copy(out: &byte, cap: usize) usize {
+    var k: usize = 0;
+    while k < g_self_addr_len && k < cap {
+        out[k] = g_self_addr[k];
+        k = k + 1;
+    }
+    return k;
+}
+
+/// 把 `ip:port` 拆成 ip 文本 + 端口；失败返回 false。
+fn srv_split_addr(spec: &[byte], ip: &byte, ipcap: usize, ip_len: &usize, port: &u16) bool {
+    var colon: usize = spec.len;
+    var i: usize = 0;
+    while i < spec.len {
+        if spec[i] == (':' as byte) {
+            colon = i;
+        }
+        i = i + 1;
+    }
+    if colon == 0 || colon >= spec.len {
+        return false;
+    }
+    var k: usize = 0;
+    while k < colon && k < ipcap {
+        ip[k] = spec[k];
+        k = k + 1;
+    }
+    ip_len[0] = k;
+    var p: u16 = 0;
+    var dg: usize = 0;
+    k = colon + 1;
+    while k < spec.len {
+        const c: byte = spec[k];
+        if c < ('0' as byte) || c > ('9' as byte) {
+            return false;
+        }
+        p = p *% (10 as u16) +% ((c as u16) -% 48);
+        dg = dg + 1;
+        k = k + 1;
+    }
+    port[0] = p;
+    return dg > 0 && p > 0;
 }
 
 fn srv_uplink_setup(spec: &[byte]) void {
@@ -631,6 +742,9 @@ fn srv_route_of(req: &HsrvReq) i32 {
     }
     if srv_path_is(req, &"/v1/keys/revoke"[0: 15]) {
         return ROUTE_KEY_REVOKE;
+    }
+    if srv_path_is(req, &"/edge/proxy"[0: 11]) {
+        return ROUTE_EDGE_PROXY;
     }
     if srv_path_is(req, &"/node/status"[0: 12]) {
         return ROUTE_NODE_STATUS;
@@ -1253,6 +1367,10 @@ fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
         srv_me(c, stats);
         return;
     }
+    if c.route == ROUTE_EDGE_PROXY {
+        srv_edge_proxy(c, stats);
+        return;
+    }
     if c.route == ROUTE_NODE_STATUS {
         srv_node_status(c, stats);
         return;
@@ -1267,6 +1385,10 @@ fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
     }
     if c.route == ROUTE_ADMIN_JS {
         srv_admin_js(c, stats);
+        return;
+    }
+    if c.route == ROUTE_EDGE_PROXY {
+        srv_edge_proxy(c, stats);
         return;
     }
     if c.route == ROUTE_NODE_STATUS {
@@ -1847,8 +1969,10 @@ export fn serve_run(lfd: i32, stats: &ServeStats) !i32 {
             const ipn: usize = srv_uplink_copy(&ipb[0], 64);
             var nb: [byte: 64] = [0: 64];
             const nn: usize = srv_node_copy(&nb[0], 64);
+            var ab: [byte: 128] = [0: 128];
+            const an: usize = srv_self_addr_copy(&ab[0], 128);
             _ = uplink_register(ipb[0: ipn], g_uplink_port, nb[0: nn],
-                &"edge"[0: 4], &""[0: 0], 2000) catch {};
+                &"edge"[0: 4], ab[0: an], 2000) catch {};
             uplink_heartbeat(ipb[0: ipn], g_uplink_port, nb[0: nn], 0, 0, 2000) catch {};
         }
         // B2：每 3s 拉一次 config 快照（版本/epoch/归属），边缘节点据此本地路由。
@@ -3317,6 +3441,26 @@ fn srv_ctl_config(c: &SrvConn, stats: &ServeStats) void {
         i = i + 1;
     }
     jsonw_end_arr(&w);
+    var nn2: usize = 0;
+    var nodes2: [MetaNode: 32] = [];
+    nn2 = meta_node_list(&g_meta, &nodes2[0], 32) catch {
+        0 as usize;
+    };
+    jsonw_key(&w, &"nodes"[0: 5]);
+    jsonw_arr(&w);
+    var j: usize = 0;
+    while j < nn2 {
+        jsonw_obj(&w);
+        jsonw_key(&w, &"id"[0: 2]);
+        jsonw_str(&w, nodes2[j].id[0: nodes2[j].id_len]);
+        jsonw_key(&w, &"addr"[0: 4]);
+        jsonw_str(&w, nodes2[j].addr[0: nodes2[j].addr_len]);
+        jsonw_key(&w, &"status"[0: 6]);
+        jsonw_str(&w, nodes2[j].status[0: nodes2[j].status_len]);
+        jsonw_end_obj(&w);
+        j = j + 1;
+    }
+    jsonw_end_arr(&w);
     jsonw_end_obj(&w);
     srv_static(c, 200, jsonw_span(&w), keep);
 }
@@ -4050,4 +4194,120 @@ fn srv_node_status(c: &SrvConn, stats: &ServeStats) void {
     jsonw_bool(&w, g_uplink_ready);
     jsonw_end_obj(&w);
     srv_static(c, 200, jsonw_span(&w), keep);
+}
+
+
+/// B4：把请求代理给 slug 的归属节点（`?slug=&path=&session=`），失败清亲和后重试一次。
+fn srv_edge_proxy(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    if !g_meta_ready && !g_uplink_ready {
+        srv_static(c, 503, SRV_JSON_503, keep);
+        return;
+    }
+    var slug: [byte: 128] = [0: 128];
+    const sn: usize = srv_query_str(&c.path[0], c.path_len, &"slug"[0: 4], 4, &slug[0], 128);
+    var sess: [byte: 128] = [0: 128];
+    const ssn: usize = srv_query_str(&c.path[0], c.path_len, &"session"[0: 7], 7, &sess[0], 128);
+    var pth: [byte: 256] = [0: 256];
+    const pn: usize = srv_query_str(&c.path[0], c.path_len, &"path"[0: 4], 4, &pth[0], 256);
+    if sn == 0 || pn == 0 {
+        srv_static(c, 400, SRV_JSON_400, keep);
+        return;
+    }
+    var nb: [byte: 64] = [0: 64];
+    var nn: usize = 0;
+    if g_meta_ready {
+        nn = edge_route(&g_meta, slug[0: sn], sess[0: ssn], &nb[0], 64);
+    } else {
+        nn = edge_route_snapshot(slug[0: sn], sess[0: ssn], &nb[0], 64);
+    }
+    if nn == 0 {
+        srv_static(c, 404, SRV_JSON_404, keep);
+        return;
+    }
+    var self: [byte: 128] = [0: 128];
+    const selfn: usize = srv_self_addr_copy(&self[0], 128);
+    var nbaddr: [byte: 128] = [0: 128];
+    var an: usize = edge_addr_get(nb[0: nn], &nbaddr[0], 128);
+    if an == 0 && g_meta_ready {
+        // controller 本地可直接从 meta 查地址
+        var nodes: [MetaNode: 64] = [];
+        var cnt: usize = 0;
+        cnt = meta_node_list(&g_meta, &nodes[0], 64) catch {
+            0 as usize;
+        };
+        var i: usize = 0;
+        while i < cnt {
+            if nodes[i].id_len == nn && srv_slice_eq(nodes[i].id[0: nodes[i].id_len], nb[0: nn]) {
+                an = nodes[i].addr_len;
+                var k: usize = 0;
+                while k < an && k < 128 {
+                    nbaddr[k] = nodes[i].addr[k];
+                    k = k + 1;
+                }
+                break;
+            }
+            i = i + 1;
+        }
+    }
+    _ = selfn;
+    _ = self;
+    if an == 0 {
+        // 不知道归属节点地址：让调用方先查 /edge/route（避免误判 502）。
+        srv_static(c, 424, SRV_JSON_502, keep);
+        return;
+    }
+    var ipb: [byte: 64] = [0: 64];
+    var ipl: usize = 0;
+    var port: u16 = 0;
+    if !srv_split_addr(nbaddr[0: an], &ipb[0], 64, &ipl, &port) {
+        srv_static(c, 502, SRV_JSON_502, keep);
+        return;
+    }
+    var out: [byte: 16384] = [0: 16384];
+    var on: usize = 0;
+    const r1: !i32 = uplink_request(ipb[0: ipl], port, &"GET"[0: 3], pth[0: pn],
+        &""[0: 0], 2000, &out[0], 16384, &on);
+    var ok: bool = false;
+    var st: i32 = 0;
+    const st1: i32 = r1 catch {
+        0;
+    };
+    if st1 > 0 {
+        st = st1;
+        ok = true;
+    }
+    if !ok {
+        // 归属节点不可达：清亲和后按最新归属重试一次。
+        edge_fail(sess[0: ssn]);
+        var nb2: [byte: 64] = [0: 64];
+        var nn2: usize = 0;
+        if g_meta_ready {
+            nn2 = edge_route(&g_meta, slug[0: sn], sess[0: ssn], &nb2[0], 64);
+        } else {
+            nn2 = edge_route_snapshot(slug[0: sn], sess[0: ssn], &nb2[0], 64);
+        }
+        if nn2 == 0 || !srv_slice_eq(nb2[0: nn2], nb[0: nn]) {
+            var a2: [byte: 128] = [0: 128];
+            const a2n: usize = edge_addr_get(nb2[0: nn2], &a2[0], 128);
+            if a2n > 0 && srv_split_addr(a2[0: a2n], &ipb[0], 64, &ipl, &port) {
+                const r2: !i32 = uplink_request(ipb[0: ipl], port, &"GET"[0: 3], pth[0: pn],
+                    &""[0: 0], 2000, &out[0], 16384, &on);
+                const st2: i32 = r2 catch {
+                    0;
+                };
+                if st2 > 0 {
+                    st = st2;
+                    ok = true;
+                }
+            }
+        }
+    }
+    if !ok {
+        srv_static(c, 502, SRV_JSON_502, keep);
+        return;
+    }
+    _ = st;
+    srv_static(c, 200, out[0: on], keep);
 }

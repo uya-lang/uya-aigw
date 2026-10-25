@@ -162,6 +162,95 @@ export fn edge_snapshot_put(slug: &[byte], node: &[byte]) usize {
     return 1 as usize;
 }
 
+// ---- B4：节点地址表（供 edge 把请求代理给归属节点）----
+export const EDGE_ADDR_MAX: usize = 64;
+
+struct EdgeAddrRow {
+    used: bool,
+    id: [byte: EDGE_NODE_MAX],
+    id_len: usize,
+    addr: [byte: 128],
+    addr_len: usize,
+}
+
+var g_addr: [EdgeAddrRow: EDGE_ADDR_MAX] = [];
+
+fn addr_at(i: usize) &EdgeAddrRow {
+    if i >= 0 && i < 64 {
+        return &g_addr[i];
+    }
+    return &g_addr[0];
+}
+
+export fn edge_addr_clear() void {
+    var i: usize = 0;
+    while i < 64 {
+        addr_at(i).used = false;
+        addr_at(i).id_len = 0;
+        addr_at(i).addr_len = 0;
+        i = i + 1;
+    }
+}
+
+export fn edge_addr_put(id: &[byte], addr: &[byte]) usize {
+    if id.len == 0 || addr.len == 0 || id.len > EDGE_NODE_MAX || addr.len > 128 {
+        return 0 as usize;
+    }
+    var i: usize = 0;
+    var hit: usize = 64;
+    while i < 64 {
+        const r: &EdgeAddrRow = addr_at(i);
+        if r.used && r.id_len == id.len && edge_eq(r.id[0: r.id_len], id) {
+            hit = i;
+            break;
+        }
+        i = i + 1;
+    }
+    if hit == 64 {
+        i = 0;
+        while i < 64 && addr_at(i).used {
+            i = i + 1;
+        }
+        if i >= 64 {
+            return 0 as usize;
+        }
+        hit = i;
+    }
+    const r2: &EdgeAddrRow = addr_at(hit);
+    r2.used = true;
+    var k: usize = 0;
+    while k < id.len {
+        r2.id[k] = id[k];
+        k = k + 1;
+    }
+    r2.id_len = k;
+    k = 0;
+    while k < addr.len {
+        r2.addr[k] = addr[k];
+        k = k + 1;
+    }
+    r2.addr_len = k;
+    return 1 as usize;
+}
+
+/// 查节点地址，返回写入 out 的字节数（0 = 未知）。
+export fn edge_addr_get(id: &[byte], out: &byte, cap: usize) usize {
+    var i: usize = 0;
+    while i < 64 {
+        const r: &EdgeAddrRow = addr_at(i);
+        if r.used && r.id_len == id.len && edge_eq(r.id[0: r.id_len], id) {
+            var k: usize = 0;
+            while k < r.addr_len && k < cap {
+                out[k] = r.addr[k];
+                k = k + 1;
+            }
+            return k;
+        }
+        i = i + 1;
+    }
+    return 0 as usize;
+}
+
 export fn edge_snapshot_count() usize {
     var i: usize = 0;
     var n: usize = 0;

@@ -52,8 +52,9 @@ A4/A5/A8 进度（子项已完成记录见 `TODO_DONE.md`）：
 | B6 | 集群 e2e + 部署（1 controller + 3 node + 2 edge + nginx） | `cluster_e2e.sh` 全绿 | B1–B5 |
 
 进度（子项完成记录见 `TODO_DONE.md`）：
-- B4：edge 路由核心（slug 归属 + session 亲和 + 失败清缓存 + 快照兜底，21 断言）与
-  `GET /edge/route`、`/edge/fail` 已落地；HTTP/SSE 代理与 1k 并发待做。
+- B4：edge 路由核心（slug 归属 + session 亲和 + 失败清缓存 + 快照兜底，26 断言）、
+  `GET /edge/route`、`/edge/fail`、`GET /edge/proxy`（节点代理 + 失败清亲和重试）已落地；
+  SSE 转发与 1k 并发压测待做。
 - B5：幂等 ingest（`POST /controller/ingest`，重复批 `duplicate`）、区间重算、本地 spool、
   Key 吊销已完成；spool 自动消费循环待做。
 - B6：`tests/cluster_e2e.sh`（`make cluster-e2e`）已全绿 —— 1 controller + 3 node 真 uplink 注册、

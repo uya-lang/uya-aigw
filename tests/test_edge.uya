@@ -105,7 +105,25 @@ fn test_snapshot_vs_meta() !void {
     edge_snapshot_clear();
 }
 
+fn test_addr() !void {
+    edge_addr_clear();
+    var ab: [byte: 128] = [0: 128];
+    try assert_eq_i32(edge_addr_get(&"n1"[0: 2], &ab[0], 128) as i32, 0);
+    _ = edge_addr_put(&"n1"[0: 2], &"127.0.0.1:8001"[0: 14]);
+    _ = edge_addr_put(&"n2"[0: 2], &"127.0.0.1:8002"[0: 14]);
+    const n: usize = edge_addr_get(&"n1"[0: 2], &ab[0], 128);
+    try assert_eq_bool(eq(ab[0: n], &"127.0.0.1:8001"[0: 14]), true);
+    // 覆盖同 id 不新增
+    _ = edge_addr_put(&"n1"[0: 2], &"10.0.0.1:9"[0: 10]);
+    const n2: usize = edge_addr_get(&"n1"[0: 2], &ab[0], 128);
+    try assert_eq_bool(eq(ab[0: n2], &"10.0.0.1:9"[0: 10]), true);
+    try assert_eq_i32(edge_addr_put(&""[0: 0], &"x"[0: 1]) as i32, 0);
+    edge_addr_clear();
+    try assert_eq_i32(edge_addr_get(&"n1"[0: 2], &ab[0], 128) as i32, 0);
+}
+
 test "route_affinity" { run_test("route_affinity", test_route_affinity); }
 test "unknown" { run_test("unknown", test_unknown); }
 test "snapshot" { run_test("snapshot", test_snapshot); }
+test "addr" { run_test("addr", test_addr); }
 test "snapshot_vs_meta" { run_test("snapshot_vs_meta", test_snapshot_vs_meta); }
