@@ -258,12 +258,22 @@ kill "$NB_PID" 2>/dev/null || true
 wait "$NB_PID" 2>/dev/null || true
 NB_PID=""
 
+# 4j) C2：用量 CSV 导出
+CSVH=$(curl -s --max-time 5 -D - -o /dev/null -H "Authorization: Bearer $TOKEN" "$BASE/v1/usage.csv")
+echo "$CSVH" | grep -qi 'content-type: text/csv' || { echo "$CSVH" >&2; fail "csv ctype"; }
+CSV=$(curl -s --max-time 5 -H "Authorization: Bearer $TOKEN" "$BASE/v1/usage.csv")
+echo "$CSV" | head -1 | grep -q 'day,model,provider,period,requests' || { echo "$CSV" >&2; fail "csv header"; }
+echo "$CSV" | grep -q 'mock-model' || { echo "$CSV" >&2; fail "csv row"; }
+
 # 4i) C1：静态壳与前端脚本
 UI=$(curl -s --max-time 5 "$BASE/")
 echo "$UI" | grep -q 'id="login"' || { echo "$UI" >&2; fail "ui index"; }
 echo "$UI" | grep -q '/ui/app.js' || { echo "$UI" >&2; fail "ui script tag"; }
 UIJS=$(curl -s --max-time 5 "$BASE/ui/app.js")
 echo "$UIJS" | grep -q '/v1/keys/revoke' || { echo "$UIJS" >&2; fail "ui js"; }
+echo "$UI" | grep -q 'id="overview"' || { echo "$UI" >&2; fail "ui overview"; }
+echo "$UIJS" | grep -q '/v1/usage' || { echo "$UIJS" >&2; fail "ui usage"; }
+echo "$UIJS" | grep -q 'usage-table' || { echo "$UIJS" >&2; fail "ui usage table"; }
 CT=$(curl -s --max-time 5 -o /dev/null -w '%{content_type}' "$BASE/")
 case "$CT" in text/html*) ;; *) fail "ui content-type=$CT";; esac
 

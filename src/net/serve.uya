@@ -82,6 +82,7 @@ const ROUTE_RESPONSES: i32 = 14;
 const ROUTE_MCP: i32 = 15;
 const ROUTE_KEY_REVOKE: i32 = 24;
 const ROUTE_CTL_INGEST: i32 = 25;
+const ROUTE_USAGE_CSV: i32 = 28;
 const ROUTE_UI: i32 = 26;
 const ROUTE_UI_JS: i32 = 27;
 const ROUTE_CTL_EPOCH: i32 = 21;
@@ -588,6 +589,9 @@ fn srv_route_of(req: &HsrvReq) i32 {
     }
     if srv_path_is(req, &"/v1/me"[0: 6]) {
         return ROUTE_ME;
+    }
+    if srv_path_is(req, &"/v1/usage.csv"[0: 13]) {
+        return ROUTE_USAGE_CSV;
     }
     if srv_path_is(req, &"/ui/app.js"[0: 10]) {
         return ROUTE_UI_JS;
@@ -1163,6 +1167,10 @@ fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
     }
     if c.route == ROUTE_ME {
         srv_me(c, stats);
+        return;
+    }
+    if c.route == ROUTE_USAGE_CSV {
+        srv_usage_csv(c, stats);
         return;
     }
     if c.route == ROUTE_UI {
@@ -3383,4 +3391,97 @@ fn srv_ui_js(c: &SrvConn, stats: &ServeStats) void {
     var buf: [byte: 16384] = [0: 16384];
     const n: usize = ui_app_js(&buf[0], 16384);
     srv_static_ct(c, 200, buf[0: n], keep, SRV_CTYPE_JS[0: 22], 22);
+}
+
+
+// C2：用量 CSV 导出（与 /v1/usage 同一份汇总数据）。
+const SRV_CTYPE_CSV: &[byte] = &"text/csv; charset=utf-8"[0: 22];
+
+fn csv_put(b: &Buf, s: &[byte]) void {
+    _ = buf_append_slice(b, s);
+}
+
+fn csv_i64(b: &Buf, v: i64) void {
+    _ = buf_append_i64(b, v);
+}
+
+fn csv_field(b: &Buf, s: &[byte]) void {
+    _ = buf_append_slice(b, s);
+}
+
+fn srv_usage_csv(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    if !runtime_ready() {
+        srv_static(c, 503, SRV_JSON_503, keep);
+        return;
+    }
+    var tok: [byte: 256] = [0: 256];
+    const tn: usize = chat_bearer_span(&c.auth[0], c.auth_len, &tok[0], 256);
+    if tn == 0 {
+        srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    }
+    var key: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
+    store_verify_key(runtime_db(), tok[0: tn], &key) catch {
+        srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    };
+    const today: i64 = store_now() / (86400 as i64);
+    var from_day: i64 = srv_query_day(&c.path[0], c.path_len, &"from_day"[0: 8], 8);
+    if from_day < 0 {
+        from_day = today -% 6;
+    }
+    var to_day: i64 = srv_query_day(&c.path[0], c.path_len, &"to_day"[0: 6], 6);
+    if to_day < 0 {
+        to_day = today;
+    }
+    if from_day < 0 || to_day < from_day {
+        srv_static(c, 400, SRV_JSON_400, keep);
+        return;
+    }
+    var rows: [RollupRow: 64] = [];
+    var n: usize = 0;
+    n = rollup_query(runtime_db(), key.user_id, from_day, to_day, &rows[0], 64) catch {
+        srv_static(c, 502, SRV_JSON_502, keep);
+        return;
+    };
+    var b: Buf = buf_new(8192);
+    defer { buf_free(&b); }
+    if !buf_valid(&b) {
+        srv_static(c, 502, SRV_JSON_502, keep);
+        return;
+    }
+    csv_put(&b, &"day,model,provider,period,requests,input_tokens,output_tokens,cache_read_tokens,cost_nano,price_nano,profit_nano\n"[0: 105]);
+    var i: usize = 0;
+    while i < n {
+        csv_i64(&b, rows[i].day);
+        csv_put(&b, &","[0: 1]);
+        csv_field(&b, rows[i].model[0: rows[i].model_len]);
+        csv_put(&b, &","[0: 1]);
+        csv_field(&b, rows[i].provider[0: rows[i].provider_len]);
+        csv_put(&b, &","[0: 1]);
+        csv_field(&b, rows[i].period[0: rows[i].period_len]);
+        csv_put(&b, &","[0: 1]);
+        csv_i64(&b, rows[i].requests);
+        csv_put(&b, &","[0: 1]);
+        csv_i64(&b, rows[i].input_tokens);
+        csv_put(&b, &","[0: 1]);
+        csv_i64(&b, rows[i].output_tokens);
+        csv_put(&b, &","[0: 1]);
+        csv_i64(&b, rows[i].cache_read_tokens);
+        csv_put(&b, &","[0: 1]);
+        csv_i64(&b, rows[i].cost_nano);
+        csv_put(&b, &","[0: 1]);
+        csv_i64(&b, rows[i].price_nano);
+        csv_put(&b, &","[0: 1]);
+        csv_i64(&b, rows[i].price_nano -% rows[i].cost_nano);
+        csv_put(&b, &"\n"[0: 1]);
+        i = i + 1;
+    }
+    if b.len <= 0 || b.cap == 0 {
+        srv_static(c, 502, SRV_JSON_502, keep);
+        return;
+    }
+    srv_static_ct(c, 200, b.ptr[0: b.len], keep, SRV_CTYPE_CSV[0: 22], 22);
 }
