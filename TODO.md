@@ -91,6 +91,9 @@ C4 进度：Playground（流式指标）+ 账单预算（schema v8 budgets、`/v
 C5 进度：`/admin` 页 + 用户/供应商列表已落地（含 401 保护）；改价/绑定/审计日志待做。
 | C6 | e2e + 安全（CSRF/XSS/CSP/越权）+ 文档 | `make ui-e2e` 全绿 | C1–C5 |
 
+C6 进度：安全头（CSP/nosniff/Referrer-Policy/XFO）、XSS/越权断言、`make ui-e2e` 已落地；
+CSRF 说明（Bearer-only）与前后端联调文档见 `docs/STATUS.md`。
+
 ---
 
 ## 当前建议顺序

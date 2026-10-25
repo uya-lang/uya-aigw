@@ -686,10 +686,19 @@ fn srv_put(out: &byte, cap: usize, off: &usize, data: &[byte]) bool {
 }
 
 /// 组装静态回包（头 + body），并进入 WRITE。
+/// C6：HTML/JS 响应的安全头（CSP 只允许同源脚本，禁止内联；无 cookie 故无 CSRF 面）。
+const SRV_SEC_HEADERS: &[byte] = &"Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nX-Frame-Options: DENY\r\n"[0: 249];
+
 fn srv_static_ct(c: &SrvConn, status: i32, body: &[byte], keep: bool,
     ctype: &[byte], ctype_len: usize) void {
-    const n: usize = hsrv_resp_head(&c.out[0], SRV_OUT_CAP, status, ctype, ctype_len,
-        body.len as i64, false, keep);
+    var n: usize = 0;
+    if ctype_len == 23 || ctype_len == 22 {
+        n = hsrv_resp_head_extra(&c.out[0], SRV_OUT_CAP, status, ctype, ctype_len,
+            body.len as i64, false, keep, SRV_SEC_HEADERS[0: 249], 249);
+    } else {
+        n = hsrv_resp_head(&c.out[0], SRV_OUT_CAP, status, ctype, ctype_len,
+            body.len as i64, false, keep);
+    }
     var off2: usize = n;
     _ = srv_put(&c.out[0], SRV_OUT_CAP, &off2, body);
     c.out_len = off2;

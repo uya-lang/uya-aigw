@@ -308,6 +308,21 @@ echo "$UI" | grep -q 'id="billing"' || { echo "$UI" >&2; fail "ui billing"; }
 echo "$UIJS" | grep -q '/v1/budget' || { echo "$UIJS" >&2; fail "ui budget js"; }
 echo "$UIJS" | grep -q '/v1/chat/completions' || { echo "$UIJS" >&2; fail "ui playground js"; }
 echo "$UIJS" | grep -q '/v1/estimate' || { echo "$UIJS" >&2; fail "ui estimate js"; }
+HDR=$(curl -s --max-time 5 -D - -o /dev/null "$BASE/")
+echo "$HDR" | grep -qi "content-security-policy: default-src 'self'" || { echo "$HDR" >&2; fail "csp"; }
+echo "$HDR" | grep -qi 'x-content-type-options: nosniff' || { echo "$HDR" >&2; fail "nosniff"; }
+echo "$HDR" | grep -qi 'x-frame-options: DENY' || { echo "$HDR" >&2; fail "xfo"; }
+echo "$HDR" | grep -qi 'referrer-policy: no-referrer' || { echo "$HDR" >&2; fail "referrer"; }
+# XSS：前端只用 textContent 写用户数据（无 innerHTML 注入）
+echo "$UIJS" | grep -q 'textContent' || { echo "$UIJS" >&2; fail "xss textContent"; }
+if echo "$UIJS" | grep -q 'innerHTML='; then
+  if echo "$UIJS" | grep -v "innerHTML=''" | grep -q 'innerHTML='; then fail "xss innerHTML"; fi
+fi
+# 越权：撤别人的 Key / 无 admin key 访问管理接口都被拒
+RC=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $TOKEN" --data '{"key_id":99999}' "$BASE/v1/keys/revoke")
+[ "$RC" = "404" ] || fail "cross-user revoke expected 404 got $RC"
+RC=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$BASE/admin/users")
+[ "$RC" = "401" ] || fail "admin no-auth expected 401 got $RC"
 CT=$(curl -s --max-time 5 -o /dev/null -w '%{content_type}' "$BASE/")
 case "$CT" in text/html*) ;; *) fail "ui content-type=$CT";; esac
 

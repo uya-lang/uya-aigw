@@ -352,6 +352,14 @@ fn hsl_put_u64(out: &byte, cap: usize, off: &usize, v: u64) bool {
 /// 写响应头。`content_length` 为 -1 且 `chunked` 为真时写 chunked 头。
 export fn hsrv_resp_head(out: &byte, cap: usize, status: i32, ctype: &[byte],
     ctype_len: usize, content_length: i64, chunked: bool, keep_alive: bool) usize {
+    return hsrv_resp_head_extra(out, cap, status, ctype, ctype_len, content_length,
+        chunked, keep_alive, &""[0: 0], 0);
+}
+
+/// 同上，但在 Connection 之前插入额外响应头（安全头用）。
+export fn hsrv_resp_head_extra(out: &byte, cap: usize, status: i32, ctype: &[byte],
+    ctype_len: usize, content_length: i64, chunked: bool, keep_alive: bool,
+    extra: &[byte], extra_len: usize) usize {
     var off: usize = 0;
     _ = hsl_put(out, cap, &off, &"HTTP/1.1 "[0: 9], 9);
     _ = hsl_put_u64(out, cap, &off, status as u64);
@@ -374,6 +382,9 @@ export fn hsrv_resp_head(out: &byte, cap: usize, status: i32, ctype: &[byte],
         _ = hsl_put(out, cap, &off, &"Content-Length: "[0: 16], 16);
         _ = hsl_put_u64(out, cap, &off, content_length as u64);
         _ = hsl_put(out, cap, &off, &"\r\n"[0: 2], 2);
+    }
+    if extra_len > 0 {
+        _ = hsl_put(out, cap, &off, extra, extra_len);
     }
     if keep_alive {
         _ = hsl_put(out, cap, &off, &"Connection: keep-alive\r\n"[0: 24], 24);
