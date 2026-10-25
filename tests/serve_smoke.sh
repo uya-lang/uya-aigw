@@ -38,10 +38,10 @@ rm -f build/aigw
 build_aigw() {
   UYA_ROOT="$UYA_ROOT" "$UYA" build \
     src/foundation/buf.uya src/net/httpsrv.uya src/net/tcpx.uya src/net/serve.uya \
-    src/core/money.uya src/core/reqlog.uya src/core/dbx.uya src/cluster/meta.uya src/cluster/elect.uya src/cluster/uplink.uya src/cluster/edge.uya src/cluster/spool.uya src/cluster/ingest.uya src/net/ui.uya src/net/rsav.uya \
+    src/core/money.uya src/core/reqlog.uya src/core/dbx.uya src/cluster/meta.uya src/cluster/elect.uya src/cluster/uplink.uya src/cluster/edge.uya src/cluster/spool.uya src/cluster/ingest.uya src/cluster/shard.uya src/net/ui.uya src/net/rsav.uya \
     src/core/schema.uya src/core/store.uya src/core/budget.uya src/core/backup.uya src/core/journal.uya \
     src/core/runtime.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/rollup.uya \
-  src/core/billing.uya src/core/lb.uya src/core/responses.uya src/core/chat.uya src/providers/upstream.uya \
+  src/core/billing.uya src/core/batch.uya src/core/notify.uya src/core/upwait.uya src/core/lb.uya src/core/responses.uya src/core/chat.uya src/providers/upstream.uya \
   src/providers/upstream_cfg.uya \
     src/net/x509min.uya src/net/chainx.uya src/net/urlx.uya src/net/dnsx.uya \
     src/net/tlsx.uya src/net/tlsx_conn.uya src/net/httpc.uya src/net/ssex.uya \

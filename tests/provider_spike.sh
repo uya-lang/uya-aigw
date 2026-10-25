@@ -116,6 +116,7 @@ UYA_ROOT="$UYA_ROOT" "$UYA" build \
   src/net/urlx.uya src/net/dnsx.uya src/net/tcpx.uya src/net/tlsx.uya \
   src/net/tlsx_conn.uya src/net/httpc.uya src/net/ssex.uya src/net/httpc_pool.uya \
   src/net/proxyx.uya src/providers/http.uya src/providers/httpcall.uya \
+  src/core/upwait.uya \
   src/providers/upstream.uya \
   tests/provider_spike_main.uya -o build/provider_spike
 

@@ -48,6 +48,12 @@ USAGE = (b'{"usage":{"prompt_tokens":100000,"completion_tokens":50000,'
 SSE = (b'data: {"choices":[{"delta":{"content":"hello-from-mock"}}]}\n\n'
        b'data: ' + USAGE + b'\n\n'
        b'data: [DONE]\n\n')
+# A5：流式工具调用（arguments 分片），用于断言 output_item.added/done
+SSE_TOOL = (b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]}}]}\n\n'
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"city\\":"}}]}}]}\n\n'
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"SF\\"}"}}]}}]}\n\n'
+            b'data: ' + USAGE + b'\n\n'
+            b'data: [DONE]\n\n')
 class H(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     def log_message(self, *a): pass
@@ -56,6 +62,14 @@ class H(http.server.BaseHTTPRequestHandler):
         data = self.rfile.read(n)
         with open(reqfile, "wb") as f:
             f.write(data)
+        if "text/event-stream" in (self.headers.get("Accept") or ""):
+            data = SSE_TOOL if b'"tools"' in data else SSE
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data); self.wfile.flush()
+            return
         if b'"tools"' in data:
             tb = (b'{"id":"chatcmpl-tool","object":"chat.completion",'
                   b'"choices":[{"message":{"role":"assistant","content":null,'
@@ -68,19 +82,11 @@ class H(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(tb); self.wfile.flush()
             return
-        if "text/event-stream" in (self.headers.get("Accept") or ""):
-            data = SSE
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data); self.wfile.flush()
-        else:
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(BODY)))
-            self.end_headers()
-            self.wfile.write(BODY); self.wfile.flush()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(BODY)))
+        self.end_headers()
+        self.wfile.write(BODY); self.wfile.flush()
 srv = http.server.HTTPServer(("127.0.0.1", port), H)
 sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 sctx.load_cert_chain(cert, key)
@@ -104,10 +110,10 @@ AIGW_MODE=seed AIGW_DB="$SEED_DB" AIGW_UPSTREAM_PORT="$MPORT" ./build/seed >/dev
 
 UYA_ROOT="$UYA_ROOT" "$UYA" build \
   src/foundation/buf.uya src/net/httpsrv.uya src/net/tcpx.uya src/net/serve.uya \
-  src/core/money.uya src/core/reqlog.uya src/core/dbx.uya src/cluster/meta.uya src/cluster/elect.uya src/cluster/uplink.uya src/cluster/edge.uya src/cluster/spool.uya src/cluster/ingest.uya src/net/ui.uya src/net/rsav.uya \
+  src/core/money.uya src/core/reqlog.uya src/core/dbx.uya src/cluster/meta.uya src/cluster/elect.uya src/cluster/uplink.uya src/cluster/edge.uya src/cluster/spool.uya src/cluster/ingest.uya src/cluster/shard.uya src/net/ui.uya src/net/rsav.uya \
   src/core/schema.uya src/core/store.uya src/core/budget.uya src/core/backup.uya src/core/journal.uya \
   src/core/runtime.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/rollup.uya \
-  src/core/billing.uya src/core/lb.uya src/core/responses.uya src/core/chat.uya src/providers/upstream.uya \
+  src/core/billing.uya src/core/batch.uya src/core/notify.uya src/core/upwait.uya src/core/lb.uya src/core/responses.uya src/core/chat.uya src/providers/upstream.uya \
   src/providers/upstream_cfg.uya \
   src/net/x509min.uya src/net/chainx.uya src/net/urlx.uya src/net/dnsx.uya \
   src/net/tlsx.uya src/net/tlsx_conn.uya src/net/httpc.uya src/net/ssex.uya \
@@ -182,6 +188,20 @@ echo "$RS" | grep -q 'response.output_text.delta' || { echo "$RS" >&2; fail "res
 echo "$RS" | grep -q 'hello-from-mock' || { echo "$RS" >&2; fail "responses delta text"; }
 echo "$RS" | grep -q 'response.completed' || { echo "$RS" >&2; fail "responses completed"; }
 
+# 4b1c) A5 responses 流式工具事件：added → arguments.delta → done
+RST=$(curl -s -N --max-time 15 -X POST -H "Authorization: Bearer $TOKEN" \
+  -H 'Accept: text/event-stream' \
+  --data '{"model":"mock-model","stream":true,"input":"weather?","tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}]}' \
+  "$BASE/v1/responses")
+echo "$RST" | grep -q 'response.output_item.added' || { echo "$RST" >&2; fail "tool item added"; }
+echo "$RST" | grep -q '"type":"function_call"' || { echo "$RST" >&2; fail "tool item type"; }
+echo "$RST" | grep -q '"name":"get_weather"' || { echo "$RST" >&2; fail "tool item name"; }
+echo "$RST" | grep -q 'response.function_call_arguments.delta' || { echo "$RST" >&2; fail "tool args delta"; }
+echo "$RST" | grep -q 'response.output_item.done' || { echo "$RST" >&2; fail "tool item done"; }
+echo "$RST" | grep -q '"arguments":"{\\"city\\":\\"SF\\"}"' || { echo "$RST" >&2; fail "tool args accumulated"; }
+echo "$RST" | grep -q '"output":\[{"type":"function_call"' || { echo "$RST" >&2; fail "tool output array"; }
+echo "$RST" | grep -q 'response.completed' || { echo "$RST" >&2; fail "tool completed"; }
+
 # 4b2) models：公开列表来自 provider_models
 MJSON=$(curl -s --max-time 10 "http://127.0.0.1:$PORT/v1/models")
 echo "$MJSON" | grep -q '"id":"mock-model"' || { echo "$MJSON" >&2; fail "models list"; }
@@ -190,8 +210,8 @@ echo "$MJSON" | grep -q '"id":"mock-model"' || { echo "$MJSON" >&2; fail "models
 UJSON=$(curl -s --max-time 10 -H "Authorization: Bearer $TOKEN" \
   "http://127.0.0.1:$PORT/v1/usage?from_day=0&to_day=999999")
 echo "$UJSON" | grep -q '"mock-model"' || { echo "$UJSON" >&2; fail "usage model missing"; }
-echo "$UJSON" | grep -q '"requests":5' || { echo "$UJSON" >&2; fail "usage totals"; }
-echo "$UJSON" | grep -q '"profit_nano":660' || { echo "$UJSON" >&2; fail "usage profit"; }
+echo "$UJSON" | grep -q '"requests":6' || { echo "$UJSON" >&2; fail "usage totals"; }
+echo "$UJSON" | grep -q '"profit_nano":792' || { echo "$UJSON" >&2; fail "usage profit"; }
 
 # 4d) A7 管理 REST（--admin-key）
 AH=$(curl -s --max-time 5 -H 'Authorization: Bearer test-admin' "$BASE/admin/health")
@@ -312,6 +332,15 @@ echo "$AP2" | grep -q '"ok":true' || { echo "$AP2" >&2; fail "price entry put"; 
 APL=$(curl -s --max-time 5 -H 'Authorization: Bearer test-admin' "$BASE/admin/price-entries")
 echo "$APL" | grep -q '"model":"price-model"' || { echo "$APL" >&2; fail "price entry list"; }
 echo "$APL" | grep -q '"input":1000000' || { echo "$APL" >&2; fail "price entry rate"; }
+# C3：分时价编辑（schedule 入库 + 列表回显 + 非法规则拒绝）
+APS=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer test-admin' \
+  --data '{"model":"sched-model","provider":"","input":100,"output":200,"cache_read":0,"schedule":"workday 09:00-18:00 120%"}' "$BASE/admin/price-entries")
+echo "$APS" | grep -q '"ok":true' || { echo "$APS" >&2; fail "schedule price put"; }
+APL2=$(curl -s --max-time 5 -H 'Authorization: Bearer test-admin' "$BASE/admin/price-entries")
+echo "$APL2" | grep -q '"schedule":"workday 09:00-18:00 120%"' || { echo "$APL2" >&2; fail "schedule echoed"; }
+APBAD=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' -X POST -H 'Authorization: Bearer test-admin' \
+  --data '{"model":"sched-model","schedule":"bogus"}' "$BASE/admin/price-entries")
+[ "$APBAD" = "400" ] || fail "bad schedule expected 400, got $APBAD"
 AP401=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$BASE/admin/price-entries")
 [ "$AP401" = "401" ] || fail "price entries expected 401, got $AP401"
 # C5：审计日志记录改价与绑定
@@ -321,6 +350,19 @@ echo "$AA" | grep -q '"action":"bind"' || { echo "$AA" >&2; fail "audit bind"; }
 echo "$AA" | grep -q '"target":"price-model"' || { echo "$AA" >&2; fail "audit target"; }
 AA401=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$BASE/admin/audit")
 [ "$AA401" = "401" ] || fail "audit expected 401, got $AA401"
+# C5：更多审计动作（key.create / key.revoke / schedule.put，actor=user）
+NK=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $SESSION" --data '{"name":"audit-key"}' "$BASE/v1/keys")
+echo "$NK" | grep -q '"key":"aigw_sk_' || { echo "$NK" >&2; fail "audit key create"; }
+NKEYS=$(curl -s --max-time 5 -H "Authorization: Bearer $SESSION" "$BASE/v1/keys")
+NKID=$(echo "$NKEYS" | tr '}' '\n' | grep '"name":"audit-key"' | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+[ -n "$NKID" ] || { echo "$NKEYS" >&2; fail "audit key id"; }
+NRV=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $SESSION" --data "{\"key_id\":$NKID}" "$BASE/v1/keys/revoke")
+echo "$NRV" | grep -q '"ok":true' || { echo "$NRV" >&2; fail "audit key revoke"; }
+AA2=$(curl -s --max-time 5 -H 'Authorization: Bearer test-admin' "$BASE/admin/audit")
+echo "$AA2" | grep -q '"action":"key.create"' || { echo "$AA2" >&2; fail "audit key.create"; }
+echo "$AA2" | grep -q '"action":"key.revoke"' || { echo "$AA2" >&2; fail "audit key.revoke"; }
+echo "$AA2" | grep -q '"action":"schedule.put"' || { echo "$AA2" >&2; fail "audit schedule.put"; }
+echo "$AA2" | grep -q '"actor":"user"' || { echo "$AA2" >&2; fail "audit actor"; }
 
 # 4n) C2：请求列表 / 详情（分页）
 RL=$(curl -s --max-time 5 -H "Authorization: Bearer $TOKEN" "$BASE/v1/requests?limit=5&offset=0")
@@ -346,10 +388,13 @@ AU401=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$BASE/admin/users")
 ADM=$(curl -s --max-time 5 "$BASE/admin")
 echo "$ADM" | grep -q 'id="admin-audit"' || { echo "$ADM" >&2; fail "admin audit section"; }
 echo "$ADM" | grep -q 'id="admin-users"' || { echo "$ADM" >&2; fail "admin page"; }
+echo "$ADM" | grep -q 'id="pe-schedule"' || { echo "$ADM" >&2; fail "admin schedule input"; }
+echo "$ADM" | grep -q '价目表' || { echo "$ADM" >&2; fail "admin price table"; }
 ADMJ=$(curl -s --max-time 5 "$BASE/ui/admin.js")
 echo "$ADMJ" | grep -q '/admin/price-entries' || { echo "$ADMJ" >&2; fail "admin js pricing"; }
 echo "$ADMJ" | grep -q '/admin/bind' || { echo "$ADMJ" >&2; fail "admin js bind"; }
 echo "$ADMJ" | grep -q '/admin/providers' || { echo "$ADMJ" >&2; fail "admin js"; }
+echo "$ADMJ" | grep -q 'pe-schedule' || { echo "$ADMJ" >&2; fail "admin js schedule"; }
 
 # 4l) C4：预算设置与告警（当月已用来自 usage_daily）
 BG=$(curl -s --max-time 5 -H "Authorization: Bearer $TOKEN" "$BASE/v1/budget")
@@ -358,6 +403,14 @@ BS=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $TOKEN" --data '{"mo
 echo "$BS" | grep -q '"over_budget":true' || { echo "$BS" >&2; fail "budget over"; }
 BS2=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $TOKEN" --data '{"monthly_nano":100000000}' "$BASE/v1/budget")
 echo "$BS2" | grep -q '"over_budget":false' || { echo "$BS2" >&2; fail "budget under"; }
+# C4：站内通知（预算超额写一条，同月不重复；无 token 401）
+NT=$(curl -s --max-time 5 -H "Authorization: Bearer $TOKEN" "$BASE/v1/notifications")
+echo "$NT" | grep -q '"kind":"budget.over"' || { echo "$NT" >&2; fail "notify budget"; }
+echo "$NT" | grep -q '"limit_nano":1' || { echo "$NT" >&2; fail "notify limit"; }
+NTN=$(echo "$NT" | grep -c '"kind":"budget.over"')
+[ "$NTN" = "1" ] || fail "notify dedup count=$NTN"
+NT401=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$BASE/v1/notifications")
+[ "$NT401" = "401" ] || fail "notify expected 401, got $NT401"
 
 # 4k) C3：费用估算（价格来自 seed 的 sell 价目）
 EST=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $TOKEN" \
@@ -388,6 +441,8 @@ echo "$UI" | grep -q 'id="playground"' || { echo "$UI" >&2; fail "ui playground"
 echo "$UI" | grep -q 'id="req-table"' || { echo "$UI" >&2; fail "ui requests"; }
 echo "$UI" | grep -q 'id="billing"' || { echo "$UI" >&2; fail "ui billing"; }
 echo "$UIJS" | grep -q '/v1/budget' || { echo "$UIJS" >&2; fail "ui budget js"; }
+echo "$UI" | grep -q 'id="notifications"' || { echo "$UI" >&2; fail "ui notifications"; }
+echo "$UIJS" | grep -q '/v1/notifications' || { echo "$UIJS" >&2; fail "ui notifications js"; }
 echo "$UIJS" | grep -q '/v1/chat/completions' || { echo "$UIJS" >&2; fail "ui playground js"; }
 echo "$UIJS" | grep -q '/v1/estimate' || { echo "$UIJS" >&2; fail "ui estimate js"; }
 HDR=$(curl -s --max-time 5 -D - -o /dev/null "$BASE/")
@@ -415,10 +470,31 @@ echo "$I1" | grep -q '"applied":2' || { echo "$I1" >&2; fail "ingest applied"; }
 I2=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer test-admin' --data "$ING" "$BASE/controller/ingest")
 echo "$I2" | grep -q '"duplicate":2' || { echo "$I2" >&2; fail "ingest duplicate"; }
 
+# 4y) A4：上游事件驱动等待下的 p99（20 次顺序 chat；上游是本地 TLS mock）
+LAT="$TMP/lat.txt"
+: > "$LAT"
+for i in $(seq 1 20); do
+  curl -s --max-time 10 -o /dev/null -w '%{time_total}\n' -X POST \
+    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+    --data '{"model":"mock-model","messages":[{"role":"user","content":"ping"}]}' \
+    "$BASE/v1/chat/completions" >> "$LAT"
+done
+P99=$(sort -n "$LAT" | awk '{a[NR]=$1} END{print a[int(NR*0.99)]}')
+AVG=$(awk '{s+=$1} END{printf "%.4f", s/NR}' "$LAT")
+awk -v p="$P99" 'BEGIN{exit !(p>0 && p<1.0)}' || fail "chat p99=$P99"
+echo "CHAT-LAT n=20 avg=${AVG}s p99=${P99}s"
+
 # 5) 停机后查账本
 kill "$SRV_PID" 2>/dev/null || true
 wait "$SRV_PID" 2>/dev/null || true
 SRV_PID=""
-COUNT=$(AIGW_MODE=count AIGW_DB="$SEED_DB" ./build/seed | sed -n 's/^COUNT=//p')
-[ "$COUNT" = "11" ] || fail "usage_ledger count=$COUNT"
+# B5：controller 分片后账本在 usage-<k>.db；逐库求和（不含则不重复计）。
+COUNT=0
+for db in "$SEED_DB" "$TMP/data"/usage-*.db; do
+  [ -f "$db" ] || continue
+  C=$(AIGW_MODE=count AIGW_DB="$db" ./build/seed | sed -n 's/^COUNT=//p')
+  [ -n "$C" ] || fail "count db=$db"
+  COUNT=$((COUNT + C))
+done
+[ "$COUNT" = "32" ] || fail "usage_ledger count=$COUNT"
 echo "CHAT-ALL-OK status=$CODE count=$COUNT"

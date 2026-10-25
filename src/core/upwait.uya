@@ -1,0 +1,108 @@
+// src/core/upwait.uya — A4 上游异步化：用 epoll 事件驱动等待 `Future<!i32>`
+//
+// 背景：`std.async.block_on` 在 Pending 时原地忙轮询（waker 登记的 fd 兴趣被丢掉），
+// 上游 TLS 握手 / 等响应期间会烧满一个核，p99 抖动大。这里实现等价的 block_on：
+// Pending 时把 waker 当前登记的 fd（可读/可写/双向）加入 epoll，阻塞到就绪后再 poll。
+//
+// 语义与 `std.block_on` 一致：Future Ready 就返回；不改变任何调用方的 future 代码。
+// 上游 future 自带 deadline，epoll 超时后会重新 poll，由 future 决定是否报超时。
+
+use std.async;
+use libc.syscall;
+
+const UPWAIT_TIMEOUT_MS: i32 = 5000;
+const UPWAIT_SLEEP_NS: i64 = 1000000;
+const UPWAIT_SLOTS: i32 = 4;
+
+/// 保命路径：epoll 建不出来时退回忙轮询（行为与 std.block_on 相同）。
+fn wait_i32_busy(f: Future<!i32>) !i32 {
+    var w: Waker = Waker{};
+    while true {
+        w.reset();
+        w.clear_io_interest();
+        const p: Poll<!i32> = f.poll(&w);
+        match p {
+            .Ready(v) => { return v; },
+            .Pending(_) => {},
+        };
+    }
+}
+
+/// 事件驱动地跑一个 `Future<!i32>` 到 Ready。
+export fn wait_i32(f: Future<!i32>) !i32 {
+    const epfd: i32 = sys_epoll_create1(EPOLL_CLOEXEC) catch {
+        return wait_i32_busy(f);
+    };
+    defer { _ = sys_close(epfd) catch {}; }
+    var w: Waker = Waker{};
+    var evs: [EpollEvent: 8] = [];
+    while true {
+        w.reset();
+        w.clear_io_interest();
+        const p: Poll<!i32> = f.poll(&w);
+        match p {
+            .Ready(v) => { return v; },
+            .Pending(_) => {},
+        };
+        // 把本轮 poll 登记的 fd 兴趣转成 epoll 注册（最多 4 槽）。
+        var reg: [i32: 4] = [0 - 1, 0 - 1, 0 - 1, 0 - 1];
+        var nreg: i32 = 0;
+        var i: i32 = 0;
+        while i < w._io_slot_count && i < UPWAIT_SLOTS {
+            const fd: i32 = w._io_slot_fds[i];
+            const interest: i32 = w._io_slot_interests[i];
+            if fd >= 0 && nreg < 4 {
+                var mask: u32 = 0;
+                if interest == 1 || interest == 3 {
+                    mask = mask | (EPOLLIN as u32);
+                }
+                if interest == 2 || interest == 3 {
+                    mask = mask | (EPOLLOUT as u32);
+                }
+                if mask == 0 {
+                    mask = EPOLLIN as u32;
+                }
+                var ev: EpollEvent = epoll_event_with_fd(mask, fd);
+                const ar: !i32 = sys_epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
+                var added: bool = true;
+                _ = ar catch {
+                    added = false;
+                    0;
+                };
+                if added {
+                    reg[nreg] = fd;
+                    nreg = nreg + 1;
+                }
+            }
+            i = i + 1;
+        }
+        // 没有 fd 兴趣但绑了 eventfd：等 wake 通知。
+        if nreg == 0 && w._event_fd_bound != 0 && w._event_fd >= 0 && nreg < 4 {
+            const evfd: i32 = w._event_fd;
+            var ev: EpollEvent = epoll_event_with_fd(EPOLLIN as u32, evfd);
+            _ = sys_epoll_ctl(epfd, EPOLL_CTL_ADD, evfd, &ev) catch {
+                0;
+            };
+            reg[nreg] = evfd;
+            nreg = nreg + 1;
+        }
+        if nreg > 0 {
+            const r: !i32 = sys_epoll_wait(epfd, &evs[0], 8, UPWAIT_TIMEOUT_MS);
+            _ = r catch {
+                0;
+            };
+            var j: i32 = 0;
+            while j < nreg {
+                _ = sys_epoll_ctl_del(epfd, reg[j]) catch {};
+                j = j + 1;
+            }
+        } else {
+            // 未来没有任何 I/O 关注（纯计时器）：小睡 1ms 再 poll，避免空转。
+            var nap: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: UPWAIT_SLEEP_NS };
+            var rem: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+            _ = sys_nanosleep(&nap, &rem) catch {
+                0;
+            };
+        }
+    }
+}

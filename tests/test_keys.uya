@@ -77,5 +77,31 @@ fn test_revoke_ownership() !void {
     try assert_eq_bool(try store_revoke_key_owned(&d, rows[0].key_id, a.id, T0), true);
 }
 
+fn test_fast_cache() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    var u: StoreUser = StoreUser{ id: 0, status: 0, found: false };
+    try store_create_user(&d, &"c@example.com"[0: 13], &"u1"[0: 2], T0, &u);
+    var tok: [byte: 64] = [0: 64];
+    const tn: usize = try store_create_key(&d, u.id, &"k"[0: 1], T0, &tok[0], 64);
+    var k1: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
+    try store_verify_key_fast(&d, tok[0: tn], T0, &k1);
+    try assert_eq_i64(k1.user_id, u.id);
+    // 命中缓存（TTL 内重复校验结果一致）
+    var k2: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
+    try store_verify_key_fast(&d, tok[0: tn], T0 + 1, &k2);
+    try assert_eq_i64(k2.key_id, k1.key_id);
+    // 撤销后缓存失效 → 校验失败
+    try assert_eq_bool(try store_revoke_key_owned(&d, k1.key_id, u.id, T0 + 2), true);
+    var k3: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
+    var bad: bool = false;
+    store_verify_key_fast(&d, tok[0: tn], T0 + 3, &k3) catch {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+}
+
 test "list_and_revoke" { run_test("list_and_revoke", test_list_and_revoke); }
 test "revoke_ownership" { run_test("revoke_ownership", test_revoke_ownership); }
+test "fast_cache" { run_test("fast_cache", test_fast_cache); }

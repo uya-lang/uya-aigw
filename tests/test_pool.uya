@@ -2,6 +2,7 @@
 use std.testing.assert_eq_i32;
 use std.testing.assert_eq_bool;
 use std.testing.run_test;
+use libc.syscall;
 
 const CMD: &[byte] = &"python3 tests/plugin_echo.py"[0: 28];
 
@@ -128,8 +129,79 @@ fn test_cancel() !void {
     plugin_pool_shutdown();
 }
 
+const PING1: &[byte] = &"{\"id\":1,\"method\":\"ping\"}\n"[0: 25];
+const PING2: &[byte] = &"{\"id\":2,\"method\":\"ping\"}\n"[0: 25];
+const SLOW1: &[byte] = &"{\"id\":3,\"method\":\"slow\"}\n"[0: 25];
+
+fn contains(hay: &[byte], needle: &[byte]) bool {
+    if needle.len == 0 || hay.len < needle.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i + needle.len <= hay.len {
+        var j: usize = 0;
+        var same: bool = true;
+        while j < needle.len {
+            if hay[i + j] != needle[j] {
+                same = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if same {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn test_rebind() !void {
+    plugin_pool_shutdown();
+    try plugin_pool_init_at(CMD, 1, 2, 60000, 500, 9000);
+    const a: i32 = try plugin_pool_acquire(9000);
+    const pa: i32 = plugin_pool_pid_of(a);
+    try assert_eq_i32(plugin_pool_state_of(a), PLUGIN_POOL_STATE_BUSY);
+    // 模拟供应商插件被外部杀掉
+    _ = sys_kill(pa as i64, 9) catch { 0; };
+    var nap: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 30000000 };
+    var rem: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+    _ = sys_nanosleep(&nap, &rem) catch { 0; };
+
+    // 同一槽位调用：检测到 EOF/EPIPE → 收尸 → 重绑 → 重试成功
+    var idx: i32 = a;
+    var line: [byte: 128] = [0: 128];
+    const n: usize = try plugin_pool_call(&idx, PING1, &line[0], 128, 5000, 9001);
+    try assert_eq_bool(n > 0, true);
+    try assert_eq_bool(contains(line[0: n], &"\"pong\""[0: 6]), true);
+    try assert_eq_i32(idx, a);
+    try assert_eq_bool(plugin_pool_pid_of(idx) != pa, true);
+    try assert_eq_i32(plugin_pool_state_of(idx), PLUGIN_POOL_STATE_BUSY);
+    // 重绑后的进程继续服务同一个槽
+    var line2: [byte: 128] = [0: 128];
+    const n2: usize = try plugin_pool_call(&idx, PING2, &line2[0], 128, 5000, 9002);
+    try assert_eq_bool(contains(line2[0: n2], &"pong"[0: 4]), true);
+    plugin_pool_release(idx, 9003);
+
+    // 超时只是慢，不算进程坏：call 返回超时但 pid/状态不变
+    const b: i32 = try plugin_pool_acquire(9700); // 越过上一次崩溃的退避窗口
+    const pb: i32 = plugin_pool_pid_of(b);
+    var idx2: i32 = b;
+    var to: bool = false;
+    _ = plugin_pool_call(&idx2, SLOW1, &line[0], 128, 150, 9701) catch |_| {
+        to = true;
+        0 as usize;
+    };
+    try assert_eq_bool(to, true);
+    try assert_eq_i32(plugin_pool_pid_of(idx2), pb);
+    try assert_eq_i32(plugin_pool_state_of(idx2), PLUGIN_POOL_STATE_BUSY);
+    plugin_pool_cancel(idx2);
+    plugin_pool_shutdown();
+}
+
 test "reuse" { run_test("reuse", test_reuse); }
 test "max_and_exhausted" { run_test("max_and_exhausted", test_max_and_exhausted); }
 test "crash_backoff" { run_test("crash_backoff", test_crash_backoff); }
 test "idle_eviction" { run_test("idle_eviction", test_idle_eviction); }
 test "cancel" { run_test("cancel", test_cancel); }
+test "rebind" { run_test("rebind", test_rebind); }

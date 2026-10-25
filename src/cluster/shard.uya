@@ -1,0 +1,146 @@
+// src/cluster/shard.uya — B5 usage 分片：controller 的账本按 `hash(user_id) % K` 落到
+// `<data_dir>/usage-<k>.db`（K=4），每个分片是独立 SQLite（同 schema）。
+//
+// 设计要点：
+//   * 只有 controller 调 `shard_begin`；node 仍用本地 runtime DB，行为不变。
+//   * 路由是纯函数 `shard_of`：node 与 controller 用同一个 uid 得到同一个 k，便于对账。
+//   * `shard_active()` 供 journal 重放 / ingest 判断是否需要分片路由。
+
+export const SHARD_K: i32 = 4;
+
+export error ShardFailed;
+
+var g_on: bool = false;
+var g_db0: Db = Db{ h: null };
+var g_db1: Db = Db{ h: null };
+var g_db2: Db = Db{ h: null };
+var g_db3: Db = Db{ h: null };
+
+/// 分片是否已启用（controller 启动时 `shard_begin` 之后为 true）。
+export fn shard_active() bool {
+    return g_on;
+}
+
+/// `hash(user_id) % K`：Knuth 乘法散列，纯函数、跨进程稳定。
+export fn shard_of(user_id: i64) i32 {
+    var x: u64 = user_id as u64;
+    x = x *% (2654435761 as u64);
+    return (x % (SHARD_K as u64)) as i32;
+}
+
+/// `<dir>/usage-<k>.db`；容量不足返回 0。
+export fn shard_path(dir: &[byte], k: i32, out: &byte, cap: usize) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while i < dir.len && n < cap {
+        out[n] = dir[i];
+        n = n + 1;
+        i = i + 1;
+    }
+    const suffix: &[byte] = &"/usage-"[0: 7];
+    i = 0;
+    while i < suffix.len && n < cap {
+        out[n] = suffix[i];
+        n = n + 1;
+        i = i + 1;
+    }
+    if n >= cap {
+        return 0;
+    }
+    var kk: i32 = k;
+    if kk < 0 || kk > 9 {
+        kk = 0;
+    }
+    out[n] = (48 +% kk) as byte;
+    n = n + 1;
+    const tail: &[byte] = &".db"[0: 3];
+    i = 0;
+    while i < tail.len && n < cap {
+        out[n] = tail[i];
+        n = n + 1;
+        i = i + 1;
+    }
+    return n;
+}
+
+/// 打开（或返回已打开的）第 k 个分片。
+export fn shard_db(k: i32) &Db {
+    if k == 1 {
+        return &g_db1;
+    }
+    if k == 2 {
+        return &g_db2;
+    }
+    if k == 3 {
+        return &g_db3;
+    }
+    return &g_db0;
+}
+
+/// 按用户路由到分片。
+export fn shard_db_for(user_id: i64) &Db {
+    return shard_db(shard_of(user_id));
+}
+
+fn shard_open(dir: &[byte], k: i32) !Db {
+    var p: [byte: 512] = [0: 512];
+    const pn: usize = shard_path(dir, k, &p[0], 512);
+    if pn == 0 {
+        return error.ShardFailed;
+    }
+    var db: Db = Db{ h: null };
+    _ = schema_open(&db, p[0: pn]) catch {
+        dbx_close(&db);
+        return error.ShardFailed;
+    };
+    return db;
+}
+
+/// controller 启动时打开全部分片（数据目录不存在则失败）。
+export fn shard_begin(dir: &[byte]) !void {
+    if g_on {
+        return;
+    }
+    if dir.len == 0 {
+        return error.ShardFailed;
+    }
+    g_db0 = shard_open(dir, 0) catch {
+        shard_end();
+        return error.ShardFailed;
+    };
+    g_db1 = shard_open(dir, 1) catch {
+        shard_end();
+        return error.ShardFailed;
+    };
+    g_db2 = shard_open(dir, 2) catch {
+        shard_end();
+        return error.ShardFailed;
+    };
+    g_db3 = shard_open(dir, 3) catch {
+        shard_end();
+        return error.ShardFailed;
+    };
+    g_on = true;
+    return;
+}
+
+/// 关闭全部分片（停机/测试清理用）。
+export fn shard_end() void {
+    if g_db0.h != null {
+        dbx_close(&g_db0);
+    }
+    if g_db1.h != null {
+        dbx_close(&g_db1);
+    }
+    if g_db2.h != null {
+        dbx_close(&g_db2);
+    }
+    if g_db3.h != null {
+        dbx_close(&g_db3);
+    }
+    g_db0 = Db{ h: null };
+    g_db1 = Db{ h: null };
+    g_db2 = Db{ h: null };
+    g_db3 = Db{ h: null };
+    g_on = false;
+}

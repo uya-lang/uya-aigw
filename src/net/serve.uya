@@ -101,6 +101,7 @@ const ROUTE_ESTIMATE: i32 = 29;
 const ROUTE_USAGE_CSV: i32 = 28;
 const ROUTE_UI: i32 = 26;
 const ROUTE_UI_JS: i32 = 27;
+const ROUTE_NOTIFICATIONS: i32 = 45;
 const ROUTE_CTL_EPOCH: i32 = 21;
 const ROUTE_CTL_ASSIGN: i32 = 22;
 const ROUTE_CTL_DRAIN: i32 = 23;
@@ -537,7 +538,17 @@ fn srv_stop_requested() i32 {
 }
 
 /// 单调时钟毫秒。取不到时返回 0（SSE 会退化成每轮都推，不影响正确性）。
-fn srv_now_ms() u64 {
+/// A4：查询账本前先刷批量队列，保证「刚请求完就能查到」。
+fn srv_batch_sync() void {
+    if !batch_ready() {
+        return;
+    }
+    _ = batch_flush() catch {
+        0 as usize;
+    };
+}
+
+export fn srv_now_ms() u64 {
     var ts: TimeSpec = TimeSpec{};
     const r: !i32 = sys_clock_gettime(SRV_CLOCK_MONOTONIC, &ts);
     _ = r catch {
@@ -860,6 +871,9 @@ fn srv_route_of(req: &HsrvReq) i32 {
     if srv_path_is(req, &"/v1/budget"[0: 10]) {
         return ROUTE_BUDGET;
     }
+    if srv_path_is(req, &"/v1/notifications"[0: 17]) {
+        return ROUTE_NOTIFICATIONS;
+    }
     if srv_path_is(req, &"/v1/estimate"[0: 12]) {
         return ROUTE_ESTIMATE;
     }
@@ -1005,7 +1019,7 @@ fn srv_chat_stream(c: &SrvConn, plan: &ChatPlan, cfg: &const HttppConfig, nowu: 
     htc_call_init(&call);
     defer { htc_call_free(&call); }
     const deadline: u64 = nowu +% 10000;
-    const o: !i32 = block_on<i32>(htc_open_async(cfg, &g_up_ctx, &"POST"[0: 4],
+    const o: !i32 = wait_i32(htc_open_async(cfg, &g_up_ctx, &"POST"[0: 4],
         plan.path[0: plan.path_len], plan.payload[0: plan.payload_len], true, nowu, deadline, &call));
     const orc: i32 = o catch |_| {
         lb_report(plan.provider_id, false, store_now());
@@ -1040,7 +1054,7 @@ fn srv_chat_stream(c: &SrvConn, plan: &ChatPlan, cfg: &const HttppConfig, nowu: 
     var usage_found: bool = false;
     while events < 4096 && !done {
         var has: bool = false;
-        const r: !i32 = block_on<i32>(htc_next_event_async(&call, &has, 5000 as u64));
+        const r: !i32 = wait_i32(htc_next_event_async(&call, &has, 5000 as u64));
         const rr: i32 = r catch |_| {
             break;
         };
@@ -1097,11 +1111,10 @@ fn srv_chat_stream(c: &SrvConn, plan: &ChatPlan, cfg: &const HttppConfig, nowu: 
             0 as usize;
         };
         if ridn > 0 {
-            var dirbuf: [byte: 256] = [0: 256];
-            const dn: usize = runtime_dir_copy(&dirbuf[0], 256);
             var settle: BillingResult = BillingResult{ cost_nano: 0, price_nano: 0, rate_version: 0, duplicate: false, found: false };
-            billing_settle(runtime_db(), dirbuf[0: dn], rid[0: ridn], user_id,
-                store_now(), 0, plan.model[0: plan.model_len],
+            // A4：只查价 + 入队，批量落库在事件循环里做
+            billing_settle_deferred(rid[0: ridn], user_id, store_now(), 0,
+                plan.model[0: plan.model_len],
                 plan.provider_name[0: plan.provider_name_len], &usage, &settle) catch {};
         }
     }
@@ -1200,8 +1213,67 @@ fn srv_query_day(path: &const byte, n: usize, key: &const byte, kn: usize) i64 {
 }
 
 /// A6：/v1/usage 读 usage_daily 汇总（按天，用户级）。
+/// B5：把一行 rollup 拷到目标（结构体含数组，逐字段/逐字节复制）。
+fn srv_rollup_copy(dst: &RollupRow, src: &RollupRow) void {
+    dst.day = src.day;
+    dst.user_id = src.user_id;
+    dst.model_len = src.model_len;
+    dst.provider_len = src.provider_len;
+    dst.period_len = src.period_len;
+    dst.requests = src.requests;
+    dst.input_tokens = src.input_tokens;
+    dst.output_tokens = src.output_tokens;
+    dst.cache_read_tokens = src.cache_read_tokens;
+    dst.cost_nano = src.cost_nano;
+    dst.price_nano = src.price_nano;
+    var i: usize = 0;
+    while i < ROLLUP_MODEL_MAX {
+        dst.model[i] = src.model[i];
+        i = i + 1;
+    }
+    i = 0;
+    while i < ROLLUP_PROVIDER_MAX {
+        dst.provider[i] = src.provider[i];
+        i = i + 1;
+    }
+    i = 0;
+    while i < ROLLUP_PERIOD_MAX {
+        dst.period[i] = src.period[i];
+        i = i + 1;
+    }
+}
+
+/// B5：controller 分片模式下合并各分片；node/单机直接查 runtime DB。
+fn srv_rollup_query(uid: i64, from_day: i64, to_day: i64, out: &RollupRow,
+    cap: usize) usize {
+    if !shard_active() {
+        return rollup_query(runtime_db(), uid, from_day, to_day, out, cap) catch {
+            0 as usize;
+        };
+    }
+    var n: usize = 0;
+    var k: i32 = 0;
+    while k < SHARD_K {
+        if uid <= 0 || shard_of(uid) == k {
+            var part: [RollupRow: 64] = [];
+            const pn: usize = rollup_query(shard_db(k), uid, from_day, to_day, &part[0], 64) catch {
+                0 as usize;
+            };
+            var j: usize = 0;
+            while j < pn && j < 64 && n < cap {
+                srv_rollup_copy(&out[n], &part[j]);
+                n = n + 1;
+                j = j + 1;
+            }
+        }
+        k = k + 1;
+    }
+    return n;
+}
+
 fn srv_usage(c: &SrvConn, stats: &ServeStats) void {
     const keep: bool = c.keep;
+    srv_batch_sync();
     stats.requests = stats.requests +% 1;
     if !runtime_ready() {
         srv_static(c, 503, SRV_JSON_503, keep);
@@ -1214,7 +1286,8 @@ fn srv_usage(c: &SrvConn, stats: &ServeStats) void {
         return;
     }
     var key: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
-    store_verify_key(runtime_db(), tok[0: tn], &key) catch {
+    // A4 快路径：同一 Key 的连续请求走单槽缓存（TTL 2s），省一次 DB 校验。
+    store_verify_key_fast(runtime_db(), tok[0: tn], store_now(), &key) catch {
         srv_static(c, 401, SRV_JSON_401, keep);
         return;
     };
@@ -1233,10 +1306,7 @@ fn srv_usage(c: &SrvConn, stats: &ServeStats) void {
     }
     var rows: [RollupRow: 64] = [];
     var n: usize = 0;
-    n = rollup_query(runtime_db(), key.user_id, from_day, to_day, &rows[0], 64) catch {
-        srv_static(c, 502, SRV_JSON_502, keep);
-        return;
-    };
+    n = srv_rollup_query(key.user_id, from_day, to_day, &rows[0], 64);
     var w: JsonW = JsonW{};
     jsonw_init(&w);
     jsonw_obj(&w);
@@ -1331,7 +1401,8 @@ fn srv_chat(c: &SrvConn, stats: &ServeStats) void {
         return;
     }
     var key: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
-    store_verify_key(runtime_db(), tok[0: tn], &key) catch {
+    // A4 快路径：同一 Key 的连续请求走单槽缓存（TTL 2s），省一次 DB 校验。
+    store_verify_key_fast(runtime_db(), tok[0: tn], store_now(), &key) catch {
         srv_static(c, 401, SRV_JSON_401, keep);
         return;
     };
@@ -1400,9 +1471,7 @@ fn srv_chat(c: &SrvConn, stats: &ServeStats) void {
             return;
         };
         var settle: BillingResult = BillingResult{ cost_nano: 0, price_nano: 0, rate_version: 0, duplicate: false, found: false };
-        var dirbuf: [byte: 256] = [0: 256];
-        const dn: usize = runtime_dir_copy(&dirbuf[0], 256);
-        chat_settle(runtime_db(), dirbuf[0: dn], rid[0: ridn], key.user_id, store_now(), 0,
+        chat_settle_deferred(rid[0: ridn], key.user_id, store_now(), 0,
             &plan, resp[0: rn], &settle) catch {
             srv_static(c, 502, SRV_JSON_502, keep);
             return;
@@ -1573,6 +1642,10 @@ fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
     }
     if c.route == ROUTE_BUDGET {
         srv_budget(c, stats);
+        return;
+    }
+    if c.route == ROUTE_NOTIFICATIONS {
+        srv_notifications(c, stats);
         return;
     }
     if c.route == ROUTE_ESTIMATE {
@@ -2145,6 +2218,7 @@ export fn serve_run(lfd: i32, stats: &ServeStats) !i32 {
         }
     }
     runtime_tick();
+        batch_tick(srv_now_ms());
         if srv_stop_requested() != 0 && stopping == 0 {
             stopping = 1;
             stop_at = srv_now_ms() +% SRV_SHUTDOWN_MS;
@@ -2382,6 +2456,9 @@ fn srv_key_revoke(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 404, SRV_JSON_404, keep);
         return;
     }
+    var tb: [byte: 24] = [0: 24];
+    const tn: usize = srv_i64_text(kid, &tb[0], 24);
+    srv_audit_actor(&"user"[0: 4], &"key.revoke"[0: 10], tb[0: tn]);
     var w: JsonW = JsonW{};
     jsonw_init(&w);
     jsonw_obj(&w);
@@ -2451,6 +2528,7 @@ fn srv_keys(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 502, SRV_JSON_502, keep);
         return;
     };
+    srv_audit_actor(&"user"[0: 4], &"key.create"[0: 10], name[0: nn]);
     var w: JsonW = JsonW{};
     jsonw_init(&w);
     jsonw_obj(&w);
@@ -2563,6 +2641,7 @@ fn srv_rates_out(w: &JsonW, label: &[byte], r: &PriceRates) void {
 
 fn srv_admin_health(c: &SrvConn, stats: &ServeStats) void {
     const keep: bool = c.keep;
+    srv_batch_sync();
     stats.requests = stats.requests +% 1;
     if !runtime_ready() {
         srv_static(c, 503, SRV_JSON_503, keep);
@@ -2711,6 +2790,7 @@ fn srv_admin_pricing_post(c: &SrvConn, stats: &ServeStats) void {
 
 fn srv_admin_billing(c: &SrvConn, stats: &ServeStats) void {
     const keep: bool = c.keep;
+    srv_batch_sync();
     stats.requests = stats.requests +% 1;
     if !runtime_ready() {
         srv_static(c, 503, SRV_JSON_503, keep);
@@ -2734,10 +2814,7 @@ fn srv_admin_billing(c: &SrvConn, stats: &ServeStats) void {
     }
     var rows: [RollupRow: 64] = [];
     var n: usize = 0;
-    n = rollup_query(runtime_db(), uid, from_day, to_day, &rows[0], 64) catch {
-        srv_static(c, 502, SRV_JSON_502, keep);
-        return;
-    };
+    n = srv_rollup_query(uid, from_day, to_day, &rows[0], 64);
     var w: JsonW = JsonW{};
     jsonw_init(&w);
     jsonw_obj(&w);
@@ -2822,7 +2899,8 @@ fn srv_responses(c: &SrvConn, stats: &ServeStats) void {
         return;
     }
     var key: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
-    store_verify_key(runtime_db(), tok[0: tn], &key) catch {
+    // A4 快路径：同一 Key 的连续请求走单槽缓存（TTL 2s），省一次 DB 校验。
+    store_verify_key_fast(runtime_db(), tok[0: tn], store_now(), &key) catch {
         srv_static(c, 401, SRV_JSON_401, keep);
         return;
     };
@@ -2942,11 +3020,9 @@ fn srv_responses(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 502, SRV_JSON_502, keep);
         return;
     }
-    var dirbuf: [byte: 256] = [0: 256];
-    const dlen: usize = runtime_dir_copy(&dirbuf[0], 256);
     var settle: BillingResult = BillingResult{ cost_nano: 0, price_nano: 0, rate_version: 0, duplicate: false, found: false };
-    billing_settle(runtime_db(), dirbuf[0: dlen], rid[0: ridn], key.user_id, store_now(),
-        0, plan.model[0: plan.model_len], plan.provider_name[0: plan.provider_name_len],
+    billing_settle_deferred(rid[0: ridn], key.user_id, store_now(), 0,
+        plan.model[0: plan.model_len], plan.provider_name[0: plan.provider_name_len],
         &usage, &settle) catch {
         srv_static(c, 502, SRV_JSON_502, keep);
         return;
@@ -3199,9 +3275,7 @@ fn srv_mcp(c: &SrvConn, stats: &ServeStats) void {
             }
             var rows: [RollupRow: 64] = [];
             var rn: usize = 0;
-            rn = rollup_query(runtime_db(), uid, from_day, to_day, &rows[0], 64) catch {
-                0 as usize;
-            };
+            rn = srv_rollup_query(uid, from_day, to_day, &rows[0], 64);
             jsonw_obj(&iw);
             jsonw_key(&iw, &"rows"[0: 4]);
             jsonw_arr(&iw);
@@ -3315,6 +3389,120 @@ fn srv_sse_frame(fd: i32, ev: &const byte, evn: usize, js: &[byte]) bool {
     return on > 0 && srv_send_all(fd, ob[0: on]);
 }
 
+// A5：流式工具事件（responses API）。最多跟踪 4 个并行 tool call：
+//   output_item.added → function_call_arguments.delta… → output_item.done。
+const SRV_TC_MAX: usize = 4;
+const SRV_TC_ID_MAX: usize = 64;
+const SRV_TC_NAME_MAX: usize = 64;
+const SRV_TC_ARGS_MAX: usize = 2048;
+
+struct SrvToolCall {
+    started: bool,
+    id: [byte: SRV_TC_ID_MAX],
+    id_len: usize,
+    name: [byte: SRV_TC_NAME_MAX],
+    name_len: usize,
+    args: [byte: SRV_TC_ARGS_MAX],
+    args_len: usize,
+}
+
+fn srv_tc_copy(dst: &byte, cap: usize, src: &[byte]) usize {
+    var i: usize = 0;
+    while i < src.len && i < cap {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+    return i;
+}
+
+fn srv_tc_item_id(tc: &SrvToolCall, idx: usize, out: &byte, cap: usize) usize {
+    if tc.id_len > 0 {
+        return srv_tc_copy(out, cap, tc.id[0: tc.id_len]);
+    }
+    if cap < 4 {
+        return 0;
+    }
+    out[0] = 'f' as byte;
+    out[1] = 'c' as byte;
+    out[2] = '_' as byte;
+    out[3] = (48 as i32 + (idx as i32) % 10) as byte;
+    return 4;
+}
+
+fn srv_tc_emit_added(c: &SrvConn, tc: &SrvToolCall, idx: usize) bool {
+    var ib: [byte: SRV_TC_ID_MAX] = [0: SRV_TC_ID_MAX];
+    const il: usize = srv_tc_item_id(tc, idx, &ib[0], SRV_TC_ID_MAX);
+    var jw: JsonW = JsonW{};
+    jsonw_init(&jw);
+    jsonw_obj(&jw);
+    jsonw_key(&jw, &"type"[0: 4]);
+    jsonw_str(&jw, &"response.output_item.added"[0: 26]);
+    jsonw_key(&jw, &"item"[0: 4]);
+    jsonw_obj(&jw);
+    jsonw_key(&jw, &"type"[0: 4]);
+    jsonw_str(&jw, &"function_call"[0: 13]);
+    jsonw_key(&jw, &"id"[0: 2]);
+    jsonw_str(&jw, ib[0: il]);
+    jsonw_key(&jw, &"call_id"[0: 7]);
+    jsonw_str(&jw, tc.id[0: tc.id_len]);
+    jsonw_key(&jw, &"name"[0: 4]);
+    jsonw_str(&jw, tc.name[0: tc.name_len]);
+    jsonw_key(&jw, &"arguments"[0: 9]);
+    jsonw_str(&jw, &""[0: 0]);
+    jsonw_key(&jw, &"status"[0: 6]);
+    jsonw_str(&jw, &"in_progress"[0: 11]);
+    jsonw_end_obj(&jw);
+    jsonw_end_obj(&jw);
+    return srv_sse_frame(c.fd, &"response.output_item.added"[0: 26], 26, jsonw_span(&jw));
+}
+
+fn srv_tc_emit_delta(c: &SrvConn, tc: &SrvToolCall, idx: usize, chunk: &[byte]) bool {
+    var ib: [byte: SRV_TC_ID_MAX] = [0: SRV_TC_ID_MAX];
+    const il: usize = srv_tc_item_id(tc, idx, &ib[0], SRV_TC_ID_MAX);
+    var jw: JsonW = JsonW{};
+    jsonw_init(&jw);
+    jsonw_obj(&jw);
+    jsonw_key(&jw, &"type"[0: 4]);
+    jsonw_str(&jw, &"response.function_call_arguments.delta"[0: 38]);
+    jsonw_key(&jw, &"item_id"[0: 7]);
+    jsonw_str(&jw, ib[0: il]);
+    jsonw_key(&jw, &"delta"[0: 5]);
+    jsonw_str(&jw, chunk);
+    jsonw_end_obj(&jw);
+    return srv_sse_frame(c.fd, &"response.function_call_arguments.delta"[0: 38], 38, jsonw_span(&jw));
+}
+
+fn srv_tc_write_item(w: &JsonW, tc: &SrvToolCall, idx: usize) void {
+    var ib: [byte: SRV_TC_ID_MAX] = [0: SRV_TC_ID_MAX];
+    const il: usize = srv_tc_item_id(tc, idx, &ib[0], SRV_TC_ID_MAX);
+    jsonw_obj(w);
+    jsonw_key(w, &"type"[0: 4]);
+    jsonw_str(w, &"function_call"[0: 13]);
+    jsonw_key(w, &"id"[0: 2]);
+    jsonw_str(w, ib[0: il]);
+    jsonw_key(w, &"call_id"[0: 7]);
+    jsonw_str(w, tc.id[0: tc.id_len]);
+    jsonw_key(w, &"name"[0: 4]);
+    jsonw_str(w, tc.name[0: tc.name_len]);
+    jsonw_key(w, &"arguments"[0: 9]);
+    jsonw_str(w, tc.args[0: tc.args_len]);
+    jsonw_key(w, &"status"[0: 6]);
+    jsonw_str(w, &"completed"[0: 9]);
+    jsonw_end_obj(w);
+}
+
+fn srv_tc_emit_done(c: &SrvConn, tc: &SrvToolCall, idx: usize) bool {
+    var jw: JsonW = JsonW{};
+    jsonw_init(&jw);
+    jsonw_obj(&jw);
+    jsonw_key(&jw, &"type"[0: 4]);
+    jsonw_str(&jw, &"response.output_item.done"[0: 25]);
+    jsonw_key(&jw, &"item"[0: 4]);
+    srv_tc_write_item(&jw, tc, idx);
+    jsonw_end_obj(&jw);
+    return srv_sse_frame(c.fd, &"response.output_item.done"[0: 25], 25, jsonw_span(&jw));
+}
+
 fn srv_responses_stream(c: &SrvConn, uid: i64, plan: &ChatPlan, cfg: &const HttppConfig,
     rid: &[byte], input_text: &[byte], prev_id: &[byte]) void {
     var call: HtcCall = HtcCall{};
@@ -3324,7 +3512,7 @@ fn srv_responses_stream(c: &SrvConn, uid: i64, plan: &ChatPlan, cfg: &const Http
         srv_static(c, 502, SRV_JSON_502, c.keep);
         return;
     };
-    const o: !i32 = block_on<i32>(htc_open_async(cfg, &g_up_ctx, &"POST"[0: 4],
+    const o: !i32 = wait_i32(htc_open_async(cfg, &g_up_ctx, &"POST"[0: 4],
         plan.path[0: plan.path_len], plan.payload[0: plan.payload_len], true,
         nowu, nowu +% 10000, &call));
     const orc: i32 = o catch |_| {
@@ -3383,9 +3571,11 @@ fn srv_responses_stream(c: &SrvConn, uid: i64, plan: &ChatPlan, cfg: &const Http
     var out_len: usize = 0;
     var events: i32 = 0;
     var done: bool = false;
-    while events < 4096 && !done {
+    var closed: bool = false;
+    var tcs: [SrvToolCall: SRV_TC_MAX] = [];
+    while events < 4096 && !done && !closed {
         var has: bool = false;
-        const r: !i32 = block_on<i32>(htc_next_event_async(&call, &has, 5000 as u64));
+        const r: !i32 = wait_i32(htc_next_event_async(&call, &has, 5000 as u64));
         const rr: i32 = r catch |_| {
             break;
         };
@@ -3421,19 +3611,83 @@ fn srv_responses_stream(c: &SrvConn, uid: i64, plan: &ChatPlan, cfg: &const Http
                     jsonw_str(&jw, chunk[0: cn]);
                     jsonw_end_obj(&jw);
                     if !srv_sse_frame(c.fd, &"response.output_text.delta"[0: 26], 26, jsonw_span(&jw)) {
-                        break;
+                        closed = true;
+                    }
+                }
+            }
+            // A5：工具调用增量 → output_item.added / arguments.delta
+            if !closed {
+                const tca: i32 = json_get(&jd, delta, &"tool_calls"[0: 10]);
+                if tca >= 0 {
+                    const tn: usize = json_arr_len(&jd, tca);
+                    var ti: usize = 0;
+                    while ti < tn && ti < SRV_TC_MAX && !closed {
+                        const el: i32 = json_arr_at(&jd, tca, ti);
+                        const fnode: i32 = json_get(&jd, el, &"function"[0: 8]);
+                        const raw_slot: i64 = json_i64(&jd, json_get(&jd, el, &"index"[0: 5]));
+                        var slot: usize = 0;
+                        if raw_slot > 0 && raw_slot < 4 {
+                            slot = raw_slot as usize;
+                        }
+                        const tc: &SrvToolCall = &tcs[slot];
+                        const cid: i32 = json_get(&jd, el, &"id"[0: 2]);
+                        if cid >= 0 && json_kind(&jd, cid) == JSON_STR && tc.id_len == 0 {
+                            var cb: [byte: SRV_TC_ID_MAX] = [0: SRV_TC_ID_MAX];
+                            const cn: usize = json_str(&jd, cid, &cb[0], SRV_TC_ID_MAX);
+                            tc.id_len = srv_tc_copy(&tc.id[0], SRV_TC_ID_MAX, cb[0: cn]);
+                        }
+                        const fname: i32 = json_get(&jd, fnode, &"name"[0: 4]);
+                        if fname >= 0 && json_kind(&jd, fname) == JSON_STR && tc.name_len == 0 {
+                            var nb: [byte: SRV_TC_NAME_MAX] = [0: SRV_TC_NAME_MAX];
+                            const nn: usize = json_str(&jd, fname, &nb[0], SRV_TC_NAME_MAX);
+                            tc.name_len = srv_tc_copy(&tc.name[0], SRV_TC_NAME_MAX, nb[0: nn]);
+                        }
+                        if !tc.started && (tc.id_len > 0 || tc.name_len > 0) {
+                            tc.started = true;
+                            if !srv_tc_emit_added(c, tc, slot) {
+                                closed = true;
+                            }
+                        }
+                        if !closed {
+                            const farg: i32 = json_get(&jd, fnode, &"arguments"[0: 9]);
+                            if farg >= 0 && json_kind(&jd, farg) == JSON_STR {
+                                var ab: [byte: 512] = [0: 512];
+                                const an: usize = json_str(&jd, farg, &ab[0], 512);
+                                if an > 0 {
+                                    var k: usize = 0;
+                                    while k < an && tc.args_len < SRV_TC_ARGS_MAX {
+                                        tc.args[tc.args_len] = ab[k];
+                                        tc.args_len = tc.args_len + 1;
+                                        k = k + 1;
+                                    }
+                                    if !srv_tc_emit_delta(c, tc, slot, ab[0: an]) {
+                                        closed = true;
+                                    }
+                                }
+                            }
+                        }
+                        ti = ti + 1;
                     }
                 }
             }
         }
+        if closed {
+            break;
+        }
         sse_consume(&call.sse);
         events = events + 1;
     }
+    // A5：收尾事件（每个已开始的 tool call 一条 output_item.done）
+    var di: usize = 0;
+    while di < SRV_TC_MAX {
+        if tcs[di].started && !closed {
+            _ = srv_tc_emit_done(c, &tcs[di], di);
+        }
+        di = di + 1;
+    }
     var settle: BillingResult = BillingResult{ cost_nano: 0, price_nano: 0, rate_version: 0, duplicate: false, found: false };
     if usage_found {
-        var dirbuf: [byte: 256] = [0: 256];
-        const dlen: usize = runtime_dir_copy(&dirbuf[0], 256);
-        billing_settle(runtime_db(), dirbuf[0: dlen], rid, uid, store_now(), 0,
+        billing_settle_deferred(rid, uid, store_now(), 0,
             plan.model[0: plan.model_len], plan.provider_name[0: plan.provider_name_len],
             &usage, &settle) catch {};
     }
@@ -3459,6 +3713,16 @@ fn srv_responses_stream(c: &SrvConn, uid: i64, plan: &ChatPlan, cfg: &const Http
         jsonw_key(&jw, &"price_nano"[0: 10]);
         jsonw_i64(&jw, settle.price_nano);
         jsonw_end_obj(&jw);
+        jsonw_key(&jw, &"output"[0: 6]);
+        jsonw_arr(&jw);
+        di = 0;
+        while di < SRV_TC_MAX {
+            if tcs[di].started {
+                srv_tc_write_item(&jw, &tcs[di], di);
+            }
+            di = di + 1;
+        }
+        jsonw_end_arr(&jw);
         jsonw_end_obj(&jw);
         jsonw_end_obj(&jw);
         _ = srv_sse_frame(c.fd, &"response.completed"[0: 18], 18, jsonw_span(&jw));
@@ -3975,7 +4239,7 @@ fn srv_ctl_ingest(c: &SrvConn, stats: &ServeStats) void {
     }
     const now: i64 = store_now();
     var st: IngestStats = IngestStats{ applied: 0, duplicate: 0, bad: 0 };
-    st = ingest_apply(runtime_db(), c.body[0: c.body_len], now) catch {
+    st = ingest_apply_routed(runtime_db(), c.body[0: c.body_len], now) catch {
         srv_static(c, 400, SRV_JSON_400, keep);
         return;
     };
@@ -4031,6 +4295,7 @@ fn csv_field(b: &Buf, s: &[byte]) void {
 
 fn srv_usage_csv(c: &SrvConn, stats: &ServeStats) void {
     const keep: bool = c.keep;
+    srv_batch_sync();
     stats.requests = stats.requests +% 1;
     if !runtime_ready() {
         srv_static(c, 503, SRV_JSON_503, keep);
@@ -4043,7 +4308,8 @@ fn srv_usage_csv(c: &SrvConn, stats: &ServeStats) void {
         return;
     }
     var key: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
-    store_verify_key(runtime_db(), tok[0: tn], &key) catch {
+    // A4 快路径：同一 Key 的连续请求走单槽缓存（TTL 2s），省一次 DB 校验。
+    store_verify_key_fast(runtime_db(), tok[0: tn], store_now(), &key) catch {
         srv_static(c, 401, SRV_JSON_401, keep);
         return;
     };
@@ -4062,10 +4328,7 @@ fn srv_usage_csv(c: &SrvConn, stats: &ServeStats) void {
     }
     var rows: [RollupRow: 64] = [];
     var n: usize = 0;
-    n = rollup_query(runtime_db(), key.user_id, from_day, to_day, &rows[0], 64) catch {
-        srv_static(c, 502, SRV_JSON_502, keep);
-        return;
-    };
+    n = srv_rollup_query(key.user_id, from_day, to_day, &rows[0], 64);
     var b: Buf = buf_new(8192);
     defer { buf_free(&b); }
     if !buf_valid(&b) {
@@ -4122,7 +4385,8 @@ fn srv_estimate(c: &SrvConn, stats: &ServeStats) void {
         return;
     }
     var key: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
-    store_verify_key(runtime_db(), tok[0: tn], &key) catch {
+    // A4 快路径：同一 Key 的连续请求走单槽缓存（TTL 2s），省一次 DB 校验。
+    store_verify_key_fast(runtime_db(), tok[0: tn], store_now(), &key) catch {
         srv_static(c, 401, SRV_JSON_401, keep);
         return;
     };
@@ -4190,8 +4454,30 @@ fn srv_estimate(c: &SrvConn, stats: &ServeStats) void {
 
 
 // C4：预算（GET 读当前额度与当月已用；POST 设置，需会话或 Key）。
+/// C4：站内通知（JSONL，按用户隔离；无通知返回空 body）。
+fn srv_notifications(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    if !runtime_ready() {
+        srv_static(c, 503, SRV_JSON_503, keep);
+        return;
+    }
+    var uid: i64 = 0;
+    if !srv_bearer_uid(c, &uid) {
+        srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    }
+    var dir: [byte: 256] = [0: 256];
+    const dn: usize = runtime_dir_copy(&dir[0], 256);
+    var buf: [byte: 16384] = [0: 16384];
+    var bn: usize = 0;
+    _ = notify_read(dir[0: dn], uid, &buf[0], 16384, &bn);
+    srv_static_ct(c, 200, buf[0: bn], keep, &"text/plain"[0: 10], 10);
+}
+
 fn srv_budget(c: &SrvConn, stats: &ServeStats) void {
     const keep: bool = c.keep;
+    srv_batch_sync();
     stats.requests = stats.requests +% 1;
     if !runtime_ready() {
         srv_static(c, 503, SRV_JSON_503, keep);
@@ -4226,12 +4512,25 @@ fn srv_budget(c: &SrvConn, stats: &ServeStats) void {
     const limit: i64 = budget_get(runtime_db(), uid) catch {
         0 as i64;
     };
-    const spent: i64 = budget_month_spent(runtime_db(), uid, now) catch {
+    var bdb: &Db = runtime_db();
+    if shard_active() {
+        bdb = shard_db_for(uid);
+    }
+    const spent: i64 = budget_month_spent(bdb, uid, now) catch {
         0 as i64;
     };
     var over: bool = false;
     if limit > 0 && spent >= limit {
         over = true;
+    }
+    if !c.is_get && over {
+        var dir: [byte: 256] = [0: 256];
+        const dn: usize = runtime_dir_copy(&dir[0], 256);
+        var dayv: i64 = 0;
+        const day: i64 = budget_month(now, &dayv);
+        _ = notify_budget_over(dir[0: dn], uid, day, spent, limit, now) catch {
+            false;
+        };
     }
     var w: JsonW = JsonW{};
     jsonw_init(&w);
@@ -4438,6 +4737,56 @@ fn srv_node_status(c: &SrvConn, stats: &ServeStats) void {
 
 
 /// B4：把请求代理给 slug 的归属节点（`?slug=&path=&session=`），失败清亲和后重试一次。
+/// B4：edge→node 的 SSE 流式转发：边读边刷，首事件不必等整个响应。
+fn srv_edge_proxy_stream(c: &SrvConn, ip: &[byte], port: u16, path: &[byte]) void {
+    const keep: bool = c.keep;
+    _ = keep;
+    var us: UpStream = UpStream{};
+    uplink_stream_begin(ip, port, path, 5000, &us) catch {
+        srv_static(c, 502, SRV_JSON_502, c.keep);
+        return;
+    };
+    defer { uplink_stream_close(&us); }
+    if us.status != 200 {
+        srv_static(c, 502, SRV_JSON_502, c.keep);
+        return;
+    }
+    const fl: !i32 = sys_fcntl(c.fd, 3, 0);
+    const flags: i32 = fl catch {
+        0;
+    };
+    if flags != 0 {
+        _ = sys_fcntl(c.fd, 4, flags & (0 -% 2049)) catch {};
+    }
+    var head: [byte: 256] = [0: 256];
+    const hn: usize = hsrv_resp_head(&head[0], 256, 200, &SRV_CTYPE_SSE[0: 17], 17,
+        0 as i64, true, false);
+    if !srv_send_all(c.fd, head[0: hn]) {
+        srv_chat_close(c);
+        return;
+    }
+    var buf: [byte: 4096] = [0: 4096];
+    var ob: [byte: 4200] = [0: 4200];
+    var guard: i32 = 0;
+    while guard < 100000 {
+        guard = guard +% 1;
+        const got: !usize = uplink_stream_read(&us, &buf[0], 4096);
+        var n: usize = 0;
+        n = got catch {
+            0 as usize;
+        };
+        if n == 0 {
+            break;
+        }
+        const on: usize = hsrv_chunk(&ob[0], 4200, buf[0: n], n);
+        if on == 0 || !srv_send_all(c.fd, ob[0: on]) {
+            break;
+        }
+    }
+    _ = srv_send_all(c.fd, &"0\r\n\r\n"[0: 5]);
+    srv_chat_close(c);
+}
+
 fn srv_edge_proxy(c: &SrvConn, stats: &ServeStats) void {
     const keep: bool = c.keep;
     stats.requests = stats.requests +% 1;
@@ -4503,6 +4852,13 @@ fn srv_edge_proxy(c: &SrvConn, stats: &ServeStats) void {
     var port: u16 = 0;
     if !srv_split_addr(nbaddr[0: an], &ipb[0], 64, &ipl, &port) {
         srv_static(c, 502, SRV_JSON_502, keep);
+        return;
+    }
+    // B4：`stream=1` 走 SSE 流式转发（不等整个节点响应）
+    var stb: [byte: 8] = [0: 8];
+    const stn: usize = srv_query_str(&c.path[0], c.path_len, &"stream"[0: 6], 6, &stb[0], 8);
+    if stn == 1 && stb[0] == ('1' as byte) {
+        srv_edge_proxy_stream(c, ipb[0: ipl], port, pth[0: pn]);
         return;
     }
     var out: [byte: 16384] = [0: 16384];
@@ -4578,6 +4934,7 @@ fn srv_node_spool(c: &SrvConn, stats: &ServeStats) void {
 /// C2：请求列表（分页）/ 详情（`?id=`）。
 fn srv_requests(c: &SrvConn, stats: &ServeStats) void {
     const keep: bool = c.keep;
+    srv_batch_sync();
     stats.requests = stats.requests +% 1;
     if !runtime_ready() {
         srv_static(c, 503, SRV_JSON_503, keep);
@@ -4590,17 +4947,23 @@ fn srv_requests(c: &SrvConn, stats: &ServeStats) void {
         return;
     }
     var key: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
-    store_verify_key(runtime_db(), tok[0: tn], &key) catch {
+    // A4 快路径：同一 Key 的连续请求走单槽缓存（TTL 2s），省一次 DB 校验。
+    store_verify_key_fast(runtime_db(), tok[0: tn], store_now(), &key) catch {
         srv_static(c, 401, SRV_JSON_401, keep);
         return;
     };
     var w: JsonW = JsonW{};
     jsonw_init(&w);
+    // B5：分片模式下账本在用户的固定分片；否则在 runtime DB。
+    var ldb: &Db = runtime_db();
+    if shard_active() {
+        ldb = shard_db_for(key.user_id);
+    }
     var rid: [byte: 128] = [0: 128];
     const rn: usize = srv_query_str(&c.path[0], c.path_len, &"id"[0: 2], 2, &rid[0], 128);
     if rn > 0 {
         var row: StoreLedgerRow = StoreLedgerRow{};
-        const found: bool = store_get_ledger(runtime_db(), key.user_id, rid[0: rn], &row) catch {
+        const found: bool = store_get_ledger(ldb, key.user_id, rid[0: rn], &row) catch {
             false;
         };
         if !found {
@@ -4623,7 +4986,7 @@ fn srv_requests(c: &SrvConn, stats: &ServeStats) void {
     }
     var rows: [StoreLedgerRow: 100] = [];
     var n: usize = 0;
-    n = store_list_ledger(runtime_db(), key.user_id, limit, offset, &rows[0], 100) catch {
+    n = store_list_ledger(ldb, key.user_id, limit, offset, &rows[0], 100) catch {
         srv_static(c, 502, SRV_JSON_502, keep);
         return;
     };
@@ -4689,8 +5052,8 @@ fn srv_audit_path(out: &byte, cap: usize) usize {
     return n;
 }
 
-/// 追加一条审计：`{"ts":..,"actor":"admin","action":"..","target":".."}`。
-fn srv_audit(action: &[byte], target: &[byte]) void {
+/// 追加一条审计（actor 可指定：admin / user）：`{"ts":..,"actor":..,"action":..,"target":..}`。
+fn srv_audit_actor(actor: &[byte], action: &[byte], target: &[byte]) void {
     var path: [byte: 320] = [0: 320];
     const pn: usize = srv_audit_path(&path[0], 320);
     if pn == 0 {
@@ -4702,13 +5065,45 @@ fn srv_audit(action: &[byte], target: &[byte]) void {
     jsonw_key(&w, &"ts"[0: 2]);
     jsonw_i64(&w, store_now());
     jsonw_key(&w, &"actor"[0: 5]);
-    jsonw_str(&w, &"admin"[0: 5]);
+    jsonw_str(&w, actor);
     jsonw_key(&w, &"action"[0: 6]);
     jsonw_str(&w, action);
     jsonw_key(&w, &"target"[0: 6]);
     jsonw_str(&w, target);
     jsonw_end_obj(&w);
     _ = spool_try_append(path[0: pn], jsonw_span(&w));
+}
+
+/// 管理端写操作的审计（actor 固定 admin）。
+fn srv_audit(action: &[byte], target: &[byte]) void {
+    srv_audit_actor(&"admin"[0: 5], action, target);
+}
+
+/// 非负整数转文本（审计 target 里的 key id 用）。
+fn srv_i64_text(v: i64, out: &byte, cap: usize) usize {
+    var x: u64 = 0;
+    if v > 0 {
+        x = v as u64;
+    }
+    var digits: [byte: 20] = [0: 20];
+    var d: usize = 0;
+    if x == 0 {
+        digits[0] = 48;
+        d = 1;
+    } else {
+        while x > 0 && d < 20 {
+            digits[d] = (48 +% (x % (10 as u64))) as byte;
+            x = x / (10 as u64);
+            d = d + 1;
+        }
+    }
+    var n: usize = 0;
+    while d > 0 && n < cap {
+        d = d - 1;
+        out[n] = digits[d];
+        n = n + 1;
+    }
+    return n;
 }
 
 /// C5：审计列表（最近 N 行，text/plain 的 JSONL）。
@@ -4781,16 +5176,30 @@ fn srv_admin_prices(c: &SrvConn, stats: &ServeStats) void {
         const inr: i64 = json_i64(&d, json_get(&d, root, &"input"[0: 5]));
         const outr: i64 = json_i64(&d, json_get(&d, root, &"output"[0: 6]));
         const cr: i64 = json_i64(&d, json_get(&d, root, &"cache_read"[0: 10]));
+        const pr: i64 = json_i64(&d, json_get(&d, root, &"per_request"[0: 11]));
+        var sched: [byte: 256] = [0: 256];
+        const sn: usize = json_str(&d, json_get(&d, root, &"schedule"[0: 8]), &sched[0], 256);
         if mn == 0 {
             srv_static(c, 400, SRV_JSON_400, keep);
             return;
         }
-        price_entry_put(runtime_db(), card, prov[0: pn], model[0: mn], 0, inr, outr, cr, 0,
-            &""[0: 0]) catch {
+        // 分时规则先解析校验：坏规则不入库（避免请求时才失败）。
+        if sn > 0 {
+            var sc: Sched = Sched{ rules: [], count: 0 };
+            schedule_parse(sched[0: sn], &sc) catch {
+                srv_static(c, 400, SRV_JSON_400, keep);
+                return;
+            };
+        }
+        price_entry_put(runtime_db(), card, prov[0: pn], model[0: mn], 0, inr, outr, cr, pr,
+            sched[0: sn]) catch {
             srv_static(c, 400, SRV_JSON_400, keep);
             return;
         };
         srv_audit(&"price.put"[0: 9], model[0: mn]);
+        if sn > 0 {
+            srv_audit(&"schedule.put"[0: 12], model[0: mn]);
+        }
         srv_static(c, 200, SRV_JSON_OK, keep);
         return;
     }
@@ -4819,6 +5228,10 @@ fn srv_admin_prices(c: &SrvConn, stats: &ServeStats) void {
         jsonw_i64(&w, rows[i].output_nano_per_mtok);
         jsonw_key(&w, &"cache_read"[0: 10]);
         jsonw_i64(&w, rows[i].cache_read_nano_per_mtok);
+        jsonw_key(&w, &"per_request"[0: 11]);
+        jsonw_i64(&w, rows[i].per_request_nano);
+        jsonw_key(&w, &"schedule"[0: 8]);
+        jsonw_str(&w, rows[i].schedule[0: rows[i].schedule_len]);
         jsonw_end_obj(&w);
         i = i + 1;
     }

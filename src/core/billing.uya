@@ -86,22 +86,13 @@ export fn billing_quote(d: &Db, model: &[byte], provider: &[byte], user_id: i64,
     return;
 }
 
-/// 结算一笔请求：journal → usage_ledger。重复 request_id 幂等（`duplicate = true`）。
-export fn billing_settle(d: &Db, dir: &[byte], request_id: &[byte], user_id: i64,
-    ts: i64, tz_min: i32, model: &[byte], provider: &[byte], usage: &PriceUsage,
-    out: &BillingResult) !void {
-    if request_id.len == 0 {
-        return error.BillingFailed;
-    }
-    try billing_quote(d, model, provider, user_id, ts, tz_min, usage, out);
-    var path: [byte: 512] = [0: 512];
-    const pn: usize = journal_path(dir, ts, &path[0], 512);
-    var empty: [byte: 1] = [0: 1];
-    journal_append(path[0: pn], request_id, user_id, model, provider, ts,
-        usage.input_tokens, usage.output_tokens, usage.cache_read_tokens,
-        out.cost_nano, out.price_nano, empty[0: 0], out.rate_version) catch {
-        return error.BillingFailed;
-    };
+/// 把一行用量写进账本（`request_id` 幂等）并实时汇总到 `usage_daily`。
+/// 返回 true 表示确实插入了一行；false 表示重复请求（不重复计数）。
+/// 立即落库（单测/无批处理调用方）与批量 flush（batch.uya）共用这一份 SQL。
+export fn billing_apply_ledger(d: &Db, request_id: &[byte], user_id: i64, ts: i64,
+    model: &[byte], provider: &[byte], input_tokens: i64, output_tokens: i64,
+    cache_read_tokens: i64, cost_nano: i64, price_nano: i64, period: &[byte],
+    rate_version: i64) !bool {
     var st: DbStmt = dbx_prepare(d,
         "insert or ignore into usage_ledger(request_id, user_id, ts, model, provider, input_tokens, output_tokens, cache_read_tokens, cost_nano, price_nano, period, rate_version) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)" as &const byte) catch {
         return error.BillingFailed;
@@ -122,50 +113,73 @@ export fn billing_settle(d: &Db, dir: &[byte], request_id: &[byte], user_id: i64
     dbx_bind_text(&st, 5, provider) catch {
         return error.BillingFailed;
     };
-    dbx_bind_i64(&st, 6, usage.input_tokens) catch {
+    dbx_bind_i64(&st, 6, input_tokens) catch {
         return error.BillingFailed;
     };
-    dbx_bind_i64(&st, 7, usage.output_tokens) catch {
+    dbx_bind_i64(&st, 7, output_tokens) catch {
         return error.BillingFailed;
     };
-    dbx_bind_i64(&st, 8, usage.cache_read_tokens) catch {
+    dbx_bind_i64(&st, 8, cache_read_tokens) catch {
         return error.BillingFailed;
     };
-    dbx_bind_i64(&st, 9, out.cost_nano) catch {
+    dbx_bind_i64(&st, 9, cost_nano) catch {
         return error.BillingFailed;
     };
-    dbx_bind_i64(&st, 10, out.price_nano) catch {
+    dbx_bind_i64(&st, 10, price_nano) catch {
         return error.BillingFailed;
     };
-    dbx_bind_text(&st, 11, empty[0: 0]) catch {
+    dbx_bind_text(&st, 11, period) catch {
         return error.BillingFailed;
     };
-    dbx_bind_i64(&st, 12, out.rate_version) catch {
+    dbx_bind_i64(&st, 12, rate_version) catch {
         return error.BillingFailed;
     };
     if dbx_step(&st) != 0 {
         return error.BillingFailed;
     }
-    out.duplicate = dbx_changes(d) != 1;
+    const applied: bool = dbx_changes(d) == 1;
     // 实时汇总（A6）：查询不扫明细；重复请求不重复计数，重建 rollup 可对账。
-    if !out.duplicate && ts >= 0 {
-        const day: i64 = ts / (86400 as i64);
-        var ud: DbStmt = dbx_prepare(d,
-            "insert into usage_daily(day, user_id, model, provider, period, requests, input_tokens, output_tokens, cache_read_tokens, cost_nano, price_nano) values(?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?) on conflict(day, user_id, model, provider, period) do update set requests = requests + 1, input_tokens = input_tokens + excluded.input_tokens, output_tokens = output_tokens + excluded.output_tokens, cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens, cost_nano = cost_nano + excluded.cost_nano, price_nano = price_nano + excluded.price_nano" as &const byte) catch {
-            return;
-        };
-        defer { dbx_finalize(&ud); }
-        dbx_bind_i64(&ud, 1, day) catch { return; };
-        dbx_bind_i64(&ud, 2, user_id) catch { return; };
-        dbx_bind_text(&ud, 3, model) catch { return; };
-        dbx_bind_text(&ud, 4, provider) catch { return; };
-        dbx_bind_text(&ud, 5, empty[0: 0]) catch { return; };
-        dbx_bind_i64(&ud, 6, usage.input_tokens) catch { return; };
-        dbx_bind_i64(&ud, 7, usage.output_tokens) catch { return; };
-        dbx_bind_i64(&ud, 8, usage.cache_read_tokens) catch { return; };
-        dbx_bind_i64(&ud, 9, out.cost_nano) catch { return; };
-        dbx_bind_i64(&ud, 10, out.price_nano) catch { return; };
-        _ = dbx_step(&ud);
+    if !applied || ts < 0 {
+        return applied;
     }
+    const day: i64 = ts / (86400 as i64);
+    var ud: DbStmt = dbx_prepare(d,
+        "insert into usage_daily(day, user_id, model, provider, period, requests, input_tokens, output_tokens, cache_read_tokens, cost_nano, price_nano) values(?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?) on conflict(day, user_id, model, provider, period) do update set requests = requests + 1, input_tokens = input_tokens + excluded.input_tokens, output_tokens = output_tokens + excluded.output_tokens, cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens, cost_nano = cost_nano + excluded.cost_nano, price_nano = price_nano + excluded.price_nano" as &const byte) catch {
+        return applied;
+    };
+    defer { dbx_finalize(&ud); }
+    dbx_bind_i64(&ud, 1, day) catch { return applied; };
+    dbx_bind_i64(&ud, 2, user_id) catch { return applied; };
+    dbx_bind_text(&ud, 3, model) catch { return applied; };
+    dbx_bind_text(&ud, 4, provider) catch { return applied; };
+    dbx_bind_text(&ud, 5, period) catch { return applied; };
+    dbx_bind_i64(&ud, 6, input_tokens) catch { return applied; };
+    dbx_bind_i64(&ud, 7, output_tokens) catch { return applied; };
+    dbx_bind_i64(&ud, 8, cache_read_tokens) catch { return applied; };
+    dbx_bind_i64(&ud, 9, cost_nano) catch { return applied; };
+    dbx_bind_i64(&ud, 10, price_nano) catch { return applied; };
+    _ = dbx_step(&ud);
+    return applied;
+}
+
+/// 结算一笔请求：journal → usage_ledger。重复 request_id 幂等（`duplicate = true`）。
+export fn billing_settle(d: &Db, dir: &[byte], request_id: &[byte], user_id: i64,
+    ts: i64, tz_min: i32, model: &[byte], provider: &[byte], usage: &PriceUsage,
+    out: &BillingResult) !void {
+    if request_id.len == 0 {
+        return error.BillingFailed;
+    }
+    try billing_quote(d, model, provider, user_id, ts, tz_min, usage, out);
+    var path: [byte: 512] = [0: 512];
+    const pn: usize = journal_path(dir, ts, &path[0], 512);
+    journal_append(path[0: pn], request_id, user_id, model, provider, ts,
+        usage.input_tokens, usage.output_tokens, usage.cache_read_tokens,
+        out.cost_nano, out.price_nano, &""[0: 0], out.rate_version) catch {
+        return error.BillingFailed;
+    };
+    const applied: bool = try billing_apply_ledger(d, request_id, user_id, ts, model,
+        provider, usage.input_tokens, usage.output_tokens, usage.cache_read_tokens,
+        out.cost_nano, out.price_nano, &""[0: 0], out.rate_version);
+    out.duplicate = !applied;
     return;
 }

@@ -137,6 +137,253 @@ fn chat_rewrite_model(body: &[byte], model: &[byte], out: &byte, cap: usize) usi
     return off;
 }
 
+/// A4 快路径：不建 DOM，只在顶层扫描 `"model"` 与 `"stream"`。
+/// `unsupported` 表示形态不适合快路径（调用方回退到完整解析）。
+export struct ChatScan {
+    model_found: bool,
+    model_vs: usize,
+    model_ve: usize,
+    stream_found: bool,
+    stream_val: bool,
+    unsupported: bool,
+}
+
+fn chat_key_eq(body: &[byte], s: usize, n: usize, lit: &const byte, ln: usize) bool {
+    if n != ln {
+        return false;
+    }
+    var i: usize = 0;
+    while i < n {
+        if body[s + i] != lit[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// 顶层扫描：跳过字符串/嵌套对象，定位顶层 `model`（字符串）与 `stream`（布尔），
+/// 同时校验字符串闭合与括号平衡。拿不准的形态置 `unsupported`，交给完整解析。
+export fn chat_scan(body: &[byte], out: &ChatScan) !void {
+    out.model_found = false;
+    out.model_vs = 0;
+    out.model_ve = 0;
+    out.stream_found = false;
+    out.stream_val = false;
+    out.unsupported = false;
+    var depth: i32 = 0;
+    var root_ok: bool = false;
+    var root_done: bool = false;
+    var i: usize = 0;
+    while i < body.len {
+        const c: byte = body[i];
+        if chat_ws(c) {
+            i = i + 1;
+            continue;
+        }
+        if root_done {
+            return error.ChatBadRequest;
+        }
+        if c == (34 as byte) {
+            const ks: usize = i + 1;
+            var j: usize = ks;
+            var esc: bool = false;
+            while j < body.len && body[j] != (34 as byte) {
+                if body[j] == (92 as byte) {
+                    esc = true;
+                    j = j + 2;
+                } else {
+                    j = j + 1;
+                }
+            }
+            if j >= body.len {
+                return error.ChatBadRequest;
+            }
+            if depth == 1 && root_ok {
+                var k: usize = j + 1;
+                while k < body.len && chat_ws(body[k]) {
+                    k = k + 1;
+                }
+                if k < body.len && body[k] == (58 as byte) {
+                    const kn: usize = j - ks;
+                    if esc {
+                        out.unsupported = true;
+                    } else if chat_key_eq(body, ks, kn, &"model"[0: 5], 5) {
+                        var v: usize = k + 1;
+                        while v < body.len && chat_ws(body[v]) {
+                            v = v + 1;
+                        }
+                        if v >= body.len || body[v] != (34 as byte) {
+                            out.unsupported = true;
+                            i = j + 1;
+                            continue;
+                        }
+                        var e: usize = v + 1;
+                        var vesc: bool = false;
+                        while e < body.len && body[e] != (34 as byte) {
+                            if body[e] == (92 as byte) {
+                                vesc = true;
+                                e = e + 2;
+                            } else {
+                                e = e + 1;
+                            }
+                        }
+                        if e >= body.len {
+                            return error.ChatBadRequest;
+                        }
+                        if out.model_found || vesc {
+                            out.unsupported = true;
+                        } else {
+                            out.model_found = true;
+                            out.model_vs = v + 1;
+                            out.model_ve = e;
+                        }
+                        i = e + 1;
+                        continue;
+                    } else if chat_key_eq(body, ks, kn, &"stream"[0: 6], 6) {
+                        var v: usize = k + 1;
+                        while v < body.len && chat_ws(body[v]) {
+                            v = v + 1;
+                        }
+                        if v + 4 <= body.len && body[v] == ('t' as byte)
+                            && body[v + 1] == ('r' as byte) && body[v + 2] == ('u' as byte)
+                            && body[v + 3] == ('e' as byte) {
+                            out.stream_found = true;
+                            out.stream_val = true;
+                            i = v + 4;
+                            continue;
+                        }
+                        if v + 5 <= body.len && body[v] == ('f' as byte)
+                            && body[v + 1] == ('a' as byte) && body[v + 2] == ('l' as byte)
+                            && body[v + 3] == ('s' as byte) && body[v + 4] == ('e' as byte) {
+                            out.stream_found = true;
+                            out.stream_val = false;
+                            i = v + 5;
+                            continue;
+                        }
+                        out.unsupported = true;
+                    }
+                }
+            }
+            i = j + 1;
+            continue;
+        }
+        if c == (123 as byte) || c == (91 as byte) {
+            depth = depth + 1;
+            if depth == 1 {
+                if c == (123 as byte) {
+                    root_ok = true;
+                } else {
+                    out.unsupported = true;
+                }
+            }
+            i = i + 1;
+            continue;
+        }
+        if c == (125 as byte) || c == (93 as byte) {
+            depth = depth - 1;
+            if depth < 0 {
+                return error.ChatBadRequest;
+            }
+            if depth == 0 {
+                root_done = true;
+            }
+            i = i + 1;
+            continue;
+        }
+        i = i + 1;
+    }
+    if depth != 0 || !root_done {
+        return error.ChatBadRequest;
+    }
+    if !root_ok {
+        // 根不是对象（如数组）：结构没坏，但形态不支持快路径
+        out.unsupported = true;
+    }
+    return;
+}
+
+/// 按已知 span 重写 model 值（快路径用，避免二次扫描）。
+fn chat_rewrite_model_span(body: &[byte], vs: usize, ve: usize, model: &[byte],
+    out: &byte, cap: usize) usize {
+    if vs > body.len || ve > body.len || ve < vs {
+        return 0;
+    }
+    var off: usize = 0;
+    if !chat_put(out, cap, &off, body[0: vs]) {
+        return 0;
+    }
+    if !chat_put(out, cap, &off, model) {
+        return 0;
+    }
+    if !chat_put(out, cap, &off, body[ve: body.len - ve]) {
+        return 0;
+    }
+    return off;
+}
+
+/// 选 provider + 填 host/凭证/path（快慢路径共用）。
+fn chat_route(d: &Db, model: &[byte], session: &[byte], now: i64, out: &ChatPlan) !void {
+    var prov: StoreProvider = StoreProvider{};
+    var up: [byte: CHAT_MODEL_MAX] = [0: CHAT_MODEL_MAX];
+    var upn: usize = 0;
+    const ok: bool = try lb_pick(d, model, session, now, &prov, &up[0], CHAT_MODEL_MAX, &upn);
+    if !ok {
+        return error.ChatNoRoute;
+    }
+    out.provider_id = prov.id;
+    out.port = prov.port;
+    out.auth_type = prov.auth_type;
+    out.timeout_ms = prov.timeout_ms;
+    out.scheme_len = chat_copy(&out.scheme[0], 8, prov.scheme[0: prov.scheme_len]);
+    out.host_len = chat_copy(&out.host[0], CHAT_HOST_MAX, prov.host[0: prov.host_len]);
+    out.provider_name_len = chat_copy(&out.provider_name[0], 64, prov.name[0: prov.name_len]);
+    out.auth_name_len = chat_copy(&out.auth_name[0], CHAT_AUTH_NAME_MAX, prov.auth_name[0: prov.auth_name_len]);
+    out.secret_len = chat_copy(&out.secret[0], CHAT_SECRET_MAX, prov.secret[0: prov.secret_len]);
+    out.upstream_len = chat_copy(&out.upstream_model[0], CHAT_MODEL_MAX, up[0: upn]);
+    if prov.base_path_len == 0 {
+        out.path_len = chat_copy(&out.path[0], CHAT_PATH_MAX, &"/v1/chat/completions"[0: 20]);
+    } else {
+        var off: usize = 0;
+        if !chat_put(&out.path[0], CHAT_PATH_MAX, &off, prov.base_path[0: prov.base_path_len]) {
+            return error.ChatTooLarge;
+        }
+        if !chat_put(&out.path[0], CHAT_PATH_MAX, &off, &"/chat/completions"[0: 17]) {
+            return error.ChatTooLarge;
+        }
+        out.path_len = off;
+    }
+    return;
+}
+
+/// A4 快路径入口：返回 false 表示「形态不支持，调用方走完整解析」。
+export fn chat_prepare_fast(d: &Db, body: &[byte], session: &[byte], now: i64,
+    out: &ChatPlan) !bool {
+    if body.len == 0 || body.len > CHAT_PAYLOAD_MAX {
+        return error.ChatTooLarge;
+    }
+    var sc: ChatScan = ChatScan{ model_found: false, model_vs: 0, model_ve: 0,
+        stream_found: false, stream_val: false, unsupported: false };
+    try chat_scan(body, &sc);
+    if sc.unsupported || !sc.model_found {
+        return false;
+    }
+    const mn: usize = sc.model_ve - sc.model_vs;
+    if mn == 0 {
+        return false;
+    }
+    out.model_len = chat_copy(&out.model[0], CHAT_MODEL_MAX, body[sc.model_vs: mn]);
+    out.stream = sc.stream_val;
+    try chat_route(d, out.model[0: out.model_len], session, now, out);
+    const pn: usize = chat_rewrite_model_span(body, sc.model_vs, sc.model_ve,
+        out.upstream_model[0: out.upstream_len], &out.payload[0], CHAT_PAYLOAD_MAX);
+    if pn == 0 {
+        return error.ChatTooLarge;
+    }
+    out.payload_len = pn;
+    return true;
+}
+
 /// 无亲和的入口（单测/兼容）。
 export fn chat_prepare(d: &Db, body: &[byte], now: i64, out: &ChatPlan) !void {
     return chat_prepare_session(d, body, &""[0: 0], now, out);
@@ -148,7 +395,11 @@ export fn chat_prepare_span(d: &Db, body: &const byte, n: usize, now: i64,
     if n > CHAT_PAYLOAD_MAX {
         return error.ChatTooLarge;
     }
-    return chat_prepare(d, body[0: n], now, out);
+    const fast: bool = try chat_prepare_fast(d, body[0: n], &""[0: 0], now, out);
+    if !fast {
+        return chat_prepare(d, body[0: n], now, out);
+    }
+    return;
 }
 
 /// serve 用：带会话亲和的版本。
@@ -157,7 +408,12 @@ export fn chat_prepare_span_session(d: &Db, body: &const byte, n: usize,
     if n > CHAT_PAYLOAD_MAX {
         return error.ChatTooLarge;
     }
-    return chat_prepare_session(d, body[0: n], session, now, out);
+    // A4 热路径：先无 DOM 扫描；形态不支持才回退完整解析。
+    const fast: bool = try chat_prepare_fast(d, body[0: n], session, now, out);
+    if !fast {
+        return chat_prepare_session(d, body[0: n], session, now, out);
+    }
+    return;
 }
 
 /// 解析 `Authorization: Bearer <token>`；返回 token 长度（0=格式不对）。
@@ -224,43 +480,36 @@ export fn chat_prepare_session(d: &Db, body: &[byte], session: &[byte], now: i64
     out.model_len = chat_copy(&out.model[0], CHAT_MODEL_MAX, mbuf[0: mn]);
     out.stream = json_bool(&doc, json_get(&doc, root, &"stream"[0: 6]));
 
-    var prov: StoreProvider = StoreProvider{};
-    var up: [byte: CHAT_MODEL_MAX] = [0: CHAT_MODEL_MAX];
-    var upn: usize = 0;
-    const ok: bool = try lb_pick(d, mbuf[0: mn], session, now, &prov, &up[0], CHAT_MODEL_MAX, &upn);
-    if !ok {
-        return error.ChatNoRoute;
-    }
-    out.provider_id = prov.id;
-    out.port = prov.port;
-    out.auth_type = prov.auth_type;
-    out.timeout_ms = prov.timeout_ms;
-    out.scheme_len = chat_copy(&out.scheme[0], 8, prov.scheme[0: prov.scheme_len]);
-    out.host_len = chat_copy(&out.host[0], CHAT_HOST_MAX, prov.host[0: prov.host_len]);
-    out.provider_name_len = chat_copy(&out.provider_name[0], 64, prov.name[0: prov.name_len]);
-    out.auth_name_len = chat_copy(&out.auth_name[0], CHAT_AUTH_NAME_MAX, prov.auth_name[0: prov.auth_name_len]);
-    out.secret_len = chat_copy(&out.secret[0], CHAT_SECRET_MAX, prov.secret[0: prov.secret_len]);
-    out.upstream_len = chat_copy(&out.upstream_model[0], CHAT_MODEL_MAX, up[0: upn]);
-
-    if prov.base_path_len == 0 {
-        out.path_len = chat_copy(&out.path[0], CHAT_PATH_MAX, &"/v1/chat/completions"[0: 20]);
-    } else {
-        var off: usize = 0;
-        if !chat_put(&out.path[0], CHAT_PATH_MAX, &off, prov.base_path[0: prov.base_path_len]) {
-            return error.ChatTooLarge;
-        }
-        if !chat_put(&out.path[0], CHAT_PATH_MAX, &off, &"/chat/completions"[0: 17]) {
-            return error.ChatTooLarge;
-        }
-        out.path_len = off;
-    }
-
-    const pn: usize = chat_rewrite_model(body, up[0: upn], &out.payload[0], CHAT_PAYLOAD_MAX);
+    try chat_route(d, mbuf[0: mn], session, now, out);
+    const pn: usize = chat_rewrite_model(body, out.upstream_model[0: out.upstream_len],
+        &out.payload[0], CHAT_PAYLOAD_MAX);
     if pn == 0 {
         return error.ChatTooLarge;
     }
     out.payload_len = pn;
     _ = now;
+    return;
+}
+
+/// 同上，但只查价 + 入队（A4 批量落库）；serve 的请求路径用这个。
+export fn chat_settle_deferred(request_id: &[byte], user_id: i64, now: i64,
+    tz_min: i32, plan: &ChatPlan, response: &[byte], out: &BillingResult) !void {
+    if response.len == 0 {
+        return error.ChatFailed;
+    }
+    var doc: JsonDoc = JsonDoc{};
+    json_parse(&doc, response) catch {
+        return error.ChatFailed;
+    };
+    var usage: PriceUsage = PriceUsage{ input_tokens: 0, output_tokens: 0, cache_read_tokens: 0 };
+    if !billing_usage_parse(&doc, json_root(&doc), &usage) {
+        return error.ChatNoUsage;
+    }
+    billing_settle_deferred(request_id, user_id, now, tz_min,
+        plan.model[0: plan.model_len], plan.provider_name[0: plan.provider_name_len],
+        &usage, out) catch {
+        return error.ChatFailed;
+    };
     return;
 }
 

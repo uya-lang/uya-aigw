@@ -63,7 +63,7 @@
 
 - **node**：数据面，单进程单线程，跑 HTTP framing、插件池/内置 TLS 客户端、SSE 转发。
 - **controller**：控制面，用户/密钥/模型/价目/分配/计费账本；active/standby 通过 `flock` 选主。
-- **edge**：接入层，按 slug 把请求代理到 node；控制台与账户类请求转发到 controller。
+- **edge**：接入层，按 slug 把请求代理到 node；控制台与账户类请求转发到 controller。SSE 请求（`/edge/proxy?...&stream=1`）边读节点响应边刷客户端，chunked 增量解码、不等整个响应。
 - **内部接口**：`/cluster/{register,heartbeat,config,routes,route,ingest,drain,health}`，集群内明文 + `X-Cluster-Token`（可选 stunnel）。
 
 ## 4. 运行时模型
@@ -71,6 +71,8 @@
 - **单进程、单线程、无锁**：所有 I/O 走 epoll；协程用 `@async_fn` / `Future` / `Waker`。
 - **连接级协程**：每个连接一个 `@frame(conn_serve)` 帧（默认 1024 槽），状态机解析请求、转发上游、写响应。
 - **不阻塞**：DNS、TCP connect、TLS 握手、读写、上游 SSE 全部异步；插件子进程用 `fork+execve` + 非阻塞管道。
+- **上游等待**：`src/core/upwait.uya` 的 `wait_i32` 把 waker 登记的 fd（可读/可写/双向 + eventfd）
+  加进 epoll，Pending 时阻塞等待而不是忙轮询。
 - **背压**：客户端慢时停止读上游；插件池满时请求排队或快速失败。
 - **超时**：连接空闲读 60s；请求总 deadline 30min；上游首字节 60s、流空闲 120s。
 - **优雅停机**：`signalfd` 收到 SIGTERM/SIGINT 后停止 accept、排空在飞请求、回收插件、退出。
@@ -94,7 +96,7 @@
 {"id":1,"event":"error","data":{"code":"upstream_error","message":"..."}}
 ```
 
-插件池：常驻、`min/max`、空闲回收、崩溃退避、取消、`ping/pong`；v1 每进程 1 条在飞。
+插件池：常驻、`min/max`、空闲回收、崩溃退避、取消、`ping/pong`、被杀后同槽重绑并重试一次；v1 每进程 1 条在飞。
 
 内置 HTTP 供应商：设计见 `docs/design/tls-provider.md`。
 
@@ -103,10 +105,10 @@
 1. **接入**：edge 按 `/p/<slug>/v1/chat/completions` 解析 slug → node；或 node 直接接流量。
 2. **鉴权**：`Authorization: Bearer aigw_sk_...`；查内存快照（key → user/限额/模型权限）；slug 与 key 必须同用户。
 3. **限流**：节点本地令牌桶（RPM/TPM/并发），单属主保证精确。
-4. **规范**：chat 快路径只改 `model/stream/stream_options`；responses 做全量翻译。
+4. **规范**：chat 快路径不建 DOM（顶层扫描定位 `model`/`stream`，只按 span 改写 model），形态不安全才回退完整解析；responses 做全量翻译。
 5. **选路**：按模型取候选绑定，priority → 健康 → 权重/least-inflight → session 亲和；按会话哈希固定供应商。
 6. **调用**：插件池或内置 HTTP + TLS；记录首 token 时间。
-7. **转发**：流式逐事件写 SSE（chunked、逐事件 flush）；非流式聚合后一次写。
+7. **转发**：流式逐事件写 SSE（chunked、逐事件 flush）；非流式聚合后一次写。responses 的工具调用流额外发 `response.output_item.added` / `response.function_call_arguments.delta` / `response.output_item.done`，`completed` 里带 `output` 数组。
 8. **计量**：usage（供应商优先，缺失则估算）+ 分时价目 → `cost_nano` / `price_nano`。
 9. **日志**：请求行写入进程内队列 → 批量落 node.db → 批量上报 controller（幂等）。
 10. **收尾**：断连取消上游；释放连接/插件；更新熔断与 session 绑定。
@@ -135,11 +137,11 @@
 | 数据 | 位置 |
 |---|---|
 | 元数据（用户/密钥/模型/价目/分配） | controller `meta.db` |
-| 计费明细 + rollup | controller `usage-<k>.db`，`hash(user_id) % K`，K=4 |
+| 计费明细 + rollup | controller `usage-<k>.db`，`hash(user_id) % K`，K=4；journal 重放/ingest/查询都按 uid 路由或合并（已落地） |
 | 节点本地日志/待上报 | node `node-<id>.db` |
 
 - SQLite 3（`@c_import` 编入二进制），WAL、`synchronous=NORMAL`、`busy_timeout=5000`。
-- 热路径不碰库；批量写（500 行/事务或 200ms）；读只走 rollup。
+- 热路径不碰库：`batch.uya` 队列 + 事件循环按 512 行/200ms 单事务写 `usage_ledger`/`usage_daily`，journal 批追加只 fsync 一次；查询前先 flush 保证可见；读只走 rollup。
 - **每天 03:00 备份**（`VACUUM INTO` 子进程），**保留 7 份**。
 - **计费 journal**：每批 ingest 后追加 + fsync，保留 8 天，恢复时重放，RPO ≈ 5s。
 - 恢复流程见 `docs/runbooks/restore.md`。

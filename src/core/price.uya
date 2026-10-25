@@ -239,6 +239,8 @@ export struct PriceEntryRow {
     output_nano_per_mtok: i64,
     cache_read_nano_per_mtok: i64,
     per_request_nano: i64,
+    schedule: [byte: 256],
+    schedule_len: usize,
 }
 
 export fn price_entry_list(d: &Db, card_id: i64, out: &PriceEntryRow, cap: usize) !usize {
@@ -246,7 +248,7 @@ export fn price_entry_list(d: &Db, card_id: i64, out: &PriceEntryRow, cap: usize
         return error.PriceInvalid;
     }
     var st: DbStmt = dbx_prepare(d,
-        "select provider, model, user_id, input_nano_per_mtok, output_nano_per_mtok, cache_read_nano_per_mtok, per_request_nano from price_entries where card_id = ? order by model, provider limit ?" as &const byte) catch {
+        "select provider, model, user_id, input_nano_per_mtok, output_nano_per_mtok, cache_read_nano_per_mtok, per_request_nano, schedule from price_entries where card_id = ? order by model, provider limit ?" as &const byte) catch {
         return error.PriceFailed;
     };
     defer { dbx_finalize(&st); }
@@ -264,6 +266,7 @@ export fn price_entry_list(d: &Db, card_id: i64, out: &PriceEntryRow, cap: usize
         out[n].output_nano_per_mtok = dbx_col_i64(&st, 4);
         out[n].cache_read_nano_per_mtok = dbx_col_i64(&st, 5);
         out[n].per_request_nano = dbx_col_i64(&st, 6);
+        out[n].schedule_len = dbx_col_text(&st, 7, &out[n].schedule[0], 256);
         n = n + 1;
     }
     return n;

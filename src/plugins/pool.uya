@@ -12,6 +12,8 @@
 //   * 崩溃：子进程退出由 tick 的 waitpid(WNOHANG) 发现；崩溃次数用于指数退避
 //     （`backoff_ms * crashes`，封顶 30s），退避窗口内 acquire 返回 PluginPoolBackoff。
 //   * cancel：请求方主动放弃（断连/超时），SIGKILL + 收尸，不计崩溃数。
+//   * 重绑：进程被杀/崩溃后，`plugin_pool_call` 收尸 → 同槽换新进程 → 重试一次；
+//     `plugin_pool_rebind` 可单独调用（跳过崩溃退避，因为这是恢复而不是补常驻）。
 //   * 行 IO：非阻塞 fd + poll 超时；读缓冲按行分帧，半行留在槽里下次续读。
 //
 // 单线程前提：池状态无锁；fd 交给 epoll（A4）时用 `plugin_pool_out_fd` / `plugin_pool_in_fd` 注册。
@@ -26,6 +28,7 @@ extern fn aigw_pool_wait_nohang(pid: i32, status: &i32) i32;
 extern fn aigw_pool_wait(pid: i32, status: &i32) i32;
 extern fn aigw_pool_kill(pid: i32, sig: i32) i32;
 extern fn aigw_pool_poll(fd: i32, events: i32, timeout_ms: i32) i32;
+extern fn aigw_pool_ignore_sigpipe() void;
 
 /// 池容量上限（编译期固定，槽表放 .bss）。
 export const PLUGIN_POOL_MAX_SLOTS: usize = 8;
@@ -188,6 +191,8 @@ fn plugin_pool_spawn_slot(idx: i32, now: i64, state: i32) !void {
 /// 配置 + 预热。已有池在用时返回 PluginPoolAlreadyInit（先 shutdown）。
 export fn plugin_pool_init_at(cmd: &[byte], min: i32, max: i32, idle_ms: i64,
     backoff_ms: i64, now: i64) !void {
+    // 插件可能随时退出；写死管道只应拿到 EPIPE，不能把进程带走。
+    aigw_pool_ignore_sigpipe();
     if g_pp_ready {
         return error.PluginPoolAlreadyInit;
     }
@@ -333,6 +338,22 @@ export fn plugin_pool_mark_dead(idx: i32, now: i64) void {
     plugin_pool_reap(s);
     s.crashes = s.crashes +% 1;
     plugin_pool_crash_block(now);
+}
+
+/// 插件级重绑：进程被杀/崩溃后，在同一个槽里换新进程（跳过崩溃退避窗口）。
+/// 槽里已有活进程时是 no-op；成功后槽状态为 BUSY，调用方可继续用同一 idx。
+export fn plugin_pool_rebind(idx: i32, now: i64) !void {
+    if !plugin_pool_valid(idx) {
+        return error.PluginPoolSlotInvalid;
+    }
+    const s: &PluginPoolSlot = plugin_pool_slot(idx);
+    if s.pid > 0 && s.state != PLUGIN_POOL_STATE_FREE {
+        return;
+    }
+    if s.pid > 0 || s.in_fd >= 0 || s.out_fd >= 0 {
+        plugin_pool_reap(s);
+    }
+    return plugin_pool_spawn_slot(idx, now, PLUGIN_POOL_STATE_BUSY);
 }
 
 /// 主动取消（断连/超时）：杀进程但不计崩溃、不进退避。
@@ -582,6 +603,92 @@ export fn plugin_pool_ping(idx: i32, timeout_ms: i32) !void {
         return error.PluginPoolIo;
     }
     return;
+}
+
+// ---------------------------------------------------------------
+// 调用 + 重绑（A8）
+// ---------------------------------------------------------------
+
+/// 一次「写一行 + 读一行」的原始结果：0=成功、1=超时、2=进程坏、3=槽无效。
+/// `n` 只在 0 时有意义。
+fn plugin_pool_attempt(idx: i32, data: &[byte], out: &byte, cap: usize,
+    timeout_ms: i32, n: &usize) i32 {
+    n[0] = 0;
+    const sr: !void = plugin_pool_send(idx, data);
+    var failed: bool = false;
+    var eid: i32 = 0;
+    sr catch |e| {
+        failed = true;
+        eid = @error_id(e) as i32;
+    };
+    if failed {
+        if eid == (@error_id(error.PluginPoolTimeout) as i32) {
+            return 1;
+        }
+        if eid == (@error_id(error.PluginPoolSlotInvalid) as i32) {
+            return 3;
+        }
+        return 2;
+    }
+    const rr: !usize = plugin_pool_read_line(idx, out, cap, timeout_ms);
+    var got: usize = 0;
+    got = rr catch |e| {
+        failed = true;
+        eid = @error_id(e) as i32;
+        0 as usize;
+    };
+    if failed {
+        if eid == (@error_id(error.PluginPoolTimeout) as i32) {
+            return 1;
+        }
+        if eid == (@error_id(error.PluginPoolSlotInvalid) as i32) {
+            return 3;
+        }
+        return 2;
+    }
+    n[0] = got;
+    return 0;
+}
+
+/// 插件级调用（A8）：写一行 + 读一行；进程坏了就同槽重绑并重试一次。
+/// 成功返回行字节数（含换行）。超时不重绑（进程只是慢）；槽号写回 `idx`。
+export fn plugin_pool_call(idx: &i32, data: &[byte], out: &byte, cap: usize,
+    timeout_ms: i32, now: i64) !usize {
+    if !plugin_pool_valid(idx[0]) || cap == 0 {
+        return error.PluginPoolSlotInvalid;
+    }
+    const i: i32 = idx[0];
+    if plugin_pool_state_of(i) != PLUGIN_POOL_STATE_BUSY {
+        return error.PluginPoolSlotInvalid;
+    }
+    var n: usize = 0;
+    var rc: i32 = plugin_pool_attempt(i, data, out, cap, timeout_ms, &n);
+    if rc == 0 {
+        return n;
+    }
+    if rc == 1 {
+        return error.PluginPoolTimeout;
+    }
+    if rc == 3 {
+        return error.PluginPoolSlotInvalid;
+    }
+    // rc == 2：进程坏了（EOF/EPIPE/协议错）→ 收尸 → 同槽重绑 → 原样重试一次
+    plugin_pool_mark_dead(i, now);
+    plugin_pool_rebind(i, now) catch {
+        return error.PluginPoolSpawnFailed;
+    };
+    var n2: usize = 0;
+    rc = plugin_pool_attempt(i, data, out, cap, timeout_ms, &n2);
+    if rc == 0 {
+        return n2;
+    }
+    if rc == 1 {
+        return error.PluginPoolTimeout;
+    }
+    if rc == 3 {
+        return error.PluginPoolSlotInvalid;
+    }
+    return error.PluginPoolIo;
 }
 
 // ---------------------------------------------------------------

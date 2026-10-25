@@ -146,7 +146,93 @@ fn test_bearer() !void {
     try assert_eq_i32(chat_bearer(&"Bearer"[0: 6], &tok[0], 64) as i32, 0);
 }
 
+const FAST_A: &[byte] = &"{\"model\" : \"gpt-4o\", \"stream\" : true, \"messages\" : [{\"role\":\"user\",\"content\":\"hi model\"}]}"[0: 90];
+const FAST_B: &[byte] = &"{\"model\":\"gpt-4o\",\"messages\":[{\"model\":\"nested\",\"content\":\"hi\"}]}"[0: 65];
+const FAST_C: &[byte] = &"{\"model\":\"gpt\\u002d4o\",\"messages\":[]}"[0: 37];
+const FAST_D: &[byte] = &"[{\"model\":\"gpt-4o\"}]"[0: 20];
+const FAST_E: &[byte] = &"{\"model\":\"gpt-4o\",\"model\":\"gpt-4o\"}"[0: 35];
+const FAST_F: &[byte] = &"{\"model\":123}"[0: 13];
+const FAST_G: &[byte] = &"{\"model\":\"gpt-4o\",\"stream\":\"true\"}"[0: 34];
+const FAST_H: &[byte] = &"{\"model\":\"gpt-4o\""[0: 17];
+const FAST_I: &[byte] = &"{\"messages\":[{\"model\":\"x\"}]}"[0: 28];
+const FAST_J: &[byte] = &"{\"model\":\"gpt-4o\",\"messages\":[]}"[0: 32];
+
+fn eq_bytes(a: &[byte], b: &[byte]) bool {
+    if a.len != b.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < a.len {
+        if a[i] != b[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn test_fast_path() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    try setup(&d);
+
+    // 带空白/乱序字段/嵌套 content 的请求：快路径可用，且与完整解析结果一致
+    var fast: ChatPlan = ChatPlan{};
+    const ok: bool = try chat_prepare_fast(&d, FAST_A, &""[0: 0], T0, &fast);
+    try assert_eq_bool(ok, true);
+    try assert_eq_bool(fast.stream, true);
+    try assert_eq_i32(fast.model_len as i32, 6);
+    try assert_eq_i32(fast.upstream_len as i32, 11);
+    try assert_eq_bool(contains(fast.payload[0: fast.payload_len], &"\"model\" : \"gpt-4o-2024\""[0: 23]), true);
+    try assert_eq_bool(contains(fast.payload[0: fast.payload_len], &"hi model"[0: 8]), true);
+    var slow: ChatPlan = ChatPlan{};
+    try chat_prepare_session(&d, FAST_A, &""[0: 0], T0, &slow);
+    try assert_eq_bool(eq_bytes(fast.payload[0: fast.payload_len], slow.payload[0: slow.payload_len]), true);
+    try assert_eq_bool(eq_bytes(fast.model[0: fast.model_len], slow.model[0: slow.model_len]), true);
+
+    // 嵌套的 model 键不参与改写
+    var b: ChatPlan = ChatPlan{};
+    try assert_eq_bool(try chat_prepare_fast(&d, FAST_B, &""[0: 0], T0, &b), true);
+    try assert_eq_bool(contains(b.payload[0: b.payload_len], &"\"model\":\"gpt-4o-2024\""[0: 21]), true);
+    try assert_eq_bool(contains(b.payload[0: b.payload_len], &"\"model\":\"nested\""[0: 16]), true);
+
+    // 没有 stream 字段 → 非流式
+    var j: ChatPlan = ChatPlan{};
+    try assert_eq_bool(try chat_prepare_fast(&d, FAST_J, &""[0: 0], T0, &j), true);
+    try assert_eq_bool(j.stream, false);
+
+    // 不适合快路径的形态一律回退（false），不误判
+    var p: ChatPlan = ChatPlan{};
+    try assert_eq_bool(try chat_prepare_fast(&d, FAST_C, &""[0: 0], T0, &p), false);
+    try assert_eq_bool(try chat_prepare_fast(&d, FAST_D, &""[0: 0], T0, &p), false);
+    try assert_eq_bool(try chat_prepare_fast(&d, FAST_E, &""[0: 0], T0, &p), false);
+    try assert_eq_bool(try chat_prepare_fast(&d, FAST_F, &""[0: 0], T0, &p), false);
+    try assert_eq_bool(try chat_prepare_fast(&d, FAST_G, &""[0: 0], T0, &p), false);
+    try assert_eq_bool(try chat_prepare_fast(&d, FAST_I, &""[0: 0], T0, &p), false);
+
+    // 回退后完整解析能把 \u002d 还原成 '-'，仍然路由到同一个上游模型
+    var esc: ChatPlan = ChatPlan{};
+    try chat_prepare_span_session(&d, FAST_C.ptr, FAST_C.len, &""[0: 0], T0, &esc);
+    try assert_eq_i32(esc.model_len as i32, 6);
+    try assert_eq_bool(contains(esc.model[0: esc.model_len], &"gpt-4o"[0: 6]), true);
+    try assert_eq_i32(esc.upstream_len as i32, 11);
+
+    // 结构损坏 / 只有嵌套 model → 拒绝
+    var bad: bool = false;
+    _ = chat_prepare(&d, FAST_H, T0, &p) catch |_| {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+    bad = false;
+    _ = chat_prepare(&d, FAST_I, T0, &p) catch |_| {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+}
+
 test "prepare" { run_test("prepare", test_prepare); }
+test "fast_path" { run_test("fast_path", test_fast_path); }
 test "bearer" { run_test("bearer", test_bearer); }
 test "prepare_errors" { run_test("prepare_errors", test_prepare_errors); }
 test "settle" { run_test("settle", test_settle); }
