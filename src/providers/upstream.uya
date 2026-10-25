@@ -1,0 +1,44 @@
+// src/providers/upstream.uya — A4 上游传输（复用 TLS-09 的 htc_* 异步栈）
+//
+// 只做「一次非流式 POST → 状态码 + 响应体」；配置（HttppConfig / HtcCtx）由调用方
+// 准备：serve 从 ChatPlan 构造，测试用 provider_spike 的本地 TLS 上游。
+//
+// 注意：`block_on` 目前是忙轮询（TLS-09E 的等待原语限制），在请求路径上是阻塞的；
+// A8/A9 再换成事件循环里的 future。当前先保证鉴权/路由/结算语义正确。
+
+use std.async;
+
+export error UpstreamFailed;
+
+/// 非流式 POST：网络/协议错误返回 `UpstreamFailed`；HTTP 状态码原样写回 `status`。
+export fn upstream_post(ctx: &HtcCtx, cfg: &const HttppConfig, path: &[byte],
+    body: &[byte], now_ms: u64, deadline: u64, out: &byte, cap: usize,
+    status: &i32, out_len: &usize) !void {
+    status[0] = 0;
+    out_len[0] = 0;
+    if cap == 0 {
+        return error.UpstreamFailed;
+    }
+    var call: HtcCall = HtcCall{};
+    htc_call_init(&call);
+    defer { htc_call_free(&call); }
+    const o: !i32 = block_on<i32>(htc_open_async(cfg, ctx, &"POST"[0: 4], path,
+        body, false, now_ms, deadline, &call));
+    const rc: i32 = o catch |_| {
+        return error.UpstreamFailed;
+    };
+    if rc != 0 {
+        return error.UpstreamFailed;
+    }
+    var got: usize = 0;
+    const b: !i32 = block_on<i32>(htc_body_async(&call, out, cap, &got));
+    const br: i32 = b catch |_| {
+        return error.UpstreamFailed;
+    };
+    if br != 0 {
+        return error.UpstreamFailed;
+    }
+    status[0] = call.head.status;
+    out_len[0] = got;
+    return;
+}
