@@ -38,7 +38,8 @@ PY
 )
 cat > "$TMP/mock.py" <<'PY'
 import http.server, ssl, sys
-port, cert, key, reqfile = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+port, cert, key, reqfile, connfile = (int(sys.argv[1]), sys.argv[2], sys.argv[3],
+                                     sys.argv[4], sys.argv[5])
 BODY = (b'{"id":"chatcmpl-e2e","object":"chat.completion",'
         b'"choices":[{"message":{"role":"assistant","content":"hello-from-mock"}}],'
         b'"usage":{"prompt_tokens":100000,"completion_tokens":50000,'
@@ -57,6 +58,11 @@ SSE_TOOL = (b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1"
 class H(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     def log_message(self, *a): pass
+    def setup(self):
+        super().setup()
+        # D2：每次 TCP accept 记一行，用于断言连接池复用（请求数 >> 连接数）
+        with open(connfile, "a") as f:
+            f.write("c\n")
     def do_POST(self):
         n = int(self.headers.get("Content-Length", "0"))
         data = self.rfile.read(n)
@@ -87,13 +93,16 @@ class H(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(BODY)))
         self.end_headers()
         self.wfile.write(BODY); self.wfile.flush()
-srv = http.server.HTTPServer(("127.0.0.1", port), H)
+# D2：连接池会长期占用 keep-alive 连接，单线程 HTTPServer 会让后续新连接饿死，
+# 因此 mock 用「每连接一线程」。
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), H)
+srv.daemon_threads = True
 sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 sctx.load_cert_chain(cert, key)
 srv.socket = sctx.wrap_socket(srv.socket, server_side=True)
 srv.serve_forever()
 PY
-python3 "$TMP/mock.py" "$MPORT" "$TMP/leaf.pem" "$TMP/leaf.key" "$TMP/req.json" >"$TMP/mock.log" 2>&1 &
+python3 "$TMP/mock.py" "$MPORT" "$TMP/leaf.pem" "$TMP/leaf.key" "$TMP/req.json" "$TMP/conns.txt" >"$TMP/mock.log" 2>&1 &
 MOCK_PID=$!
 sleep 0.3
 
@@ -473,12 +482,20 @@ echo "$I2" | grep -q '"duplicate":2' || { echo "$I2" >&2; fail "ingest duplicate
 # 4y) A4：上游事件驱动等待下的 p99（20 次顺序 chat；上游是本地 TLS mock）
 LAT="$TMP/lat.txt"
 : > "$LAT"
+# D2：连接池复用——这 20 次顺序请求不应各建一条 TCP/TLS 连接
+CONN0=$(wc -l < "$TMP/conns.txt" 2>/dev/null | tr -d ' ' || echo 0)
+[ -n "$CONN0" ] || CONN0=0
 for i in $(seq 1 20); do
   curl -s --max-time 10 -o /dev/null -w '%{time_total}\n' -X POST \
     -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
     --data '{"model":"mock-model","messages":[{"role":"user","content":"ping"}]}' \
     "$BASE/v1/chat/completions" >> "$LAT"
 done
+CONN1=$(wc -l < "$TMP/conns.txt" 2>/dev/null | tr -d ' ' || echo 0)
+[ -n "$CONN1" ] || CONN1=0
+CONND=$((CONN1 - CONN0))
+[ "$CONND" -le 2 ] || fail "pool not reusing: 20 chats opened $CONND conns"
+echo "CHAT-POOL reused conns_delta=$CONND"
 P99=$(sort -n "$LAT" | awk '{a[NR]=$1} END{print a[int(NR*0.99)]}')
 AVG=$(awk '{s+=$1} END{printf "%.4f", s/NR}' "$LAT")
 awk -v p="$P99" 'BEGIN{exit !(p>0 && p<1.0)}' || fail "chat p99=$P99"

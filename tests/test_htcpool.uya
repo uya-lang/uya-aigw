@@ -1,0 +1,120 @@
+// tests/test_htcpool.uya — D2 活连接池：命中/key 隔离/TTL/LRU/数量
+//
+// 不建真连接：槽里放 `/dev/null` 的 fd（关闭是安全的），只验证所有权转移与淘汰策略。
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+use libc.syscall;
+
+fn make_conn() TlsxConn {
+    var c: TlsxConn = tlsx_conn_empty();
+    const fd: i32 = sys_open(&"/dev/null"[0] as *const byte, 0 as i32, 0 as i32) catch {
+        0 - 1;
+    };
+    c.fd = fd;
+    return c;
+}
+
+fn test_put_take() !void {
+    var p: HtcPool = HtcPool{};
+    htc_pool_init(&p);
+    try assert_eq_i32(htc_pool_count(&p) as i32, 0);
+    var miss: TlsxConn = tlsx_conn_empty();
+    try assert_eq_bool(htc_pool_take(&p, &"a.com"[0: 5], 5, 443, 1, 1000, &miss), false);
+    try assert_eq_i32(p.misses as i32, 1);
+
+    var c: TlsxConn = make_conn();
+    try assert_eq_bool(htc_pool_put(&p, &"a.com"[0: 5], 5, 443, 1, 1000, &c), true);
+    try assert_eq_i32(c.fd as i32, -1);            // 所有权已转走
+    try assert_eq_i32(htc_pool_count(&p) as i32, 1);
+
+    var out: TlsxConn = tlsx_conn_empty();
+    try assert_eq_bool(htc_pool_take(&p, &"A.COM"[0: 5], 5, 443, 1, 2000, &out), true);
+    try assert_eq_bool(out.fd >= 0, true);
+    try assert_eq_i32(p.hits as i32, 1);
+    try assert_eq_i32(htc_pool_count(&p) as i32, 0);
+    tlsx_conn_free(&out);
+}
+
+fn test_key_isolation() !void {
+    var p: HtcPool = HtcPool{};
+    htc_pool_init(&p);
+    var c: TlsxConn = make_conn();
+    try assert_eq_bool(htc_pool_put(&p, &"a.com"[0: 5], 5, 443, 1, 1000, &c), true);
+    var o1: TlsxConn = tlsx_conn_empty();
+    try assert_eq_bool(htc_pool_take(&p, &"a.com"[0: 5], 5, 444, 1, 2000, &o1), false);
+    try assert_eq_bool(htc_pool_take(&p, &"b.com"[0: 5], 5, 443, 1, 2000, &o1), false);
+    try assert_eq_bool(htc_pool_take(&p, &"a.com"[0: 5], 5, 443, 2, 2000, &o1), false);
+    // 原条目还在
+    try assert_eq_bool(htc_pool_take(&p, &"a.com"[0: 5], 5, 443, 1, 2000, &o1), true);
+    tlsx_conn_free(&o1);
+}
+
+fn test_ttl_and_prune() !void {
+    var p: HtcPool = HtcPool{};
+    htc_pool_init(&p);
+    var c: TlsxConn = make_conn();
+    try assert_eq_bool(htc_pool_put(&p, &"a.com"[0: 5], 5, 443, 1, 1000, &c), true);
+    const stale: u64 = 1000 +% HTC_POOL_IDLE_MS;
+    var o: TlsxConn = tlsx_conn_empty();
+    try assert_eq_bool(htc_pool_take(&p, &"a.com"[0: 5], 5, 443, 1, stale, &o), false);
+    try assert_eq_i32(htc_pool_count(&p) as i32, 0);
+
+    var c2: TlsxConn = make_conn();
+    try assert_eq_bool(htc_pool_put(&p, &"a.com"[0: 5], 5, 443, 1, 10, &c2), true);
+    try assert_eq_i32(htc_pool_prune(&p, 10 +% HTC_POOL_IDLE_MS) as i32, 1);
+    try assert_eq_i32(htc_pool_count(&p) as i32, 0);
+}
+
+fn test_lru_evict() !void {
+    var p: HtcPool = HtcPool{};
+    htc_pool_init(&p);
+    var i: usize = 0;
+    while i < HTC_POOL_SLOTS {
+        var c: TlsxConn = make_conn();
+        var hb: [byte: 8] = [0: 8];
+        hb[0] = 'h';
+        hb[1] = ('0' as byte) +% (i as byte);
+        try assert_eq_bool(htc_pool_put(&p, &hb[0], 2, 443, 0, 1000 +% (i as u64), &c), true);
+        try assert_eq_i32(htc_pool_count(&p) as i32, (i + 1) as i32);
+        i = i + 1;
+    }
+    // 满：最旧的 h0 被淘汰，其它还在
+    var c: TlsxConn = make_conn();
+    try assert_eq_bool(htc_pool_put(&p, &"zz"[0: 2], 2, 443, 0, 2000, &c), true);
+    try assert_eq_i32(p.drops as i32, 1);
+    var o: TlsxConn = tlsx_conn_empty();
+    try assert_eq_bool(htc_pool_take(&p, &"h0"[0: 2], 2, 443, 0, 2000, &o), false);
+    try assert_eq_bool(htc_pool_take(&p, &"h1"[0: 2], 2, 443, 0, 2000, &o), true);
+    tlsx_conn_free(&o);
+}
+
+fn test_reusable_rules() !void {
+    var call: HtcCall = HtcCall{};
+    htc_call_init(&call);
+    defer { htc_call_free(&call); }
+    // 未读完 → 不可复用
+    try assert_eq_bool(htc_call_reusable(&call), false);
+    call.done = true;
+    call.head.content_length = 0;
+    call.head.head_len = 30;
+    call.body.len = 30;
+    try assert_eq_bool(htc_call_reusable(&call), true);
+    // Connection: close → 不可复用
+    call.head.connection_close = true;
+    try assert_eq_bool(htc_call_reusable(&call), false);
+    call.head.connection_close = false;
+    // 有多余字节（可能是下一个响应）→ 不可复用
+    call.body.len = 31;
+    try assert_eq_bool(htc_call_reusable(&call), false);
+    // 流式 → 不可复用
+    call.body.len = 30;
+    call.stream = true;
+    try assert_eq_bool(htc_call_reusable(&call), false);
+}
+
+test "put_take" { run_test("put_take", test_put_take); }
+test "key_isolation" { run_test("key_isolation", test_key_isolation); }
+test "ttl_and_prune" { run_test("ttl_and_prune", test_ttl_and_prune); }
+test "lru_evict" { run_test("lru_evict", test_lru_evict); }
+test "reusable_rules" { run_test("reusable_rules", test_reusable_rules); }

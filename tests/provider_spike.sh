@@ -90,7 +90,9 @@ class H(http.server.BaseHTTPRequestHandler):
             self.wfile.write(("%x\r\n" % len(body)).encode() + body + b"\r\n0\r\n\r\n")
             self.wfile.flush()
 
-srv = http.server.HTTPServer(("127.0.0.1", port), H)
+# 连接池会长期占用 keep-alive 连接：fixture 必须能同时服务多条连接。
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), H)
+srv.daemon_threads = True
 sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 sctx.load_cert_chain(cert, key)
 srv.socket = sctx.wrap_socket(srv.socket, server_side=True)

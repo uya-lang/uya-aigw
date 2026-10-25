@@ -2407,6 +2407,8 @@ export fn serve_run(lfd: i32, stats: &ServeStats) !i32 {
     }
     runtime_tick();
         batch_tick(srv_now_ms());
+        // D2：顺手清理过期的上游空闲连接（每轮 O(8) 比较）。
+        _ = htc_pool_prune(&g_up_ctx.pool, srv_now_ms());
         if srv_stop_requested() != 0 && stopping == 0 {
             stopping = 1;
             stop_at = srv_now_ms() +% SRV_SHUTDOWN_MS;

@@ -19,6 +19,7 @@ run src/foundation/buf.uya src/net/rsav.uya src/net/x509min.uya src/net/chainx.u
 run src/foundation/buf.uya src/net/rsav.uya src/net/x509min.uya src/net/chainx.uya src/net/urlx.uya src/net/dnsx.uya src/net/tcpx.uya src/net/tlsx.uya src/net/tlsx_conn.uya src/net/httpc.uya tests/test_httpc.uya
 run src/foundation/buf.uya src/net/ssex.uya tests/test_ssex.uya
 run src/net/httpc_pool.uya tests/test_httpc_pool.uya
+run src/foundation/buf.uya src/net/rsav.uya src/net/x509min.uya src/net/chainx.uya src/net/urlx.uya src/net/dnsx.uya src/net/tcpx.uya src/net/tlsx.uya src/net/tlsx_conn.uya src/net/httpc.uya src/net/ssex.uya src/net/httpc_pool.uya src/providers/http.uya src/providers/httpcall.uya tests/test_htcpool.uya
 run src/foundation/buf.uya src/providers/http.uya tests/test_provider_http.uya
 run src/foundation/buf.uya src/providers/http.uya src/providers/upstream_cfg.uya tests/test_upstream_cfg.uya
 run src/foundation/buf.uya src/net/proxyx.uya tests/test_proxyx.uya

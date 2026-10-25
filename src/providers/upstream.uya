@@ -5,6 +5,9 @@
 //
 // 上游等待走 `upwait.wait_i32`（epoll 事件驱动：Pending 时等 waker 登记的 fd，
 // 不再忙轮询烧 CPU）；请求路径上的语义与原来的 block_on 完全一致。
+//
+// D2：连接池命中旧连接但上游已经把它关掉时，`htc_open_async` 返回 `HtcStale`，
+// 这里换一条全新连接重试一次（只重试一次，避免把连接抖动放大成请求风暴）。
 
 use std.async;
 
@@ -20,26 +23,47 @@ export fn upstream_post(ctx: &HtcCtx, cfg: &const HttppConfig, path: &[byte],
     if cap == 0 {
         return error.UpstreamFailed;
     }
-    var call: HtcCall = HtcCall{};
-    htc_call_init(&call);
-    defer { htc_call_free(&call); }
-    const o: !i32 = wait_i32(htc_open_async(cfg, ctx, &"POST"[0: 4], path,
-        body, false, now_ms, deadline, &call));
-    const rc: i32 = o catch |_| {
-        return error.UpstreamFailed;
-    };
-    if rc != 0 {
-        return error.UpstreamFailed;
+    var tries: i32 = 0;
+    while tries < 2 {
+        tries = tries +% 1;
+        var call: HtcCall = HtcCall{};
+        htc_call_init(&call);
+        var stale: bool = false;
+        const o: !i32 = wait_i32(htc_open_async(cfg, ctx, &"POST"[0: 4], path,
+            body, false, now_ms, deadline, &call));
+        const rc: i32 = o catch |err| {
+            if @error_id(err) == @error_id(error.HtcStale) {
+                stale = true;
+            }
+            0 - 1;
+        };
+        if stale {
+            htc_call_free(&call);
+            continue;
+        }
+        if rc != 0 {
+            htc_call_free(&call);
+            return error.UpstreamFailed;
+        }
+        var got: usize = 0;
+        const b: !i32 = wait_i32(htc_body_async(&call, out, cap, &got));
+        const br: i32 = b catch |_| {
+            htc_call_free(&call);
+            return error.UpstreamFailed;
+        };
+        if br != 0 {
+            htc_call_free(&call);
+            return error.UpstreamFailed;
+        }
+        status[0] = call.head.status;
+        out_len[0] = got;
+        // D2：读完且上游没要求关闭 → 归还连接池，下一次同 (host,port,trust) 跳过握手。
+        if htc_call_reusable(&call) {
+            _ = htc_pool_put(&ctx.pool, &cfg.host[0], cfg.host_len, cfg.port,
+                ctx.mode, now_ms, &call.conn);
+        }
+        htc_call_free(&call);
+        return;
     }
-    var got: usize = 0;
-    const b: !i32 = wait_i32(htc_body_async(&call, out, cap, &got));
-    const br: i32 = b catch |_| {
-        return error.UpstreamFailed;
-    };
-    if br != 0 {
-        return error.UpstreamFailed;
-    }
-    status[0] = call.head.status;
-    out_len[0] = got;
-    return;
+    return error.UpstreamFailed;
 }
