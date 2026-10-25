@@ -54,16 +54,16 @@
   旧问题：uplink 之前其实从未成功（`tcpx_connect_v4` 在事件循环里只空转、点分 IP 未解析、
   请求用了非 NUL 结尾的 cstr 追加）；已改为阻塞 socket/connect + `dnsx_parse_ipv4` + 固定缓冲，
   `make cluster-e2e` 用独立 node id 验证注册。
-- B4（进行中）：edge 路由核心 + `GET /edge/route`、`/edge/fail`、`GET /edge/proxy`（节点代理 +
-  失败清亲和重试）已落地；SSE 转发与 1k 并发压测待做。
+- B4（已完成）：edge 路由核心 + `GET /edge/route`、`/edge/fail`、`GET /edge/proxy`（节点代理 +
+  失败清亲和重试）+ `stream=1` SSE 流式转发（chunked 增量解码，cluster e2e 实测首事件 0.000s、
+  总时长 0.389s）+ 1k 并发压测（`make load-sse`）。
 - B5（进行中）：幂等 ingest、区间重算、spool 重放循环（`POST /node/spool` + tick 2s 重放，
   全成功才清空）、Key 吊销已落地；usage 分片与 journal 全量重放待做。
 - B6（已完成）：`make cluster-e2e` 全绿（1 controller + 3 node、epoch/fencing、config 快照、
   edge 路由/亲和/归属、代理、drain 迁移、ingest 幂等、spool 重放）+ `deploy/nginx.conf`、`docs/deploy.md`。
 - C6（已完成）：CSP/nosniff/Referrer-Policy/XFO 安全头、XSS/越权断言、`make ui-e2e`、
   `docs/ui.md`；API 全 Bearer、无 Cookie，故 CSRF 面为零（不做双提交 token）。
-- B4（进行中）：edge 路由核心（slug 归属 + session 亲和 + 失败清缓存，11 断言）；
-  HTTP/SSE 代理待做。
+- B4（已完成）：edge 路由核心（slug 归属 + session 亲和 + 失败清缓存）+ HTTP/SSE 代理。
 
 ## 开发命令（A9）
 
@@ -110,16 +110,16 @@
   旧问题：uplink 之前其实从未成功（`tcpx_connect_v4` 在事件循环里只空转、点分 IP 未解析、
   请求用了非 NUL 结尾的 cstr 追加）；已改为阻塞 socket/connect + `dnsx_parse_ipv4` + 固定缓冲，
   `make cluster-e2e` 用独立 node id 验证注册。
-- B4（进行中）：edge 路由核心 + `GET /edge/route`、`/edge/fail`、`GET /edge/proxy`（节点代理 +
-  失败清亲和重试）已落地；SSE 转发与 1k 并发压测待做。
+- B4（已完成）：edge 路由核心 + `GET /edge/route`、`/edge/fail`、`GET /edge/proxy`（节点代理 +
+  失败清亲和重试）+ `stream=1` SSE 流式转发（chunked 增量解码，cluster e2e 实测首事件 0.000s、
+  总时长 0.389s）+ 1k 并发压测（`make load-sse`）。
 - B5（进行中）：幂等 ingest、区间重算、spool 重放循环（`POST /node/spool` + tick 2s 重放，
   全成功才清空）、Key 吊销已落地；usage 分片与 journal 全量重放待做。
 - B6（已完成）：`make cluster-e2e` 全绿（1 controller + 3 node、epoch/fencing、config 快照、
   edge 路由/亲和/归属、代理、drain 迁移、ingest 幂等、spool 重放）+ `deploy/nginx.conf`、`docs/deploy.md`。
 - C6（已完成）：CSP/nosniff/Referrer-Policy/XFO 安全头、XSS/越权断言、`make ui-e2e`、
   `docs/ui.md`；API 全 Bearer、无 Cookie，故 CSRF 面为零（不做双提交 token）。
-- B4（进行中）：edge 路由核心（slug 归属 + session 亲和 + 失败清缓存，11 断言）；
-  HTTP/SSE 代理待做。
+- B4（已完成）：edge 路由核心（slug 归属 + session 亲和 + 失败清缓存）+ HTTP/SSE 代理。
 
 ## 开发命令（A9）
 

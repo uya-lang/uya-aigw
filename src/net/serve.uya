@@ -4639,6 +4639,56 @@ fn srv_node_status(c: &SrvConn, stats: &ServeStats) void {
 
 
 /// B4：把请求代理给 slug 的归属节点（`?slug=&path=&session=`），失败清亲和后重试一次。
+/// B4：edge→node 的 SSE 流式转发：边读边刷，首事件不必等整个响应。
+fn srv_edge_proxy_stream(c: &SrvConn, ip: &[byte], port: u16, path: &[byte]) void {
+    const keep: bool = c.keep;
+    _ = keep;
+    var us: UpStream = UpStream{};
+    uplink_stream_begin(ip, port, path, 5000, &us) catch {
+        srv_static(c, 502, SRV_JSON_502, c.keep);
+        return;
+    };
+    defer { uplink_stream_close(&us); }
+    if us.status != 200 {
+        srv_static(c, 502, SRV_JSON_502, c.keep);
+        return;
+    }
+    const fl: !i32 = sys_fcntl(c.fd, 3, 0);
+    const flags: i32 = fl catch {
+        0;
+    };
+    if flags != 0 {
+        _ = sys_fcntl(c.fd, 4, flags & (0 -% 2049)) catch {};
+    }
+    var head: [byte: 256] = [0: 256];
+    const hn: usize = hsrv_resp_head(&head[0], 256, 200, &SRV_CTYPE_SSE[0: 17], 17,
+        0 as i64, true, false);
+    if !srv_send_all(c.fd, head[0: hn]) {
+        srv_chat_close(c);
+        return;
+    }
+    var buf: [byte: 4096] = [0: 4096];
+    var ob: [byte: 4200] = [0: 4200];
+    var guard: i32 = 0;
+    while guard < 100000 {
+        guard = guard +% 1;
+        const got: !usize = uplink_stream_read(&us, &buf[0], 4096);
+        var n: usize = 0;
+        n = got catch {
+            0 as usize;
+        };
+        if n == 0 {
+            break;
+        }
+        const on: usize = hsrv_chunk(&ob[0], 4200, buf[0: n], n);
+        if on == 0 || !srv_send_all(c.fd, ob[0: on]) {
+            break;
+        }
+    }
+    _ = srv_send_all(c.fd, &"0\r\n\r\n"[0: 5]);
+    srv_chat_close(c);
+}
+
 fn srv_edge_proxy(c: &SrvConn, stats: &ServeStats) void {
     const keep: bool = c.keep;
     stats.requests = stats.requests +% 1;
@@ -4704,6 +4754,13 @@ fn srv_edge_proxy(c: &SrvConn, stats: &ServeStats) void {
     var port: u16 = 0;
     if !srv_split_addr(nbaddr[0: an], &ipb[0], 64, &ipl, &port) {
         srv_static(c, 502, SRV_JSON_502, keep);
+        return;
+    }
+    // B4：`stream=1` 走 SSE 流式转发（不等整个节点响应）
+    var stb: [byte: 8] = [0: 8];
+    const stn: usize = srv_query_str(&c.path[0], c.path_len, &"stream"[0: 6], 6, &stb[0], 8);
+    if stn == 1 && stb[0] == ('1' as byte) {
+        srv_edge_proxy_stream(c, ipb[0: ipl], port, pth[0: pn]);
         return;
     }
     var out: [byte: 16384] = [0: 16384];

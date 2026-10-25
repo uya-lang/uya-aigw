@@ -139,6 +139,44 @@ while [ $i -lt 80 ]; do
   i=$((i + 1)); sleep 0.1
 done
 echo "$PX" | grep -q '"node":"node-b"' || { echo "$PX" >&2; fail "edge proxy"; }
+# B4：edge→node SSE 流式转发（首事件先到，总时长 ~20×20ms）
+SP=$(python3 - "$CPORT" <<'PY'
+import socket, sys, time
+port = int(sys.argv[1])
+req = (b"GET /edge/proxy?slug=s1&path=/v1/_sse&stream=1 HTTP/1.1\r\n"
+       b"Host: 127.0.0.1\r\nConnection: close\r\n\r\n")
+s = socket.create_connection(("127.0.0.1", port), timeout=10)
+t0 = time.time()
+s.sendall(req)
+buf = b""
+first = -1.0
+while True:
+    try:
+        d = s.recv(4096)
+    except socket.timeout:
+        break
+    if not d:
+        break
+    buf += d
+    if first < 0 and b"data: {}\n\n" in buf:
+        first = time.time() - t0
+    if b"0\r\n\r\n" in buf:
+        break
+total = time.time() - t0
+hdr = buf.split(b"\r\n\r\n", 1)[0]
+chunked = b"Transfer-Encoding: chunked" in hdr
+sse = b"Content-Type: text/event-stream" in hdr
+print(f"{first:.3f} {total:.3f} {buf.count(b'data: {}\n\n')} {int(chunked)} {int(sse)}")
+PY
+)
+set -- $SP
+FIRST=$1; TOTAL=$2; EVENTS=$3; CHUNKED=$4; SSEH=$5
+[ "$CHUNKED" = "1" ] || fail "edge sse chunked"
+[ "$SSEH" = "1" ] || fail "edge sse content-type"
+python3 -c "import sys; sys.exit(0 if float('$FIRST') >= 0 and float('$FIRST') < 0.25 else 1)" || fail "edge sse first=$FIRST"
+python3 -c "import sys; sys.exit(0 if float('$TOTAL') > 0.3 else 1)" || fail "edge sse total=$TOTAL"
+[ "$EVENTS" -ge 20 ] || fail "edge sse events=$EVENTS"
+echo "CLUSTER-OK edge-sse first=${FIRST}s total=${TOTAL}s events=$EVENTS"
 ok edge
 
 # 6) drain node-b → 归属迁到 node-a，会话亲和失效后重新解析

@@ -63,7 +63,7 @@
 
 - **node**：数据面，单进程单线程，跑 HTTP framing、插件池/内置 TLS 客户端、SSE 转发。
 - **controller**：控制面，用户/密钥/模型/价目/分配/计费账本；active/standby 通过 `flock` 选主。
-- **edge**：接入层，按 slug 把请求代理到 node；控制台与账户类请求转发到 controller。
+- **edge**：接入层，按 slug 把请求代理到 node；控制台与账户类请求转发到 controller。SSE 请求（`/edge/proxy?...&stream=1`）边读节点响应边刷客户端，chunked 增量解码、不等整个响应。
 - **内部接口**：`/cluster/{register,heartbeat,config,routes,route,ingest,drain,health}`，集群内明文 + `X-Cluster-Token`（可选 stunnel）。
 
 ## 4. 运行时模型

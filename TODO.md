@@ -43,15 +43,10 @@ A4 进度（子项已完成记录见 `TODO_DONE.md`）：
 
 | ID | 任务 | 验收 | 依赖 |
 |---|---|---|---|
-| B4 | edge：路径/子域、节点代理、SSE 转发、失败重试、session→node | 1k 并发流；故障自动重试 | B2 |
 | B5 | ingest 幂等 + 金额/时段重算 + usage 分片 + spool + 吊销 + journal 重放 | 断网 30s 不丢不重；恢复对账一致 | B1/B3 |
 | B6 | 集群 e2e + 部署（1 controller + 3 node + 2 edge + nginx） | `cluster_e2e.sh` 全绿 | B1–B5 |
 
 进度（子项完成记录见 `TODO_DONE.md`）：
-- B4：edge 路由核心（slug 归属 + session 亲和 + 失败清缓存 + 快照兜底，26 断言）、
-  `GET /edge/route`、`/edge/fail`、`GET /edge/proxy`（节点代理 + 失败清亲和重试）已落地；
-  网关侧 SSE 1k 并发压测已通过（`make load-sse`：1000 连接 × 20 事件 ≈0.55s）；
-  edge→node 的 SSE 流式转发待做。
 - B5：幂等 ingest（`POST /controller/ingest`，重复批 `duplicate`）、区间重算、本地 spool
   （`POST /node/spool` + tick 每 2s 重放，失败保留）、Key 吊销、journal 重放（`journal_replay`/
   `journal_replay_days` 幂等，`tests/test_journal.uya` 5 组）已完成；usage 分片待做。
@@ -92,7 +87,7 @@ B3（epoch/fencing/drain、421、批量迁移/清零、stale 自动迁移），�
 2. 并行：A0 spike（SQLite + money）
 3. TLS-06 → TLS-07 → TLS-08 → TLS-09 → TLS-10 → TLS-11
 4. ~~A1 → A2 → A3 → A6 → A7 → A9 → A8 插件重绑 → A4 快路径/批量落库 → A5 流式工具事件~~ → A4 上游异步化
-5. ~~B1 → B2 → B3 → B6~~ → B4 edge→node 流式转发 → B5 usage 分片/journal 全量重放
+5. ~~B1 → B2 → B3 → B6 → B4 edge→node 流式转发~~ → B5 usage 分片/journal 全量重放
 6. ~~C1 → C2 → C3 → C4 → C5 → C6~~ → C5 审计日志 → C4 通知
 
 ---
