@@ -88,7 +88,13 @@ case "$MODELS" in
   *) fail "models body=[$MODELS]" ;;
 esac
 
-# 3) 未知路径 404
+# 3) chat 路由：body 采集就绪（上游未接，先回 501）
+CODE=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' -X POST \
+  -H 'Authorization: Bearer sk-test' --data '{"model":"gpt-4o","stream":true}' \
+  "$BASE/v1/chat/completions")
+[ "$CODE" = "501" ] || fail "chat route expected 501, got $CODE"
+
+# 4) 未知路径 404
 CODE=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$BASE/nope")
 [ "$CODE" = "404" ] || fail "404 expected, got $CODE"
 
