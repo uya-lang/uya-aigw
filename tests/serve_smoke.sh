@@ -40,7 +40,8 @@ build_aigw() {
     src/foundation/buf.uya src/net/httpsrv.uya src/net/tcpx.uya src/net/serve.uya \
     src/core/money.uya src/core/reqlog.uya src/core/dbx.uya src/net/rsav.uya \
     src/core/schema.uya src/core/store.uya src/core/backup.uya src/core/journal.uya \
-    src/core/runtime.uya \
+    src/core/runtime.uya src/core/schedule.uya src/core/price.uya src/core/json.uya \
+  src/core/billing.uya src/core/chat.uya \
     src/net/x509min.uya src/net/chainx.uya src/net/urlx.uya src/net/dnsx.uya \
     src/net/tlsx.uya src/net/tlsx_conn.uya src/net/httpc.uya src/net/ssex.uya \
     src/net/httpc_pool.uya src/net/proxyx.uya src/providers/http.uya \
@@ -88,11 +89,14 @@ case "$MODELS" in
   *) fail "models body=[$MODELS]" ;;
 esac
 
-# 3) chat 路由：body 采集就绪（上游未接，先回 501）
+# 3) chat 路由：body 采集 + Bearer 鉴权（假 Key → 401）
 CODE=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' -X POST \
   -H 'Authorization: Bearer sk-test' --data '{"model":"gpt-4o","stream":true}' \
   "$BASE/v1/chat/completions")
-[ "$CODE" = "501" ] || fail "chat route expected 501, got $CODE"
+[ "$CODE" = "401" ] || fail "chat route expected 401, got $CODE"
+CODE=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' -X POST \
+  --data '{"model":"gpt-4o"}' "$BASE/v1/chat/completions")
+[ "$CODE" = "401" ] || fail "chat route without auth expected 401, got $CODE"
 
 # 4) 未知路径 404
 CODE=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$BASE/nope")

@@ -49,7 +49,8 @@ UYA_ROOT="$UYA_ROOT" "$UYA" build \
   src/providers/http.uya src/providers/httpcall.uya src/cli/tls_cmd.uya \
   src/core/money.uya src/core/reqlog.uya src/core/dbx.uya \
   src/core/schema.uya src/core/store.uya src/core/backup.uya src/core/journal.uya \
-  src/core/runtime.uya \
+  src/core/runtime.uya src/core/schedule.uya src/core/price.uya src/core/json.uya \
+  src/core/billing.uya src/core/chat.uya \
   src/net/httpsrv.uya src/net/serve.uya src/app.uya \
   -o build/aigw
 

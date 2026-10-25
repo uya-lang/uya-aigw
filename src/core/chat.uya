@@ -137,6 +137,52 @@ fn chat_rewrite_model(body: &[byte], model: &[byte], out: &byte, cap: usize) usi
     return off;
 }
 
+/// serve 用：请求体以「指针 + 长度」给出时的入口。
+export fn chat_prepare_span(d: &Db, body: &const byte, n: usize, now: i64,
+    out: &ChatPlan) !void {
+    if n > CHAT_PAYLOAD_MAX {
+        return error.ChatTooLarge;
+    }
+    return chat_prepare(d, body[0: n], now, out);
+}
+
+/// 解析 `Authorization: Bearer <token>`；返回 token 长度（0=格式不对）。
+export fn chat_bearer_span(auth: &const byte, n: usize, out: &byte, cap: usize) usize {
+    if n < 8 || cap == 0 {
+        return 0;
+    }
+    var i: usize = 0;
+    while i < 6 {
+        var c: byte = auth[i];
+        if c >= ('A' as byte) && c <= ('Z' as byte) {
+            c = c +% 32;
+        }
+        if c != ("bearer "[i]) {
+            return 0;
+        }
+        i = i + 1;
+    }
+    if auth[6] != (32 as byte) {
+        return 0;
+    }
+    var j: usize = 7;
+    while j < n && auth[j] == (32 as byte) {
+        j = j + 1;
+    }
+    var w: usize = 0;
+    while j < n && w < cap {
+        out[w] = auth[j];
+        w = w + 1;
+        j = j + 1;
+    }
+    return w;
+}
+
+/// 同上，切片版（单测用）。
+export fn chat_bearer(auth: &[byte], out: &byte, cap: usize) usize {
+    return chat_bearer_span(auth.ptr, auth.len, out, cap);
+}
+
 /// 解析请求 → 选 provider → 生成上游 path 与重写后的请求体。
 export fn chat_prepare(d: &Db, body: &[byte], now: i64, out: &ChatPlan) !void {
     if body.len == 0 || body.len > CHAT_PAYLOAD_MAX {

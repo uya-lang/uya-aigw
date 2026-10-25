@@ -79,6 +79,9 @@ const SRV_JSON_404: &[byte] = &"{\"error\":\"not found\"}"[0: 21];
 const SRV_JSON_400: &[byte] = &"{\"error\":\"bad request\"}"[0: 23];
 const SRV_JSON_431: &[byte] = &"{\"error\":\"head too large\"}"[0: 26];
 const SRV_JSON_501: &[byte] = &"{\"error\":\"chat not implemented\"}"[0: 32];
+const SRV_JSON_401: &[byte] = &"{\"error\":\"unauthorized\"}"[0: 24];
+const SRV_JSON_413: &[byte] = &"{\"error\":\"payload too large\"}"[0: 29];
+const SRV_JSON_503: &[byte] = &"{\"error\":\"service unavailable\"}"[0: 31];
 const SRV_CTYPE_JSON: &[byte] = &"application/json"[0: 16];
 const SRV_CTYPE_SSE: &[byte] = &"text/event-stream"[0: 17];
 const SRV_SSE_LINE: &[byte] = &"data: {}\n\n"[0: 10];
@@ -447,6 +450,37 @@ fn srv_static(c: &SrvConn, status: i32, body: &[byte], keep: bool) void {
     c.state = ST_WRITE;
 }
 
+/// chat：鉴权 → 解析/路由 → （上游传输下一步接）占位 501。
+fn srv_chat(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    if !runtime_ready() {
+        srv_static(c, 503, SRV_JSON_503, keep);
+        return;
+    }
+    if c.body_overflow {
+        srv_static(c, 413, SRV_JSON_413, keep);
+        return;
+    }
+    var tok: [byte: 256] = [0: 256];
+    const tn: usize = chat_bearer_span(&c.auth[0], c.auth_len, &tok[0], 256);
+    if tn == 0 {
+        srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    }
+    var key: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
+    store_verify_key(runtime_db(), tok[0: tn], &key) catch {
+        srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    };
+    var plan: ChatPlan = ChatPlan{};
+    chat_prepare_span(runtime_db(), &c.body[0], c.body_len, store_now(), &plan) catch {
+        srv_static(c, 400, SRV_JSON_400, keep);
+        return;
+    };
+    srv_static(c, 501, SRV_JSON_501, keep);
+}
+
 /// 按解析出来的路由号出响应。
 fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
     const keep: bool = c.keep;
@@ -479,8 +513,7 @@ fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
         return;
     }
     if c.route == ROUTE_CHAT {
-        stats.requests = stats.requests +% 1;
-        srv_static(c, 501, SRV_JSON_501, keep);
+        srv_chat(c, stats);
         return;
     }
     stats.requests = stats.requests +% 1;
