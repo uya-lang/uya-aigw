@@ -34,4 +34,18 @@ fn test_spool() !void {
     try assert_eq_bool(try spool_read(PATH, &buf[0], 256, &n), false);
 }
 
+fn test_try_wrappers() !void {
+    spool_clear(PATH);
+    var buf: [byte: 256] = [0: 256];
+    var n: usize = 0;
+    // 文件不存在：不抛错，返回 false
+    try assert_eq_bool(spool_try_read(PATH, &buf[0], 256, &n), false);
+    try assert_eq_bool(spool_try_append(PATH, &"{\"x\":1}"[0: 7]), true);
+    try assert_eq_bool(spool_try_read(PATH, &buf[0], 256, &n), true);
+    try assert_eq_i32(n as i32, 8);
+    spool_clear(PATH);
+    try assert_eq_bool(spool_try_read(PATH, &buf[0], 256, &n), false);
+}
+
 test "spool" { run_test("spool", test_spool); }
+test "try_wrappers" { run_test("try_wrappers", test_try_wrappers); }

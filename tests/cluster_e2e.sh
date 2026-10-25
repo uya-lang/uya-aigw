@@ -19,7 +19,7 @@ mkdir -p "$TMP/c" "$TMP/n"
 UYA_ROOT=/home/winger/uya/uya/lib /home/winger/uya/uya/bin/uya build \
   src/foundation/buf.uya src/net/httpsrv.uya src/net/tcpx.uya src/net/serve.uya \
   src/core/money.uya src/core/reqlog.uya src/core/dbx.uya src/cluster/meta.uya src/cluster/elect.uya \
-  src/cluster/uplink.uya src/cluster/ingest.uya src/cluster/edge.uya src/net/ui.uya src/net/rsav.uya \
+  src/cluster/uplink.uya src/cluster/ingest.uya src/cluster/edge.uya src/cluster/spool.uya src/net/ui.uya src/net/rsav.uya \
   src/core/schema.uya src/core/store.uya src/core/budget.uya src/core/backup.uya src/core/journal.uya \
   src/core/runtime.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/rollup.uya \
   src/core/billing.uya src/core/lb.uya src/core/responses.uya src/core/chat.uya src/providers/upstream.uya \
@@ -155,5 +155,21 @@ echo "$I1" | grep -q '"applied":1' || { echo "$I1" >&2; fail "ingest 1"; }
 I2=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer ck' --data "$IB" "$BASE/controller/ingest")
 echo "$I2" | grep -q '"duplicate":1' || { echo "$I2" >&2; fail "ingest dup"; }
 ok ingest
+
+# 8) B5：节点断网先落 spool，恢复后自动重放（人工触发一次 flush 由 tick 轮询完成）
+SB='{"day":20301,"rows":[{"request_id":"r2","user_id":1,"key_id":1,"provider":"mock","model":"m","prompt_tokens":3,"completion_tokens":2,"cost_nano":500}]}'
+SP=$(curl -s --max-time 5 -X POST --data "$SB" "http://127.0.0.1:$CPORT/node/spool")
+echo "$SP" | grep -q '"ok":true' || { echo "$SP" >&2; fail "spool append"; }
+i=0
+while [ $i -lt 80 ]; do
+  NS3=$(curl -s --max-time 5 "http://127.0.0.1:$CPORT/node/status")
+  echo "$NS3" | grep -q '"spool_pending":0' && break
+  i=$((i + 1)); sleep 0.1
+done
+echo "$NS3" | grep -q '"spool_pending":0' || { echo "$NS3" >&2; fail "spool flush"; }
+# 重放已生效：同批再直推一次必须落到 duplicate
+I3=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer ck' --data "$SB" "$BASE/controller/ingest")
+echo "$I3" | grep -q '"duplicate":1' || { echo "$I3" >&2; fail "spool replay"; }
+ok spool
 
 echo "CLUSTER-ALL-OK"

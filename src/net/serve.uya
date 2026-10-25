@@ -90,6 +90,7 @@ const ROUTE_EDGE_ROUTE: i32 = 35;
 const ROUTE_EDGE_FAIL: i32 = 36;
 const ROUTE_NODE_STATUS: i32 = 37;
 const ROUTE_EDGE_PROXY: i32 = 38;
+const ROUTE_NODE_SPOOL: i32 = 39;
 const ROUTE_BUDGET: i32 = 30;
 const ROUTE_ESTIMATE: i32 = 29;
 const ROUTE_USAGE_CSV: i32 = 28;
@@ -221,6 +222,7 @@ var g_uplink_ip_len: usize = 0;
 var g_uplink_port: u16 = 0;
 var g_uplink_last_ms: u64 = 0;
 var g_cfg_last_ms: u64 = 0;
+var g_spool_last_ms: u64 = 0;
 var g_self_addr: [byte: 128] = [0: 128];
 var g_self_addr_len: usize = 0;
 var g_cfg_version: i64 = 0;
@@ -368,6 +370,77 @@ fn srv_split_addr(spec: &[byte], ip: &byte, ipcap: usize, ip_len: &usize, port: 
     }
     port[0] = p;
     return dg > 0 && p > 0;
+}
+
+/// B5：spool 文件路径 `<data_dir>/spool.jsonl`。
+fn srv_spool_path(out: &byte, cap: usize) usize {
+    var d: [byte: 256] = [0: 256];
+    const dn: usize = runtime_dir_copy(&d[0], 256);
+    var n: usize = 0;
+    var i: usize = 0;
+    while i < dn && n < cap {
+        out[n] = d[i];
+        n = n + 1;
+        i = i + 1;
+    }
+    const suffix: &[byte] = &"/spool.jsonl"[0: 12];
+    i = 0;
+    while i < suffix.len && n < cap {
+        out[n] = suffix[i];
+        n = n + 1;
+        i = i + 1;
+    }
+    return n;
+}
+
+fn srv_spool_pending() usize {
+    var path: [byte: 320] = [0: 320];
+    const pn: usize = srv_spool_path(&path[0], 320);
+    var buf: [byte: 64] = [0: 64];
+    var bn: usize = 0;
+    const has: bool = spool_try_read(path[0: pn], &buf[0], 64, &bn);
+    if !has || bn == 0 {
+        return 0 as usize;
+    }
+    return 1 as usize;
+}
+
+/// 逐行重放 spool；全部成功才清空（失败留待下次，保证不丢）。
+fn srv_spool_flush(ip: &[byte]) void {
+    var path: [byte: 320] = [0: 320];
+    const pn: usize = srv_spool_path(&path[0], 320);
+    var buf: [byte: 16384] = [0: 16384];
+    var bn: usize = 0;
+    const has: bool = spool_try_read(path[0: pn], &buf[0], 16384, &bn);
+    if !has || bn == 0 {
+        return;
+    }
+    var out: [byte: 2048] = [0: 2048];
+    var on: usize = 0;
+    var off: usize = 0;
+    var all_ok: bool = true;
+    while off < bn {
+        var end: usize = off;
+        while end < bn && buf[end] != (10 as byte) {
+            end = end + 1;
+        }
+        if end > off {
+            var nid: [byte: 64] = [0: 64];
+            const nidl: usize = srv_node_copy(&nid[0], 64);
+            const st: i32 = uplink_inject(ip, g_uplink_port, nid[0: nidl],
+                buf[off: end - off], end - off, &out[0], 2048, &on, 2000) catch {
+                0;
+            };
+            if st != 200 {
+                all_ok = false;
+                break;
+            }
+        }
+        off = end + 1;
+    }
+    if all_ok {
+        spool_clear(path[0: pn]);
+    }
 }
 
 fn srv_uplink_setup(spec: &[byte]) void {
@@ -742,6 +815,9 @@ fn srv_route_of(req: &HsrvReq) i32 {
     }
     if srv_path_is(req, &"/v1/keys/revoke"[0: 15]) {
         return ROUTE_KEY_REVOKE;
+    }
+    if srv_path_is(req, &"/node/spool"[0: 11]) {
+        return ROUTE_NODE_SPOOL;
     }
     if srv_path_is(req, &"/edge/proxy"[0: 11]) {
         return ROUTE_EDGE_PROXY;
@@ -1367,6 +1443,10 @@ fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
         srv_me(c, stats);
         return;
     }
+    if c.route == ROUTE_NODE_SPOOL {
+        srv_node_spool(c, stats);
+        return;
+    }
     if c.route == ROUTE_EDGE_PROXY {
         srv_edge_proxy(c, stats);
         return;
@@ -1385,6 +1465,10 @@ fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
     }
     if c.route == ROUTE_ADMIN_JS {
         srv_admin_js(c, stats);
+        return;
+    }
+    if c.route == ROUTE_NODE_SPOOL {
+        srv_node_spool(c, stats);
         return;
     }
     if c.route == ROUTE_EDGE_PROXY {
@@ -1974,6 +2058,13 @@ export fn serve_run(lfd: i32, stats: &ServeStats) !i32 {
             _ = uplink_register(ipb[0: ipn], g_uplink_port, nb[0: nn],
                 &"edge"[0: 4], ab[0: an], 2000) catch {};
             uplink_heartbeat(ipb[0: ipn], g_uplink_port, nb[0: nn], 0, 0, 2000) catch {};
+        }
+        // B5：每 2s 把本地 spool 里的 batch 重放到 controller（断网恢复后对账）。
+        if ums > g_spool_last_ms +% 2000 {
+            g_spool_last_ms = ums;
+            var ipb3: [byte: 64] = [0: 64];
+            const ipn3: usize = srv_uplink_copy(&ipb3[0], 64);
+            srv_spool_flush(ipb3[0: ipn3]);
         }
         // B2：每 3s 拉一次 config 快照（版本/epoch/归属），边缘节点据此本地路由。
         if ums > g_cfg_last_ms +% 3000 {
@@ -3703,6 +3794,31 @@ fn srv_ctl_drain(c: &SrvConn, stats: &ServeStats) void {
     srv_static(c, 200, jsonw_span(&w), keep);
 }
 
+/// `?node=<id>` 且该节点在 meta 里存在 → 视为可信节点。
+fn srv_node_ok(c: &SrvConn) bool {
+    if !g_meta_ready {
+        return false;
+    }
+    var nid: [byte: 64] = [0: 64];
+    const n: usize = srv_query_str(&c.path[0], c.path_len, &"node"[0: 4], 4, &nid[0], 64);
+    if n == 0 {
+        return false;
+    }
+    var nodes: [MetaNode: 64] = [];
+    var cnt: usize = 0;
+    cnt = meta_node_list(&g_meta, &nodes[0], 64) catch {
+        0 as usize;
+    };
+    var i: usize = 0;
+    while i < cnt {
+        if nodes[i].id_len == n && srv_slice_eq(nodes[i].id[0: nodes[i].id_len], nid[0: n]) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
 /// 字节切片相等（长度 + 内容）。
 fn srv_slice_eq(a: &[byte], b: &[byte]) bool {
     if a.len != b.len {
@@ -3727,7 +3843,8 @@ fn srv_ctl_ingest(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 503, SRV_JSON_503, keep);
         return;
     }
-    if !srv_admin_ok(c) {
+    // 管理员可直推；已注册节点用 `?node=<id>` 免 admin key（节点重放 spool/journal）。
+    if !srv_admin_ok(c) && !srv_node_ok(c) {
         srv_static(c, 401, SRV_JSON_401, keep);
         return;
     }
@@ -4192,6 +4309,8 @@ fn srv_node_status(c: &SrvConn, stats: &ServeStats) void {
     jsonw_bool(&w, g_meta_ready);
     jsonw_key(&w, &"uplink"[0: 6]);
     jsonw_bool(&w, g_uplink_ready);
+    jsonw_key(&w, &"spool_pending"[0: 13]);
+    jsonw_i64(&w, srv_spool_pending() as i64);
     jsonw_end_obj(&w);
     srv_static(c, 200, jsonw_span(&w), keep);
 }
@@ -4310,4 +4429,26 @@ fn srv_edge_proxy(c: &SrvConn, stats: &ServeStats) void {
     }
     _ = st;
     srv_static(c, 200, out[0: on], keep);
+}
+
+
+/// B5：把一批 usage 落到本地 spool（controller 不可达时先攒着）。
+fn srv_node_spool(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    if c.body_len == 0 {
+        srv_static(c, 400, SRV_JSON_400, keep);
+        return;
+    }
+    var path: [byte: 320] = [0: 320];
+    const pn: usize = srv_spool_path(&path[0], 320);
+    if pn == 0 {
+        srv_static(c, 502, SRV_JSON_502, keep);
+        return;
+    }
+    if !spool_try_append(path[0: pn], c.body[0: c.body_len]) {
+        srv_static(c, 502, SRV_JSON_502, keep);
+        return;
+    }
+    srv_static(c, 200, SRV_JSON_OK, keep);
 }

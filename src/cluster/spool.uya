@@ -82,6 +82,26 @@ export fn spool_read(path: &[byte], out: &byte, cap: usize, out_len: &usize) !bo
     return true;
 }
 
+/// 不抛错误的包装：追加一行，成功 true（serve tick 用，失败留待下次重放）。
+export fn spool_try_append(path: &[byte], body: &[byte]) bool {
+    const r: !void = spool_append(path, body);
+    var ok: bool = true;
+    _ = r catch |_| {
+        ok = false;
+    };
+    return ok;
+}
+
+/// 不抛错误的包装：读整个 spool，不存在/出错都当作没有内容。
+export fn spool_try_read(path: &[byte], out: &byte, cap: usize, out_len: &usize) bool {
+    const r: !bool = spool_read(path, out, cap, out_len);
+    var got: bool = false;
+    got = r catch |_| {
+        false;
+    };
+    return got;
+}
+
 /// 清空 spool（成功或文件不存在都视为完成）。
 export fn spool_clear(path: &[byte]) void {
     var p: [byte: 512] = [0: 512];

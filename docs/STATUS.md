@@ -47,6 +47,8 @@
   `make cluster-e2e` 用独立 node id 验证注册。
 - B4（进行中）：edge 路由核心 + `GET /edge/route`、`/edge/fail`、`GET /edge/proxy`（节点代理 +
   失败清亲和重试）已落地；SSE 转发与 1k 并发压测待做。
+- B5（进行中）：幂等 ingest、区间重算、spool 重放循环（`POST /node/spool` + tick 2s 重放，
+  全成功才清空）、Key 吊销已落地；usage 分片与 journal 全量重放待做。
 - B6（进行中）：`tests/cluster_e2e.sh`（1 controller + 3 node、epoch/fencing、edge 路由/亲和、
   drain 迁移、ingest 幂等）已全绿；nginx 反代与部署脚本待做。
 - C6（进行中）：CSP/nosniff/Referrer-Policy/XFO 安全头 + `make ui-e2e` 已落地；
@@ -98,6 +100,8 @@
   `make cluster-e2e` 用独立 node id 验证注册。
 - B4（进行中）：edge 路由核心 + `GET /edge/route`、`/edge/fail`、`GET /edge/proxy`（节点代理 +
   失败清亲和重试）已落地；SSE 转发与 1k 并发压测待做。
+- B5（进行中）：幂等 ingest、区间重算、spool 重放循环（`POST /node/spool` + tick 2s 重放，
+  全成功才清空）、Key 吊销已落地；usage 分片与 journal 全量重放待做。
 - B6（进行中）：`tests/cluster_e2e.sh`（1 controller + 3 node、epoch/fencing、edge 路由/亲和、
   drain 迁移、ingest 幂等）已全绿；nginx 反代与部署脚本待做。
 - C6（进行中）：CSP/nosniff/Referrer-Policy/XFO 安全头 + `make ui-e2e` 已落地；
