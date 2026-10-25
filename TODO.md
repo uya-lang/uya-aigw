@@ -31,15 +31,11 @@ Phase A0 (SQLite spike) 可与 Phase T 并行 ─────┘
 | ID | 任务 | 验收 | 依赖 |
 |---|---|---|---|
 | A4 | chat 流/非流、快路径、tools、usage、分时 cost/price、批量落库 | SSE 对齐；金额与 preview 一致；落库不影响 p99 | A2/A3/TLS-09 |
-| A5 | responses：`previous_response_id`、reasoning、工具、事件序列 | 事件顺序正确；续轮 | A4 |
 
-A4/A5 进度（子项已完成记录见 `TODO_DONE.md`）：
+A4 进度（子项已完成记录见 `TODO_DONE.md`）：
 - A4：chat 非流/流式、鉴权→路由→上游 TLS→分时价→journal/ledger、SSE、金额 e2e、失败转移
   已落地；无 DOM 快路径（顶层扫描 model/stream）与批量落库（512 行/200ms 事务、journal
   批追加、查询前 flush）已完成；剩余：上游异步化（p99）。
-- A5：`/v1/responses` 非流式 + `previous_response_id` 续轮 + 流式
-  `response.created/output_text.delta/completed` + tools/reasoning 透传与 `function_call` 输出
-  已落地；剩余：流式工具事件（`response.output_item.added/done`）。
 
 ---
 
@@ -95,7 +91,7 @@ B3（epoch/fencing/drain、421、批量迁移/清零、stale 自动迁移），�
 1. ~~TLS-01 → … → TLS-05A~~（已完成，见 `TODO_DONE.md`）
 2. 并行：A0 spike（SQLite + money）
 3. TLS-06 → TLS-07 → TLS-08 → TLS-09 → TLS-10 → TLS-11
-4. ~~A1 → A2 → A3 → A6 → A7 → A9 → A8 插件重绑 → A4 快路径/批量落库~~ → A5 流式工具事件 → A4 上游异步化
+4. ~~A1 → A2 → A3 → A6 → A7 → A9 → A8 插件重绑 → A4 快路径/批量落库 → A5 流式工具事件~~ → A4 上游异步化
 5. ~~B1 → B2 → B3 → B6~~ → B4 edge→node 流式转发 → B5 usage 分片/journal 全量重放
 6. ~~C1 → C2 → C3 → C4 → C5 → C6~~ → C5 审计日志 → C4 通知
 

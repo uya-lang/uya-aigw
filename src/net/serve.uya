@@ -3324,6 +3324,120 @@ fn srv_sse_frame(fd: i32, ev: &const byte, evn: usize, js: &[byte]) bool {
     return on > 0 && srv_send_all(fd, ob[0: on]);
 }
 
+// A5：流式工具事件（responses API）。最多跟踪 4 个并行 tool call：
+//   output_item.added → function_call_arguments.delta… → output_item.done。
+const SRV_TC_MAX: usize = 4;
+const SRV_TC_ID_MAX: usize = 64;
+const SRV_TC_NAME_MAX: usize = 64;
+const SRV_TC_ARGS_MAX: usize = 2048;
+
+struct SrvToolCall {
+    started: bool,
+    id: [byte: SRV_TC_ID_MAX],
+    id_len: usize,
+    name: [byte: SRV_TC_NAME_MAX],
+    name_len: usize,
+    args: [byte: SRV_TC_ARGS_MAX],
+    args_len: usize,
+}
+
+fn srv_tc_copy(dst: &byte, cap: usize, src: &[byte]) usize {
+    var i: usize = 0;
+    while i < src.len && i < cap {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+    return i;
+}
+
+fn srv_tc_item_id(tc: &SrvToolCall, idx: usize, out: &byte, cap: usize) usize {
+    if tc.id_len > 0 {
+        return srv_tc_copy(out, cap, tc.id[0: tc.id_len]);
+    }
+    if cap < 4 {
+        return 0;
+    }
+    out[0] = 'f' as byte;
+    out[1] = 'c' as byte;
+    out[2] = '_' as byte;
+    out[3] = (48 as i32 + (idx as i32) % 10) as byte;
+    return 4;
+}
+
+fn srv_tc_emit_added(c: &SrvConn, tc: &SrvToolCall, idx: usize) bool {
+    var ib: [byte: SRV_TC_ID_MAX] = [0: SRV_TC_ID_MAX];
+    const il: usize = srv_tc_item_id(tc, idx, &ib[0], SRV_TC_ID_MAX);
+    var jw: JsonW = JsonW{};
+    jsonw_init(&jw);
+    jsonw_obj(&jw);
+    jsonw_key(&jw, &"type"[0: 4]);
+    jsonw_str(&jw, &"response.output_item.added"[0: 26]);
+    jsonw_key(&jw, &"item"[0: 4]);
+    jsonw_obj(&jw);
+    jsonw_key(&jw, &"type"[0: 4]);
+    jsonw_str(&jw, &"function_call"[0: 13]);
+    jsonw_key(&jw, &"id"[0: 2]);
+    jsonw_str(&jw, ib[0: il]);
+    jsonw_key(&jw, &"call_id"[0: 7]);
+    jsonw_str(&jw, tc.id[0: tc.id_len]);
+    jsonw_key(&jw, &"name"[0: 4]);
+    jsonw_str(&jw, tc.name[0: tc.name_len]);
+    jsonw_key(&jw, &"arguments"[0: 9]);
+    jsonw_str(&jw, &""[0: 0]);
+    jsonw_key(&jw, &"status"[0: 6]);
+    jsonw_str(&jw, &"in_progress"[0: 11]);
+    jsonw_end_obj(&jw);
+    jsonw_end_obj(&jw);
+    return srv_sse_frame(c.fd, &"response.output_item.added"[0: 26], 26, jsonw_span(&jw));
+}
+
+fn srv_tc_emit_delta(c: &SrvConn, tc: &SrvToolCall, idx: usize, chunk: &[byte]) bool {
+    var ib: [byte: SRV_TC_ID_MAX] = [0: SRV_TC_ID_MAX];
+    const il: usize = srv_tc_item_id(tc, idx, &ib[0], SRV_TC_ID_MAX);
+    var jw: JsonW = JsonW{};
+    jsonw_init(&jw);
+    jsonw_obj(&jw);
+    jsonw_key(&jw, &"type"[0: 4]);
+    jsonw_str(&jw, &"response.function_call_arguments.delta"[0: 38]);
+    jsonw_key(&jw, &"item_id"[0: 7]);
+    jsonw_str(&jw, ib[0: il]);
+    jsonw_key(&jw, &"delta"[0: 5]);
+    jsonw_str(&jw, chunk);
+    jsonw_end_obj(&jw);
+    return srv_sse_frame(c.fd, &"response.function_call_arguments.delta"[0: 38], 38, jsonw_span(&jw));
+}
+
+fn srv_tc_write_item(w: &JsonW, tc: &SrvToolCall, idx: usize) void {
+    var ib: [byte: SRV_TC_ID_MAX] = [0: SRV_TC_ID_MAX];
+    const il: usize = srv_tc_item_id(tc, idx, &ib[0], SRV_TC_ID_MAX);
+    jsonw_obj(w);
+    jsonw_key(w, &"type"[0: 4]);
+    jsonw_str(w, &"function_call"[0: 13]);
+    jsonw_key(w, &"id"[0: 2]);
+    jsonw_str(w, ib[0: il]);
+    jsonw_key(w, &"call_id"[0: 7]);
+    jsonw_str(w, tc.id[0: tc.id_len]);
+    jsonw_key(w, &"name"[0: 4]);
+    jsonw_str(w, tc.name[0: tc.name_len]);
+    jsonw_key(w, &"arguments"[0: 9]);
+    jsonw_str(w, tc.args[0: tc.args_len]);
+    jsonw_key(w, &"status"[0: 6]);
+    jsonw_str(w, &"completed"[0: 9]);
+    jsonw_end_obj(w);
+}
+
+fn srv_tc_emit_done(c: &SrvConn, tc: &SrvToolCall, idx: usize) bool {
+    var jw: JsonW = JsonW{};
+    jsonw_init(&jw);
+    jsonw_obj(&jw);
+    jsonw_key(&jw, &"type"[0: 4]);
+    jsonw_str(&jw, &"response.output_item.done"[0: 25]);
+    jsonw_key(&jw, &"item"[0: 4]);
+    srv_tc_write_item(&jw, tc, idx);
+    jsonw_end_obj(&jw);
+    return srv_sse_frame(c.fd, &"response.output_item.done"[0: 25], 25, jsonw_span(&jw));
+}
+
 fn srv_responses_stream(c: &SrvConn, uid: i64, plan: &ChatPlan, cfg: &const HttppConfig,
     rid: &[byte], input_text: &[byte], prev_id: &[byte]) void {
     var call: HtcCall = HtcCall{};
@@ -3392,7 +3506,9 @@ fn srv_responses_stream(c: &SrvConn, uid: i64, plan: &ChatPlan, cfg: &const Http
     var out_len: usize = 0;
     var events: i32 = 0;
     var done: bool = false;
-    while events < 4096 && !done {
+    var closed: bool = false;
+    var tcs: [SrvToolCall: SRV_TC_MAX] = [];
+    while events < 4096 && !done && !closed {
         var has: bool = false;
         const r: !i32 = block_on<i32>(htc_next_event_async(&call, &has, 5000 as u64));
         const rr: i32 = r catch |_| {
@@ -3430,13 +3546,79 @@ fn srv_responses_stream(c: &SrvConn, uid: i64, plan: &ChatPlan, cfg: &const Http
                     jsonw_str(&jw, chunk[0: cn]);
                     jsonw_end_obj(&jw);
                     if !srv_sse_frame(c.fd, &"response.output_text.delta"[0: 26], 26, jsonw_span(&jw)) {
-                        break;
+                        closed = true;
+                    }
+                }
+            }
+            // A5：工具调用增量 → output_item.added / arguments.delta
+            if !closed {
+                const tca: i32 = json_get(&jd, delta, &"tool_calls"[0: 10]);
+                if tca >= 0 {
+                    const tn: usize = json_arr_len(&jd, tca);
+                    var ti: usize = 0;
+                    while ti < tn && ti < SRV_TC_MAX && !closed {
+                        const el: i32 = json_arr_at(&jd, tca, ti);
+                        const fnode: i32 = json_get(&jd, el, &"function"[0: 8]);
+                        const raw_slot: i64 = json_i64(&jd, json_get(&jd, el, &"index"[0: 5]));
+                        var slot: usize = 0;
+                        if raw_slot > 0 && raw_slot < 4 {
+                            slot = raw_slot as usize;
+                        }
+                        const tc: &SrvToolCall = &tcs[slot];
+                        const cid: i32 = json_get(&jd, el, &"id"[0: 2]);
+                        if cid >= 0 && json_kind(&jd, cid) == JSON_STR && tc.id_len == 0 {
+                            var cb: [byte: SRV_TC_ID_MAX] = [0: SRV_TC_ID_MAX];
+                            const cn: usize = json_str(&jd, cid, &cb[0], SRV_TC_ID_MAX);
+                            tc.id_len = srv_tc_copy(&tc.id[0], SRV_TC_ID_MAX, cb[0: cn]);
+                        }
+                        const fname: i32 = json_get(&jd, fnode, &"name"[0: 4]);
+                        if fname >= 0 && json_kind(&jd, fname) == JSON_STR && tc.name_len == 0 {
+                            var nb: [byte: SRV_TC_NAME_MAX] = [0: SRV_TC_NAME_MAX];
+                            const nn: usize = json_str(&jd, fname, &nb[0], SRV_TC_NAME_MAX);
+                            tc.name_len = srv_tc_copy(&tc.name[0], SRV_TC_NAME_MAX, nb[0: nn]);
+                        }
+                        if !tc.started && (tc.id_len > 0 || tc.name_len > 0) {
+                            tc.started = true;
+                            if !srv_tc_emit_added(c, tc, slot) {
+                                closed = true;
+                            }
+                        }
+                        if !closed {
+                            const farg: i32 = json_get(&jd, fnode, &"arguments"[0: 9]);
+                            if farg >= 0 && json_kind(&jd, farg) == JSON_STR {
+                                var ab: [byte: 512] = [0: 512];
+                                const an: usize = json_str(&jd, farg, &ab[0], 512);
+                                if an > 0 {
+                                    var k: usize = 0;
+                                    while k < an && tc.args_len < SRV_TC_ARGS_MAX {
+                                        tc.args[tc.args_len] = ab[k];
+                                        tc.args_len = tc.args_len + 1;
+                                        k = k + 1;
+                                    }
+                                    if !srv_tc_emit_delta(c, tc, slot, ab[0: an]) {
+                                        closed = true;
+                                    }
+                                }
+                            }
+                        }
+                        ti = ti + 1;
                     }
                 }
             }
         }
+        if closed {
+            break;
+        }
         sse_consume(&call.sse);
         events = events + 1;
+    }
+    // A5：收尾事件（每个已开始的 tool call 一条 output_item.done）
+    var di: usize = 0;
+    while di < SRV_TC_MAX {
+        if tcs[di].started && !closed {
+            _ = srv_tc_emit_done(c, &tcs[di], di);
+        }
+        di = di + 1;
     }
     var settle: BillingResult = BillingResult{ cost_nano: 0, price_nano: 0, rate_version: 0, duplicate: false, found: false };
     if usage_found {
@@ -3466,6 +3648,16 @@ fn srv_responses_stream(c: &SrvConn, uid: i64, plan: &ChatPlan, cfg: &const Http
         jsonw_key(&jw, &"price_nano"[0: 10]);
         jsonw_i64(&jw, settle.price_nano);
         jsonw_end_obj(&jw);
+        jsonw_key(&jw, &"output"[0: 6]);
+        jsonw_arr(&jw);
+        di = 0;
+        while di < SRV_TC_MAX {
+            if tcs[di].started {
+                srv_tc_write_item(&jw, &tcs[di], di);
+            }
+            di = di + 1;
+        }
+        jsonw_end_arr(&jw);
         jsonw_end_obj(&jw);
         jsonw_end_obj(&jw);
         _ = srv_sse_frame(c.fd, &"response.completed"[0: 18], 18, jsonw_span(&jw));

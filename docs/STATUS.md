@@ -23,6 +23,9 @@
   amalgamation（离线不可得），见 TODO A0。
 - A4（日志部分）：`src/core/reqlog.uya`，一行 `k=v` 的每请求日志（含 cost/tok-s），
   `tests/test_reqlog.uya` 全过。
+- A5（流式工具事件）：`srv_responses_stream` 支持 `delta.tool_calls` 分片 →
+  `response.output_item.added` / `response.function_call_arguments.delta` /
+  `response.output_item.done`，`completed` 带 `output` 数组；chat e2e mock 与断言覆盖。
 - A4（快路径/批量落库）：`chat_scan` 顶层扫描（不建 DOM）+ `src/core/batch.uya`
   （512 行/200ms 事务、journal 批追加、查询前 flush）；`tests/test_batch.uya` 与
   `tests/test_chat.uya` fast_path 组覆盖。

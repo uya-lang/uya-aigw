@@ -106,7 +106,7 @@
 4. **规范**：chat 快路径不建 DOM（顶层扫描定位 `model`/`stream`，只按 span 改写 model），形态不安全才回退完整解析；responses 做全量翻译。
 5. **选路**：按模型取候选绑定，priority → 健康 → 权重/least-inflight → session 亲和；按会话哈希固定供应商。
 6. **调用**：插件池或内置 HTTP + TLS；记录首 token 时间。
-7. **转发**：流式逐事件写 SSE（chunked、逐事件 flush）；非流式聚合后一次写。
+7. **转发**：流式逐事件写 SSE（chunked、逐事件 flush）；非流式聚合后一次写。responses 的工具调用流额外发 `response.output_item.added` / `response.function_call_arguments.delta` / `response.output_item.done`，`completed` 里带 `output` 数组。
 8. **计量**：usage（供应商优先，缺失则估算）+ 分时价目 → `cost_nano` / `price_nano`。
 9. **日志**：请求行写入进程内队列 → 批量落 node.db → 批量上报 controller（幂等）。
 10. **收尾**：断连取消上游；释放连接/插件；更新熔断与 session 绑定。

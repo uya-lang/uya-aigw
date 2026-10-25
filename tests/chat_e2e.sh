@@ -48,6 +48,12 @@ USAGE = (b'{"usage":{"prompt_tokens":100000,"completion_tokens":50000,'
 SSE = (b'data: {"choices":[{"delta":{"content":"hello-from-mock"}}]}\n\n'
        b'data: ' + USAGE + b'\n\n'
        b'data: [DONE]\n\n')
+# A5：流式工具调用（arguments 分片），用于断言 output_item.added/done
+SSE_TOOL = (b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]}}]}\n\n'
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"city\\":"}}]}}]}\n\n'
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"SF\\"}"}}]}}]}\n\n'
+            b'data: ' + USAGE + b'\n\n'
+            b'data: [DONE]\n\n')
 class H(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     def log_message(self, *a): pass
@@ -56,6 +62,14 @@ class H(http.server.BaseHTTPRequestHandler):
         data = self.rfile.read(n)
         with open(reqfile, "wb") as f:
             f.write(data)
+        if "text/event-stream" in (self.headers.get("Accept") or ""):
+            data = SSE_TOOL if b'"tools"' in data else SSE
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data); self.wfile.flush()
+            return
         if b'"tools"' in data:
             tb = (b'{"id":"chatcmpl-tool","object":"chat.completion",'
                   b'"choices":[{"message":{"role":"assistant","content":null,'
@@ -68,19 +82,11 @@ class H(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(tb); self.wfile.flush()
             return
-        if "text/event-stream" in (self.headers.get("Accept") or ""):
-            data = SSE
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data); self.wfile.flush()
-        else:
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(BODY)))
-            self.end_headers()
-            self.wfile.write(BODY); self.wfile.flush()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(BODY)))
+        self.end_headers()
+        self.wfile.write(BODY); self.wfile.flush()
 srv = http.server.HTTPServer(("127.0.0.1", port), H)
 sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 sctx.load_cert_chain(cert, key)
@@ -182,6 +188,20 @@ echo "$RS" | grep -q 'response.output_text.delta' || { echo "$RS" >&2; fail "res
 echo "$RS" | grep -q 'hello-from-mock' || { echo "$RS" >&2; fail "responses delta text"; }
 echo "$RS" | grep -q 'response.completed' || { echo "$RS" >&2; fail "responses completed"; }
 
+# 4b1c) A5 responses 流式工具事件：added → arguments.delta → done
+RST=$(curl -s -N --max-time 15 -X POST -H "Authorization: Bearer $TOKEN" \
+  -H 'Accept: text/event-stream' \
+  --data '{"model":"mock-model","stream":true,"input":"weather?","tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}]}' \
+  "$BASE/v1/responses")
+echo "$RST" | grep -q 'response.output_item.added' || { echo "$RST" >&2; fail "tool item added"; }
+echo "$RST" | grep -q '"type":"function_call"' || { echo "$RST" >&2; fail "tool item type"; }
+echo "$RST" | grep -q '"name":"get_weather"' || { echo "$RST" >&2; fail "tool item name"; }
+echo "$RST" | grep -q 'response.function_call_arguments.delta' || { echo "$RST" >&2; fail "tool args delta"; }
+echo "$RST" | grep -q 'response.output_item.done' || { echo "$RST" >&2; fail "tool item done"; }
+echo "$RST" | grep -q '"arguments":"{\\"city\\":\\"SF\\"}"' || { echo "$RST" >&2; fail "tool args accumulated"; }
+echo "$RST" | grep -q '"output":\[{"type":"function_call"' || { echo "$RST" >&2; fail "tool output array"; }
+echo "$RST" | grep -q 'response.completed' || { echo "$RST" >&2; fail "tool completed"; }
+
 # 4b2) models：公开列表来自 provider_models
 MJSON=$(curl -s --max-time 10 "http://127.0.0.1:$PORT/v1/models")
 echo "$MJSON" | grep -q '"id":"mock-model"' || { echo "$MJSON" >&2; fail "models list"; }
@@ -190,8 +210,8 @@ echo "$MJSON" | grep -q '"id":"mock-model"' || { echo "$MJSON" >&2; fail "models
 UJSON=$(curl -s --max-time 10 -H "Authorization: Bearer $TOKEN" \
   "http://127.0.0.1:$PORT/v1/usage?from_day=0&to_day=999999")
 echo "$UJSON" | grep -q '"mock-model"' || { echo "$UJSON" >&2; fail "usage model missing"; }
-echo "$UJSON" | grep -q '"requests":5' || { echo "$UJSON" >&2; fail "usage totals"; }
-echo "$UJSON" | grep -q '"profit_nano":660' || { echo "$UJSON" >&2; fail "usage profit"; }
+echo "$UJSON" | grep -q '"requests":6' || { echo "$UJSON" >&2; fail "usage totals"; }
+echo "$UJSON" | grep -q '"profit_nano":792' || { echo "$UJSON" >&2; fail "usage profit"; }
 
 # 4d) A7 管理 REST（--admin-key）
 AH=$(curl -s --max-time 5 -H 'Authorization: Bearer test-admin' "$BASE/admin/health")
@@ -420,5 +440,5 @@ kill "$SRV_PID" 2>/dev/null || true
 wait "$SRV_PID" 2>/dev/null || true
 SRV_PID=""
 COUNT=$(AIGW_MODE=count AIGW_DB="$SEED_DB" ./build/seed | sed -n 's/^COUNT=//p')
-[ "$COUNT" = "11" ] || fail "usage_ledger count=$COUNT"
+[ "$COUNT" = "12" ] || fail "usage_ledger count=$COUNT"
 echo "CHAT-ALL-OK status=$CODE count=$COUNT"
