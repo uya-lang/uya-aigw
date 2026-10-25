@@ -57,8 +57,7 @@ A4/A5/A8 进度（子项已完成记录见 `TODO_DONE.md`）：
   SSE 转发与 1k 并发压测待做。
 - B5：幂等 ingest（`POST /controller/ingest`，重复批 `duplicate`）、区间重算、本地 spool
   （`POST /node/spool` + tick 每 2s 重放，失败保留）、Key 吊销已完成；usage 分片与 journal 全量重放待做。
-- B6：`tests/cluster_e2e.sh`（`make cluster-e2e`）已全绿 —— 1 controller + 3 node 真 uplink 注册、
-  epoch/fencing、config 快照、edge 路由/亲和/归属、drain 迁移、ingest 幂等；nginx 反代与部署脚本待做。
+- B6 已完成：`make cluster-e2e` 全绿 + `deploy/nginx.conf`、`docs/deploy.md`（见 `TODO_DONE.md`）。
 
 已完成：B1（meta.db/选主/控制面）、B2（uplink、注册/心跳、config 快照、归属校验）、
 B3（epoch/fencing/drain、421、批量迁移/清零、stale 自动迁移），详见 `TODO_DONE.md`。
@@ -84,8 +83,7 @@ B3（epoch/fencing/drain、421、批量迁移/清零、stale 自动迁移），�
   与模型绑定（`/admin/models`、`/admin/bind`）已落地；分时价编辑页待做。
 - C4：Playground（流式指标）+ 账单预算（schema v8 budgets、`/v1/budget`、超额告警）已落地；通知待做。
 - C5：`/admin` 页 + 用户/供应商列表已落地（含 401 保护）；改价/绑定/审计日志待做。
-- C6：安全头（CSP/nosniff/Referrer-Policy/XFO）、XSS/越权断言、`make ui-e2e` 已落地；
-  CSRF 说明（Bearer-only）见 `docs/STATUS.md`。
+- C6 已完成：安全头、XSS/越权断言、`make ui-e2e`、`docs/ui.md`（见 `TODO_DONE.md`）。
 
 ---
 
@@ -96,7 +94,7 @@ B3（epoch/fencing/drain、421、批量迁移/清零、stale 自动迁移），�
 3. TLS-06 → TLS-07 → TLS-08 → TLS-09 → TLS-10 → TLS-11
 4. ~~A1 → A2 → A3 → A6 → A7 → A9~~ → A4/A5/A8 收尾
 5. ~~B1 → B2 → B3 → B6~~ → B4 → B5
-6. C1 → C2 → C3 → C4 → C5 → C6
+6. ~~C1 → C2 → C3 → C4 → C5 → C6~~ → C5 审计日志 → C4 通知
 
 ---
 

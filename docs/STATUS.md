@@ -51,10 +51,10 @@
   失败清亲和重试）已落地；SSE 转发与 1k 并发压测待做。
 - B5（进行中）：幂等 ingest、区间重算、spool 重放循环（`POST /node/spool` + tick 2s 重放，
   全成功才清空）、Key 吊销已落地；usage 分片与 journal 全量重放待做。
-- B6（进行中）：`tests/cluster_e2e.sh`（1 controller + 3 node、epoch/fencing、edge 路由/亲和、
-  drain 迁移、ingest 幂等）已全绿；nginx 反代与部署脚本待做。
-- C6（进行中）：CSP/nosniff/Referrer-Policy/XFO 安全头 + `make ui-e2e` 已落地；
-  API 全 Bearer、无 Cookie，故 CSRF 面为零（不做双提交 token）。
+- B6（已完成）：`make cluster-e2e` 全绿（1 controller + 3 node、epoch/fencing、config 快照、
+  edge 路由/亲和/归属、代理、drain 迁移、ingest 幂等、spool 重放）+ `deploy/nginx.conf`、`docs/deploy.md`。
+- C6（已完成）：CSP/nosniff/Referrer-Policy/XFO 安全头、XSS/越权断言、`make ui-e2e`、
+  `docs/ui.md`；API 全 Bearer、无 Cookie，故 CSRF 面为零（不做双提交 token）。
 - B4（进行中）：edge 路由核心（slug 归属 + session 亲和 + 失败清缓存，11 断言）；
   HTTP/SSE 代理待做。
 
@@ -106,10 +106,10 @@
   失败清亲和重试）已落地；SSE 转发与 1k 并发压测待做。
 - B5（进行中）：幂等 ingest、区间重算、spool 重放循环（`POST /node/spool` + tick 2s 重放，
   全成功才清空）、Key 吊销已落地；usage 分片与 journal 全量重放待做。
-- B6（进行中）：`tests/cluster_e2e.sh`（1 controller + 3 node、epoch/fencing、edge 路由/亲和、
-  drain 迁移、ingest 幂等）已全绿；nginx 反代与部署脚本待做。
-- C6（进行中）：CSP/nosniff/Referrer-Policy/XFO 安全头 + `make ui-e2e` 已落地；
-  API 全 Bearer、无 Cookie，故 CSRF 面为零（不做双提交 token）。
+- B6（已完成）：`make cluster-e2e` 全绿（1 controller + 3 node、epoch/fencing、config 快照、
+  edge 路由/亲和/归属、代理、drain 迁移、ingest 幂等、spool 重放）+ `deploy/nginx.conf`、`docs/deploy.md`。
+- C6（已完成）：CSP/nosniff/Referrer-Policy/XFO 安全头、XSS/越权断言、`make ui-e2e`、
+  `docs/ui.md`；API 全 Bearer、无 Cookie，故 CSRF 面为零（不做双提交 token）。
 - B4（进行中）：edge 路由核心（slug 归属 + session 亲和 + 失败清缓存，11 断言）；
   HTTP/SSE 代理待做。
 
