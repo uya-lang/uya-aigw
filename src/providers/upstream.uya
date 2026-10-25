@@ -10,6 +10,7 @@ use std.async;
 
 export error UpstreamFailed;
 
+
 /// 非流式 POST：网络/协议错误返回 `UpstreamFailed`；HTTP 状态码原样写回 `status`。
 export fn upstream_post(ctx: &HtcCtx, cfg: &const HttppConfig, path: &[byte],
     body: &[byte], now_ms: u64, deadline: u64, out: &byte, cap: usize,

@@ -291,7 +291,9 @@ export fn httpp_build_request(cfg: &const HttppConfig, method: &const byte, meth
         if !buf_append_u64(out, cfg.port as u64) { return false; }
     }
     if !buf_append_cstr(out, "\r\n" as &const byte) { return false; }
-    if !httpp_auth_line(cfg, out) { return false; }
+    if cfg.secret_len > 0 {
+        if !httpp_auth_line(cfg, out) { return false; }
+    }
     if !buf_append_cstr(out, "Content-Type: application/json\r\nAccept: " as &const byte) { return false; }
     if stream {
         if !buf_append_cstr(out, "text/event-stream" as &const byte) { return false; }

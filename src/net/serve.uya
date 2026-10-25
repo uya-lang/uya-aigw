@@ -525,7 +525,11 @@ fn srv_chat(c: &SrvConn, stats: &ServeStats) void {
     var resp: [byte: 8192] = [0: 8192];
     var st: i32 = 0;
     var rn: usize = 0;
-    const nowu: u64 = srv_now_ms();
+    // htc 的时间基准是 std.time.now_ms（wall clock），不是 serve 的单调时钟
+    const nowu: u64 = now_ms() catch {
+        srv_static(c, 502, SRV_JSON_502, keep);
+        return;
+    };
     upstream_post(&g_up_ctx, &cfg, plan.path[0: plan.path_len],
         plan.payload[0: plan.payload_len], nowu, nowu +% 60000,
         &resp[0], 8192, &st, &rn) catch {
