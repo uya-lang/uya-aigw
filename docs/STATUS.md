@@ -46,8 +46,8 @@
 - C2（已完成）：`/v1/usage`、`/v1/usage.csv`、`/v1/requests`（列表/详情分页）与 UI 概览页。
 - C3（已完成）：Key 管理、估算器、改价（`/admin/price-entries`，含 `schedule` 分时规则校验与
   回显）、模型绑定、管理后台分时价编辑与价目表。
-- C4（进行中）：Playground（流式指标）+ 账单预算（schema v8、`/v1/budget`）已落地；
-  通知待做。
+- C4（已完成）：Playground（流式指标）+ 账单预算（schema v8、`/v1/budget`）+
+  站内通知（`notify.uya`、`GET /v1/notifications`、预算超额按日去重）。
 - C5（已完成）：`/admin` 页 + 用户/供应商列表 + 改价（含分时）/绑定 + 审计日志
   （`audit.jsonl` 记录 price.put/schedule.put/key.create/key.revoke/bind/drain，带 actor）。
 - B2（已完成）：uplink 修复 + config 快照（版本/epoch/归属）+ `/node/status` + slug 归属校验（`/edge/route?self=`）。
@@ -102,8 +102,8 @@
 - C2（已完成）：`/v1/usage`、`/v1/usage.csv`、`/v1/requests`（列表/详情分页）与 UI 概览页。
 - C3（已完成）：Key 管理、估算器、改价（`/admin/price-entries`，含 `schedule` 分时规则校验与
   回显）、模型绑定、管理后台分时价编辑与价目表。
-- C4（进行中）：Playground（流式指标）+ 账单预算（schema v8、`/v1/budget`）已落地；
-  通知待做。
+- C4（已完成）：Playground（流式指标）+ 账单预算（schema v8、`/v1/budget`）+
+  站内通知（`notify.uya`、`GET /v1/notifications`、预算超额按日去重）。
 - C5（已完成）：`/admin` 页 + 用户/供应商列表 + 改价（含分时）/绑定 + 审计日志
   （`audit.jsonl` 记录 price.put/schedule.put/key.create/key.revoke/bind/drain，带 actor）。
 - B2（已完成）：uplink 修复 + config 快照（版本/epoch/归属）+ `/node/status` + slug 归属校验（`/edge/route?self=`）。

@@ -113,7 +113,7 @@ UYA_ROOT="$UYA_ROOT" "$UYA" build \
   src/core/money.uya src/core/reqlog.uya src/core/dbx.uya src/cluster/meta.uya src/cluster/elect.uya src/cluster/uplink.uya src/cluster/edge.uya src/cluster/spool.uya src/cluster/ingest.uya src/net/ui.uya src/net/rsav.uya \
   src/core/schema.uya src/core/store.uya src/core/budget.uya src/core/backup.uya src/core/journal.uya \
   src/core/runtime.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/rollup.uya \
-  src/core/billing.uya src/core/batch.uya src/core/lb.uya src/core/responses.uya src/core/chat.uya src/providers/upstream.uya \
+  src/core/billing.uya src/core/batch.uya src/core/notify.uya src/core/lb.uya src/core/responses.uya src/core/chat.uya src/providers/upstream.uya \
   src/providers/upstream_cfg.uya \
   src/net/x509min.uya src/net/chainx.uya src/net/urlx.uya src/net/dnsx.uya \
   src/net/tlsx.uya src/net/tlsx_conn.uya src/net/httpc.uya src/net/ssex.uya \
@@ -403,6 +403,14 @@ BS=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $TOKEN" --data '{"mo
 echo "$BS" | grep -q '"over_budget":true' || { echo "$BS" >&2; fail "budget over"; }
 BS2=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $TOKEN" --data '{"monthly_nano":100000000}' "$BASE/v1/budget")
 echo "$BS2" | grep -q '"over_budget":false' || { echo "$BS2" >&2; fail "budget under"; }
+# C4：站内通知（预算超额写一条，同月不重复；无 token 401）
+NT=$(curl -s --max-time 5 -H "Authorization: Bearer $TOKEN" "$BASE/v1/notifications")
+echo "$NT" | grep -q '"kind":"budget.over"' || { echo "$NT" >&2; fail "notify budget"; }
+echo "$NT" | grep -q '"limit_nano":1' || { echo "$NT" >&2; fail "notify limit"; }
+NTN=$(echo "$NT" | grep -c '"kind":"budget.over"')
+[ "$NTN" = "1" ] || fail "notify dedup count=$NTN"
+NT401=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$BASE/v1/notifications")
+[ "$NT401" = "401" ] || fail "notify expected 401, got $NT401"
 
 # 4k) C3：费用估算（价格来自 seed 的 sell 价目）
 EST=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $TOKEN" \
@@ -433,6 +441,8 @@ echo "$UI" | grep -q 'id="playground"' || { echo "$UI" >&2; fail "ui playground"
 echo "$UI" | grep -q 'id="req-table"' || { echo "$UI" >&2; fail "ui requests"; }
 echo "$UI" | grep -q 'id="billing"' || { echo "$UI" >&2; fail "ui billing"; }
 echo "$UIJS" | grep -q '/v1/budget' || { echo "$UIJS" >&2; fail "ui budget js"; }
+echo "$UI" | grep -q 'id="notifications"' || { echo "$UI" >&2; fail "ui notifications"; }
+echo "$UIJS" | grep -q '/v1/notifications' || { echo "$UIJS" >&2; fail "ui notifications js"; }
 echo "$UIJS" | grep -q '/v1/chat/completions' || { echo "$UIJS" >&2; fail "ui playground js"; }
 echo "$UIJS" | grep -q '/v1/estimate' || { echo "$UIJS" >&2; fail "ui estimate js"; }
 HDR=$(curl -s --max-time 5 -D - -o /dev/null "$BASE/")

@@ -1,0 +1,191 @@
+// src/core/notify.uya — C4 站内通知：每用户一个 JSONL（`<dir>/notify-<uid>.jsonl`）
+//
+// 通知是写多读少的提示（目前只有预算超额 `budget.over`），一行一个 JSON；
+// 追加/读取复用 spool（O_APPEND + 整文件读），UI 直接展示 JSONL 文本。
+// 同一预算周期（`day` 为月份起始日）只记一条，避免每次保存预算都刷屏。
+
+export error NotifyFailed;
+
+fn nt_put(dst: &byte, cap: usize, at: &usize, src: &[byte]) bool {
+    var i: usize = 0;
+    while i < src.len {
+        if at[0] >= cap {
+            return false;
+        }
+        dst[at[0]] = src[i];
+        at[0] = at[0] + 1;
+        i = i + 1;
+    }
+    return true;
+}
+
+fn nt_digits(v: i64, out: &byte, cap: usize) usize {
+    var x: u64 = 0;
+    if v > 0 {
+        x = v as u64;
+    }
+    var dg: [byte: 20] = [0: 20];
+    var d: usize = 0;
+    if x == 0 {
+        dg[0] = 48;
+        d = 1;
+    } else {
+        while x > 0 && d < 20 {
+            dg[d] = (48 +% (x % (10 as u64))) as byte;
+            x = x / (10 as u64);
+            d = d + 1;
+        }
+    }
+    var n: usize = 0;
+    while d > 0 && n < cap {
+        d = d - 1;
+        out[n] = dg[d];
+        n = n + 1;
+    }
+    return n;
+}
+
+/// `<dir>/notify-<uid>.jsonl`；容量不足返回 0。
+export fn notify_path(dir: &[byte], user_id: i64, out: &byte, cap: usize) usize {
+    var n: usize = 0;
+    if !nt_put(out, cap, &n, dir) {
+        return 0;
+    }
+    if !nt_put(out, cap, &n, &"/notify-"[0: 8]) {
+        return 0;
+    }
+    var db: [byte: 20] = [0: 20];
+    const dn: usize = nt_digits(user_id, &db[0], 20);
+    if dn == 0 {
+        return 0;
+    }
+    if !nt_put(out, cap, &n, db[0: dn]) {
+        return 0;
+    }
+    if !nt_put(out, cap, &n, &".jsonl"[0: 6]) {
+        return 0;
+    }
+    return n;
+}
+
+/// 追加一条通知。
+export fn notify_append(dir: &[byte], user_id: i64, kind: &[byte], message: &[byte],
+    ts: i64) !void {
+    var path: [byte: 320] = [0: 320];
+    const pn: usize = notify_path(dir, user_id, &path[0], 320);
+    if pn == 0 {
+        return error.NotifyFailed;
+    }
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"ts"[0: 2]);
+    jsonw_i64(&w, ts);
+    jsonw_key(&w, &"kind"[0: 4]);
+    jsonw_str(&w, kind);
+    jsonw_key(&w, &"message"[0: 7]);
+    jsonw_str(&w, message);
+    jsonw_end_obj(&w);
+    if !spool_try_append(path[0: pn], jsonw_span(&w)) {
+        return error.NotifyFailed;
+    }
+    return;
+}
+
+/// 读该用户的全部通知（JSONL）；没有/失败返回 false。
+export fn notify_read(dir: &[byte], user_id: i64, out: &byte, cap: usize,
+    out_len: &usize) bool {
+    var path: [byte: 320] = [0: 320];
+    const pn: usize = notify_path(dir, user_id, &path[0], 320);
+    if pn == 0 {
+        return false;
+    }
+    return spool_try_read(path[0: pn], out, cap, out_len);
+}
+
+fn nt_find(hay: &[byte], needle: &[byte], from: usize) usize {
+    if needle.len == 0 || hay.len < needle.len {
+        return hay.len;
+    }
+    var i: usize = from;
+    while i + needle.len <= hay.len {
+        var j: usize = 0;
+        var same: bool = true;
+        while j < needle.len {
+            if hay[i + j] != needle[j] {
+                same = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if same {
+            return i;
+        }
+        i = i + 1;
+    }
+    return hay.len;
+}
+
+/// 已有同 `day` 的 budget.over 记录？
+fn nt_has_day(buf: &[byte], day: i64) bool {
+    if nt_find(buf, &"\"kind\":\"budget.over\""[0: 20], 0) >= buf.len {
+        return false;
+    }
+    var pos: usize = 0;
+    while pos < buf.len {
+        const p: usize = nt_find(buf, &"\"day\":"[0: 6], pos);
+        if p >= buf.len {
+            return false;
+        }
+        var i: usize = p + 6;
+        var v: i64 = 0;
+        var dg: usize = 0;
+        while i < buf.len && buf[i] >= ('0' as byte) && buf[i] <= ('9' as byte) && dg < 18 {
+            v = v *% 10 +% ((buf[i] as i64) -% 48);
+            i = i + 1;
+            dg = dg + 1;
+        }
+        if dg > 0 && v == day {
+            return true;
+        }
+        pos = p + 6;
+    }
+    return false;
+}
+
+/// 预算超额通知：同一 `day` 只记一条；返回是否真的追加了。
+export fn notify_budget_over(dir: &[byte], user_id: i64, day: i64, spent_nano: i64,
+    limit_nano: i64, ts: i64) !bool {
+    var path: [byte: 320] = [0: 320];
+    const pn: usize = notify_path(dir, user_id, &path[0], 320);
+    if pn == 0 {
+        return error.NotifyFailed;
+    }
+    var buf: [byte: 8192] = [0: 8192];
+    var bn: usize = 0;
+    if spool_try_read(path[0: pn], &buf[0], 8192, &bn) {
+        if nt_has_day(buf[0: bn], day) {
+            return false;
+        }
+    }
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"ts"[0: 2]);
+    jsonw_i64(&w, ts);
+    jsonw_key(&w, &"kind"[0: 4]);
+    jsonw_str(&w, &"budget.over"[0: 11]);
+    jsonw_key(&w, &"day"[0: 3]);
+    jsonw_i64(&w, day);
+    jsonw_key(&w, &"spent_nano"[0: 10]);
+    jsonw_i64(&w, spent_nano);
+    jsonw_key(&w, &"limit_nano"[0: 10]);
+    jsonw_i64(&w, limit_nano);
+    jsonw_key(&w, &"message"[0: 7]);
+    jsonw_str(&w, &"monthly budget exceeded"[0: 23]);
+    jsonw_end_obj(&w);
+    if !spool_try_append(path[0: pn], jsonw_span(&w)) {
+        return error.NotifyFailed;
+    }
+    return true;
+}

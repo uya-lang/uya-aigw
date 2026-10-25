@@ -1,0 +1,114 @@
+// tests/test_notify.uya — C4 站内通知：路径、追加/读取、预算告警按天去重
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+use libc.syscall;
+
+const DIR: &[byte] = &"/tmp/aigw_notify_test"[0: 21];
+
+fn prep() void {
+    _ = sys_mkdir("/tmp/aigw_notify_test" as *const byte, 493) catch { 0; };
+}
+
+fn cleanup(uid: i64) void {
+    var p: [byte: 320] = [0: 320];
+    const pn: usize = notify_path(DIR, uid, &p[0], 320);
+    if pn > 0 {
+        _ = sys_unlink(&p[0] as *const byte) catch { 0; };
+    }
+}
+
+fn has(hay: &[byte], needle: &[byte]) bool {
+    if needle.len == 0 || hay.len < needle.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i + needle.len <= hay.len {
+        var j: usize = 0;
+        var same: bool = true;
+        while j < needle.len {
+            if hay[i + j] != needle[j] {
+                same = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if same {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn count_of(hay: &[byte], needle: &[byte]) i32 {
+    if needle.len == 0 {
+        return 0;
+    }
+    var n: i32 = 0;
+    var i: usize = 0;
+    while i + needle.len <= hay.len {
+        var j: usize = 0;
+        var same: bool = true;
+        while j < needle.len {
+            if hay[i + j] != needle[j] {
+                same = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if same {
+            n = n +% 1;
+            i = i + needle.len;
+        } else {
+            i = i + 1;
+        }
+    }
+    return n;
+}
+
+fn test_path() !void {
+    prep();
+    var p: [byte: 320] = [0: 320];
+    const n: usize = notify_path(DIR, 42, &p[0], 320);
+    try assert_eq_bool(n > 0, true);
+    try assert_eq_bool(has(p[0: n], &"/notify-42.jsonl"[0: 16]), true);
+}
+
+fn test_append_read() !void {
+    prep();
+    cleanup(7);
+    try notify_append(DIR, 7, &"hello"[0: 5], &"world"[0: 5], 1700000000);
+    var buf: [byte: 4096] = [0: 4096];
+    var bn: usize = 0;
+    try assert_eq_bool(notify_read(DIR, 7, &buf[0], 4096, &bn), true);
+    try assert_eq_bool(bn > 0, true);
+    try assert_eq_bool(has(buf[0: bn], &"\"kind\":\"hello\""[0: 14]), true);
+    try assert_eq_bool(has(buf[0: bn], &"\"message\":\"world\""[0: 17]), true);
+    // 未写过通知的用户读不到（false，不报错）
+    var bn2: usize = 0;
+    try assert_eq_bool(notify_read(DIR, 8, &buf[0], 4096, &bn2), false);
+    try assert_eq_i32(bn2 as i32, 0);
+    cleanup(7);
+}
+
+fn test_budget_dedup() !void {
+    prep();
+    cleanup(9);
+    // 同一天第一次记、第二次去重
+    try assert_eq_bool(try notify_budget_over(DIR, 9, 20300, 100, 10, 1700000000), true);
+    try assert_eq_bool(try notify_budget_over(DIR, 9, 20300, 200, 10, 1700000001), false);
+    // 下个月重新记一条
+    try assert_eq_bool(try notify_budget_over(DIR, 9, 20331, 300, 10, 1700000002), true);
+    var buf: [byte: 4096] = [0: 4096];
+    var bn: usize = 0;
+    try assert_eq_bool(notify_read(DIR, 9, &buf[0], 4096, &bn), true);
+    try assert_eq_i32(count_of(buf[0: bn], &"\"kind\":\"budget.over\""[0: 20]), 2);
+    try assert_eq_bool(has(buf[0: bn], &"\"limit_nano\":10"[0: 15]), true);
+    try assert_eq_bool(has(buf[0: bn], &"\"day\":20331"[0: 11]), true);
+    cleanup(9);
+}
+
+test "path" { run_test("path", test_path); }
+test "append_read" { run_test("append_read", test_append_read); }
+test "budget_dedup" { run_test("budget_dedup", test_budget_dedup); }

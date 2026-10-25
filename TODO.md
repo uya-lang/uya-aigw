@@ -61,17 +61,7 @@ B3（epoch/fencing/drain、421、批量迁移/清零、stale 自动迁移），�
 
 | ID | 任务 | 验收 | 依赖 |
 |---|---|---|---|
-| C1 | 静态壳 + 登录/资料 + 接入点页 | 登录→复制 URL→curl 成功 | A2/A7 |
-| C2 | 概览 + 用量/费用（含时段）+ 请求列表/详情 + CSV | 数据与 `/v1/usage` 一致；分页正确 | A6 |
-| C4 | Playground + 账单 + 设置/通知 | SSE 指标正确；预算告警触发 | C2/C3 |
-| C6 | e2e + 安全（CSRF/XSS/CSP/越权）+ 文档 | `make ui-e2e` 全绿 | C1–C5 |
-
-进度（子项完成记录见 `TODO_DONE.md`）：
-- C1：静态壳（`/`、`/ui/app.js`；登录/资料/密钥/接入点 + curl 示例）已落地。
-- C2：`/v1/usage.csv` + 概览/明细表 + CSV 导出 + 请求列表/详情（`/v1/requests`，limit/offset 分页，
-  UI 可点击看详情）已落地。
-- C4：Playground（流式指标）+ 账单预算（schema v8 budgets、`/v1/budget`、超额告警）已落地；通知待做。
-- C6 已完成：安全头、XSS/越权断言、`make ui-e2e`、`docs/ui.md`（见 `TODO_DONE.md`）。
+全部完成（C1…C6、含分时价编辑、审计动作与站内通知，见 `TODO_DONE.md`）。
 
 ---
 
@@ -82,7 +72,7 @@ B3（epoch/fencing/drain、421、批量迁移/清零、stale 自动迁移），�
 3. TLS-06 → TLS-07 → TLS-08 → TLS-09 → TLS-10 → TLS-11
 4. ~~A1 → A2 → A3 → A6 → A7 → A9 → A8 插件重绑 → A4 快路径/批量落库 → A5 流式工具事件~~ → A4 上游异步化
 5. ~~B1 → B2 → B3 → B6 → B4 edge→node 流式转发~~ → B5 usage 分片/journal 全量重放
-6. ~~C1 → C2 → C3 → C5 → C6~~ → C4 通知
+6. ~~C1 → C2 → C3 → C4 → C5 → C6~~（Phase C 全部完成）
 
 ---
 

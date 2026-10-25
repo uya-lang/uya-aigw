@@ -101,6 +101,7 @@ const ROUTE_ESTIMATE: i32 = 29;
 const ROUTE_USAGE_CSV: i32 = 28;
 const ROUTE_UI: i32 = 26;
 const ROUTE_UI_JS: i32 = 27;
+const ROUTE_NOTIFICATIONS: i32 = 45;
 const ROUTE_CTL_EPOCH: i32 = 21;
 const ROUTE_CTL_ASSIGN: i32 = 22;
 const ROUTE_CTL_DRAIN: i32 = 23;
@@ -870,6 +871,9 @@ fn srv_route_of(req: &HsrvReq) i32 {
     if srv_path_is(req, &"/v1/budget"[0: 10]) {
         return ROUTE_BUDGET;
     }
+    if srv_path_is(req, &"/v1/notifications"[0: 17]) {
+        return ROUTE_NOTIFICATIONS;
+    }
     if srv_path_is(req, &"/v1/estimate"[0: 12]) {
         return ROUTE_ESTIMATE;
     }
@@ -1581,6 +1585,10 @@ fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
     }
     if c.route == ROUTE_BUDGET {
         srv_budget(c, stats);
+        return;
+    }
+    if c.route == ROUTE_NOTIFICATIONS {
+        srv_notifications(c, stats);
         return;
     }
     if c.route == ROUTE_ESTIMATE {
@@ -4394,6 +4402,27 @@ fn srv_estimate(c: &SrvConn, stats: &ServeStats) void {
 
 
 // C4：预算（GET 读当前额度与当月已用；POST 设置，需会话或 Key）。
+/// C4：站内通知（JSONL，按用户隔离；无通知返回空 body）。
+fn srv_notifications(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    if !runtime_ready() {
+        srv_static(c, 503, SRV_JSON_503, keep);
+        return;
+    }
+    var uid: i64 = 0;
+    if !srv_bearer_uid(c, &uid) {
+        srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    }
+    var dir: [byte: 256] = [0: 256];
+    const dn: usize = runtime_dir_copy(&dir[0], 256);
+    var buf: [byte: 16384] = [0: 16384];
+    var bn: usize = 0;
+    _ = notify_read(dir[0: dn], uid, &buf[0], 16384, &bn);
+    srv_static_ct(c, 200, buf[0: bn], keep, &"text/plain"[0: 10], 10);
+}
+
 fn srv_budget(c: &SrvConn, stats: &ServeStats) void {
     const keep: bool = c.keep;
     srv_batch_sync();
@@ -4437,6 +4466,15 @@ fn srv_budget(c: &SrvConn, stats: &ServeStats) void {
     var over: bool = false;
     if limit > 0 && spent >= limit {
         over = true;
+    }
+    if !c.is_get && over {
+        var dir: [byte: 256] = [0: 256];
+        const dn: usize = runtime_dir_copy(&dir[0], 256);
+        var dayv: i64 = 0;
+        const day: i64 = budget_month(now, &dayv);
+        _ = notify_budget_over(dir[0: dn], uid, day, spent, limit, now) catch {
+            false;
+        };
     }
     var w: JsonW = JsonW{};
     jsonw_init(&w);
