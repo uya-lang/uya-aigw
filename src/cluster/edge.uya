@@ -1,0 +1,118 @@
+// src/cluster/edge.uya — B4 edge 路由核心：slug 归属 + session→node 亲和
+//
+// edge 只读 meta.db 的 assignment；同 session 先命中内存亲和表（固定 provider/node），
+// 失败调用 edge_fail(session) 清掉缓存，下次按最新归属重新解析（故障重试）。
+
+export const EDGE_SESS_MAX: usize = 256;
+export const EDGE_NODE_MAX: usize = 64;
+
+struct EdgeSession {
+    used: bool,
+    hash: u64,
+    node: [byte: EDGE_NODE_MAX],
+    node_len: usize,
+}
+
+var g_edge: [EdgeSession: EDGE_SESS_MAX] = [];
+
+/// 带边界保护地取会话槽（编译器需要显式区间守卫）。
+fn edge_at(i: usize) &EdgeSession {
+    if i >= 0 && i < 256 {
+        return &g_edge[i];
+    }
+    return &g_edge[0];
+}
+
+fn edge_hash(s: &[byte]) u64 {
+    var h: u64 = 1469598103934665603;
+    var i: usize = 0;
+    while i < s.len {
+        h = (h ^ (s[i] as u64)) *% 1099511628211;
+        i = i + 1;
+    }
+    return h;
+}
+
+fn edge_find(h: u64) usize {
+    var i: usize = 0;
+    while i < 256 {
+        if edge_at(i).used && edge_at(i).hash == h {
+            return i;
+        }
+        i = i + 1;
+    }
+    return EDGE_SESS_MAX;
+}
+
+fn edge_cache(h: u64, node: &const byte, n: usize) void {
+    var i: usize = edge_find(h);
+    if i == EDGE_SESS_MAX {
+        i = 0;
+        while i < 256 && edge_at(i).used {
+            i = i + 1;
+        }
+        if i >= 256 {
+            i = 0;
+        }
+    }
+    edge_at(i).used = true;
+    edge_at(i).hash = h;
+    edge_at(i).node_len = 0;
+    var k: usize = 0;
+    while k < n && k < 64 {
+        edge_at(i).node[k] = node[k];
+        k = k + 1;
+    }
+    edge_at(i).node_len = k;
+}
+
+export fn edge_reset() void {
+    var i: usize = 0;
+    while i < 256 {
+        edge_at(i).used = false;
+        edge_at(i).hash = 0;
+        edge_at(i).node_len = 0;
+        i = i + 1;
+    }
+}
+
+/// 解析 slug 应落到的 node；`session` 非空时优先亲和缓存。返回写入 out 的字节数。
+export fn edge_route(d: &Db, slug: &[byte], session: &[byte], out: &byte,
+    cap: usize) usize {
+    if slug.len == 0 || cap == 0 {
+        return 0;
+    }
+    var h: u64 = 0;
+    if session.len > 0 {
+        h = edge_hash(session);
+        const idx: usize = edge_find(h);
+        if idx < 256 {
+            var k: usize = 0;
+            while k < edge_at(idx).node_len && k < 64 && k < cap {
+                out[k] = edge_at(idx).node[k];
+                k = k + 1;
+            }
+            return k;
+        }
+    }
+    var ep: i64 = 0;
+    const n: usize = meta_assign_get(d, slug, out, cap, &ep) catch {
+        0 as usize;
+    };
+    if n > 0 && session.len > 0 {
+        edge_cache(h, out, n);
+    }
+    return n;
+}
+
+/// 节点调用失败：清掉该 session 的亲和，下一跳重新解析。
+export fn edge_fail(session: &[byte]) void {
+    if session.len == 0 {
+        return;
+    }
+    const idx: usize = edge_find(edge_hash(session));
+    if idx < 256 {
+        edge_at(idx).used = false;
+        edge_at(idx).node_len = 0;
+    }
+}

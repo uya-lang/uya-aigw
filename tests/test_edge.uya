@@ -1,0 +1,64 @@
+// tests/test_edge.uya — B4 edge slug 路由与 session 亲和
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_i64;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+
+const T0: i64 = 1700000000;
+
+fn open_meta(d: &Db) !void {
+    try meta_open(d, &":memory:"[0: 8]);
+}
+
+fn eq(a: &[byte], b: &[byte]) bool {
+    if a.len != b.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < a.len {
+        if a[i] != b[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn test_route_affinity() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_meta(&d);
+    try assert_eq_i64(try meta_epoch_bump(&d, &"a"[0: 1], T0), 1);
+    try meta_assign(&d, &"s1"[0: 2], &"a"[0: 1], 1, T0);
+    edge_reset();
+    var nb: [byte: 16] = [0: 16];
+    var n: usize = edge_route(&d, &"s1"[0: 2], &"sess"[0: 4], &nb[0], 16);
+    try assert_eq_i32(n as i32, 1);
+    try assert_eq_bool(eq(nb[0: n], &"a"[0: 1]), true);
+    // 归属迁到 b，但 session 亲和还在 → 仍回 a
+    try assert_eq_i64(try meta_epoch_bump(&d, &"b"[0: 1], T0), 1);
+    try assert_eq_i64(try meta_epoch_bump(&d, &"b"[0: 1], T0), 2);
+    try meta_assign(&d, &"s1"[0: 2], &"b"[0: 1], 2, T0);
+    n = edge_route(&d, &"s1"[0: 2], &"sess"[0: 4], &nb[0], 16);
+    try assert_eq_bool(eq(nb[0: n], &"a"[0: 1]), true);
+    // 失败清亲和 → 回最新归属 b
+    edge_fail(&"sess"[0: 4]);
+    n = edge_route(&d, &"s1"[0: 2], &"sess"[0: 4], &nb[0], 16);
+    try assert_eq_bool(eq(nb[0: n], &"b"[0: 1]), true);
+    // 不同 session 各自解析
+    n = edge_route(&d, &"s1"[0: 2], &"other"[0: 5], &nb[0], 16);
+    try assert_eq_bool(eq(nb[0: n], &"b"[0: 1]), true);
+}
+
+fn test_unknown() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_meta(&d);
+    edge_reset();
+    var nb: [byte: 16] = [0: 16];
+    try assert_eq_i32(edge_route(&d, &"nope"[0: 4], &"x"[0: 1], &nb[0], 16) as i32, 0);
+    try assert_eq_i32(edge_route(&d, &""[0: 0], &"x"[0: 1], &nb[0], 16) as i32, 0);
+}
+
+test "route_affinity" { run_test("route_affinity", test_route_affinity); }
+test "unknown" { run_test("unknown", test_unknown); }

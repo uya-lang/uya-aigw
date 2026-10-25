@@ -55,6 +55,9 @@ A4/A5/A8 进度（子项已完成记录见 `TODO_DONE.md`）：
 B5 进度：幂等 ingest（applied/duplicate/bad + usage_daily 实时 upsert，11 断言）已完成；
 spool、金额/时段重算、吊销、journal 重放待做。
 
+B4 进度：edge 路由核心（slug 归属 + session 亲和 + 失败清缓存，11 断言）已完成；
+HTTP/SSE 代理与 1k 并发待做。
+
 B1 已完成（见 `TODO_DONE.md`）：meta.db、A/S 选主、controller 控制面与 standby 不备份。
 
 B2 进度：`uplink.uya` + `--uplink` 已通（node 注册/心跳，e2e 断言 controller status 出现 node-b）；

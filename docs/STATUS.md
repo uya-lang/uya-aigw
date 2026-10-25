@@ -35,6 +35,8 @@
 - B2 收尾：config 快照与 slug 归属校验。
 - B5（进行中）：幂等 ingest（applied/duplicate/bad + usage_daily，11 断言）；
   spool/重算/吊销/journal 重放待做。
+- B4（进行中）：edge 路由核心（slug 归属 + session 亲和 + 失败清缓存，11 断言）；
+  HTTP/SSE 代理待做。
 
 ## 开发命令（A9）
 
@@ -68,6 +70,8 @@
 - B2 收尾：config 快照与 slug 归属校验。
 - B5（进行中）：幂等 ingest（applied/duplicate/bad + usage_daily，11 断言）；
   spool/重算/吊销/journal 重放待做。
+- B4（进行中）：edge 路由核心（slug 归属 + session 亲和 + 失败清缓存，11 断言）；
+  HTTP/SSE 代理待做。
 
 ## 开发命令（A9）
 
