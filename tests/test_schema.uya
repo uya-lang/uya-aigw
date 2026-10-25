@@ -33,6 +33,8 @@ fn test_migrate_memory() !void {
     try assert_eq_bool(table_exists(&d, &"price_cards"[0: 11]), true);
     try assert_eq_bool(table_exists(&d, &"price_entries"[0: 13]), true);
     try assert_eq_bool(table_exists(&d, &"usage_ledger"[0: 12]), true);
+    try assert_eq_bool(table_exists(&d, &"providers"[0: 9]), true);
+    try assert_eq_bool(table_exists(&d, &"provider_models"[0: 15]), true);
 }
 
 fn test_migrate_idempotent() !void {

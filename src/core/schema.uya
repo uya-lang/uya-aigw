@@ -2,7 +2,9 @@
 //
 // 一次迁移 = 一个 `pragma user_version` 台阶：
 //   v0 → v1：身份与凭据（users / api_keys / otp_codes / sessions）
-// 后面 A2 的价目、分时、journal，以及 A4 的请求明细，各自是下一个台阶。
+//   v1 → v2：价目表（price_cards / price_entries，含分时 schedule）
+//   v2 → v3：用量账本（usage_ledger，request_id 幂等）
+//   v3 → v4：供应商与模型路由（providers / provider_models）
 //
 // 约定：
 //   * 迁移**幂等**：重复执行到同一版本不产生副作用（`create table if not exists`）。
@@ -12,7 +14,7 @@
 //
 // 打开流程（`schema_open`）：open → pragmas → migrate。热路径不该调它。
 
-export const SCHEMA_VERSION: i32 = 3;
+export const SCHEMA_VERSION: i32 = 4;
 
 export error SchemaFailed;
 
@@ -95,6 +97,22 @@ fn schema_v3(d: &Db) !void {
 }
 
 // ---------------------------------------------------------------
+// v4：供应商与模型路由
+// ---------------------------------------------------------------
+//
+// 一个 provider = 一个上游端点 + 认证方式 + 超时；provider_models 把「对外模型名」
+// 映射到「上游模型名」。A4 的 chat 路由按 model 找 enabled 的 provider。
+// secret 只存引用（`literal:` / `env:`），不存明文以外的二进制。
+
+fn schema_v4(d: &Db) !void {
+    try dbx_exec_cstr(d, "create table if not exists providers (id integer primary key, name text not null, kind text not null default 'openai', scheme text not null default 'https', host text not null, port integer not null default 443, base_path text not null default '', auth_type integer not null default 1, auth_name text not null default 'Authorization', secret text not null default '', timeout_ms integer not null default 60000, enabled integer not null default 1, created_at integer not null default 0, updated_at integer not null default 0)" as &const byte);
+    try dbx_exec_cstr(d, "create unique index if not exists idx_providers_name on providers(name)" as &const byte);
+    try dbx_exec_cstr(d, "create table if not exists provider_models (id integer primary key, provider_id integer not null references providers(id) on delete cascade, model text not null, upstream_model text not null, created_at integer not null default 0)" as &const byte);
+    try dbx_exec_cstr(d, "create unique index if not exists idx_provider_models_key on provider_models(provider_id, model)" as &const byte);
+    try dbx_exec_cstr(d, "create index if not exists idx_provider_models_model on provider_models(model)" as &const byte);
+}
+
+// ---------------------------------------------------------------
 // 版本号写回
 // ---------------------------------------------------------------
 
@@ -163,6 +181,11 @@ export fn schema_migrate(d: &Db) !i32 {
             applied = true;
         } else if cur == 2 {
             schema_v3(d) catch |_| {
+                failed = true;
+            };
+            applied = true;
+        } else if cur == 3 {
+            schema_v4(d) catch |_| {
                 failed = true;
             };
             applied = true;

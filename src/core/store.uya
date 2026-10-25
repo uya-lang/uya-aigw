@@ -31,6 +31,8 @@ export error UserNotFound;
 export error KeyInvalid;
 export error OtpInvalid;
 export error SessionInvalid;
+export error ProviderExists;
+export error ProviderNotFound;
 
 /// 用户的最小读模型。
 export struct StoreUser {
@@ -45,6 +47,39 @@ export struct StoreKey {
     user_id: i64,
     rpm: i32,
     tpm: i32,
+}
+
+export const STORE_PROVIDER_NAME_MAX: usize = 64;
+export const STORE_PROVIDER_KIND_MAX: usize = 32;
+export const STORE_PROVIDER_SCHEME_MAX: usize = 8;
+export const STORE_PROVIDER_HOST_MAX: usize = 256;
+export const STORE_PROVIDER_PATH_MAX: usize = 128;
+export const STORE_PROVIDER_AUTH_NAME_MAX: usize = 64;
+export const STORE_PROVIDER_SECRET_MAX: usize = 256;
+export const STORE_PROVIDER_MODEL_MAX: usize = 128;
+
+/// 供应商读模型：固定缓冲，避免把 DB 生命周期带进调用方。
+export struct StoreProvider {
+    id: i64,
+    port: i32,
+    auth_type: i32,
+    timeout_ms: i32,
+    enabled: bool,
+    found: bool,
+    name: [byte: STORE_PROVIDER_NAME_MAX],
+    name_len: usize,
+    kind: [byte: STORE_PROVIDER_KIND_MAX],
+    kind_len: usize,
+    scheme: [byte: STORE_PROVIDER_SCHEME_MAX],
+    scheme_len: usize,
+    host: [byte: STORE_PROVIDER_HOST_MAX],
+    host_len: usize,
+    base_path: [byte: STORE_PROVIDER_PATH_MAX],
+    base_path_len: usize,
+    auth_name: [byte: STORE_PROVIDER_AUTH_NAME_MAX],
+    auth_name_len: usize,
+    secret: [byte: STORE_PROVIDER_SECRET_MAX],
+    secret_len: usize,
 }
 
 /// 当前 unix 秒。
@@ -542,4 +577,234 @@ export fn store_drop_session(d: &Db, token: &[byte]) !void {
         return error.StoreFailed;
     }
     return;
+}
+
+// ---------------------------------------------------------------
+// 供应商（A4）：providers / provider_models
+// ---------------------------------------------------------------
+
+export fn store_provider_zero(out: &StoreProvider) void {
+    out.id = 0;
+    out.port = 0;
+    out.auth_type = 0;
+    out.timeout_ms = 0;
+    out.enabled = false;
+    out.found = false;
+    out.name_len = 0;
+    out.kind_len = 0;
+    out.scheme_len = 0;
+    out.host_len = 0;
+    out.base_path_len = 0;
+    out.auth_name_len = 0;
+    out.secret_len = 0;
+}
+
+/// 读一行的前 12 列（id..enabled）；调用方保证列顺序一致。
+fn store_provider_fill(st: &DbStmt, out: &StoreProvider) void {
+    out.id = dbx_col_i64(st, 0);
+    out.name_len = dbx_col_text(st, 1, &out.name[0], STORE_PROVIDER_NAME_MAX);
+    out.kind_len = dbx_col_text(st, 2, &out.kind[0], STORE_PROVIDER_KIND_MAX);
+    out.scheme_len = dbx_col_text(st, 3, &out.scheme[0], STORE_PROVIDER_SCHEME_MAX);
+    out.host_len = dbx_col_text(st, 4, &out.host[0], STORE_PROVIDER_HOST_MAX);
+    out.port = dbx_col_i64(st, 5) as i32;
+    out.base_path_len = dbx_col_text(st, 6, &out.base_path[0], STORE_PROVIDER_PATH_MAX);
+    out.auth_type = dbx_col_i64(st, 7) as i32;
+    out.auth_name_len = dbx_col_text(st, 8, &out.auth_name[0], STORE_PROVIDER_AUTH_NAME_MAX);
+    out.secret_len = dbx_col_text(st, 9, &out.secret[0], STORE_PROVIDER_SECRET_MAX);
+    out.timeout_ms = dbx_col_i64(st, 10) as i32;
+    out.enabled = dbx_col_i64(st, 11) != 0;
+    out.found = true;
+}
+
+const STORE_PROVIDER_COLS: &const byte =
+    "select id, name, kind, scheme, host, port, base_path, auth_type, auth_name, secret, timeout_ms, enabled from providers where id = ?" as &const byte;
+
+/// 建供应商（默认 openai/https/443/bearer/60s/enabled）。
+export fn store_provider_create(d: &Db, name: &[byte], host: &[byte], port: i32,
+    now: i64, out: &StoreProvider) !void {
+    if name.len == 0 || name.len > STORE_PROVIDER_NAME_MAX || host.len == 0
+        || host.len > STORE_PROVIDER_HOST_MAX || port <= 0 || port > 65535 {
+        return error.StoreFailed;
+    }
+    var st: DbStmt = dbx_prepare(d,
+        "insert into providers(name, host, port, created_at, updated_at) values(?, ?, ?, ?, ?)" as &const byte) catch {
+        return error.StoreFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, name) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_text(&st, 2, host) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_i64(&st, 3, port as i64) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_i64(&st, 4, now) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_i64(&st, 5, now) catch {
+        return error.StoreFailed;
+    };
+    if dbx_step(&st) != 0 {
+        if store_last_error_is_unique() {
+            return error.ProviderExists;
+        }
+        return error.StoreFailed;
+    }
+    const id: i64 = dbx_last_insert_rowid(d);
+    try store_provider_get(d, id, out);
+    return;
+}
+
+/// 按 id 取供应商。
+export fn store_provider_get(d: &Db, id: i64, out: &StoreProvider) !void {
+    store_provider_zero(out);
+    var st: DbStmt = dbx_prepare(d, STORE_PROVIDER_COLS) catch {
+        return error.StoreFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_i64(&st, 1, id) catch {
+        return error.StoreFailed;
+    };
+    if dbx_step(&st) != 1 {
+        return error.ProviderNotFound;
+    }
+    store_provider_fill(&st, out);
+    return;
+}
+
+/// 按名字取供应商（含 disabled 的；enabled 由调用方判断）。
+export fn store_provider_find(d: &Db, name: &[byte], out: &StoreProvider) !void {
+    store_provider_zero(out);
+    var st: DbStmt = dbx_prepare(d,
+        "select id, name, kind, scheme, host, port, base_path, auth_type, auth_name, secret, timeout_ms, enabled from providers where name = ?" as &const byte) catch {
+        return error.StoreFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, name) catch {
+        return error.StoreFailed;
+    };
+    if dbx_step(&st) != 1 {
+        return error.ProviderNotFound;
+    }
+    store_provider_fill(&st, out);
+    return;
+}
+
+/// 更新认证配置（auth_type：0 none / 1 bearer / 2 header / 3 query）。
+export fn store_provider_set_auth(d: &Db, id: i64, auth_type: i32,
+    auth_name: &[byte], secret: &[byte], now: i64) !void {
+    if auth_type < 0 || auth_type > 3 || auth_name.len > STORE_PROVIDER_AUTH_NAME_MAX
+        || secret.len > STORE_PROVIDER_SECRET_MAX {
+        return error.StoreFailed;
+    }
+    var st: DbStmt = dbx_prepare(d,
+        "update providers set auth_type = ?, auth_name = ?, secret = ?, updated_at = ? where id = ?" as &const byte) catch {
+        return error.StoreFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_i64(&st, 1, auth_type as i64) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_text(&st, 2, auth_name) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_text(&st, 3, secret) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_i64(&st, 4, now) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_i64(&st, 5, id) catch {
+        return error.StoreFailed;
+    };
+    if dbx_step(&st) != 0 {
+        return error.StoreFailed;
+    }
+    if dbx_changes(d) == 0 {
+        return error.ProviderNotFound;
+    }
+    return;
+}
+
+/// 启用/停用。
+export fn store_provider_set_enabled(d: &Db, id: i64, enabled: bool, now: i64) !void {
+    var st: DbStmt = dbx_prepare(d,
+        "update providers set enabled = ?, updated_at = ? where id = ?" as &const byte) catch {
+        return error.StoreFailed;
+    };
+    defer { dbx_finalize(&st); }
+    var ev: i64 = 0;
+    if enabled {
+        ev = 1;
+    }
+    dbx_bind_i64(&st, 1, ev) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_i64(&st, 2, now) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_i64(&st, 3, id) catch {
+        return error.StoreFailed;
+    };
+    if dbx_step(&st) != 0 {
+        return error.StoreFailed;
+    }
+    if dbx_changes(d) == 0 {
+        return error.ProviderNotFound;
+    }
+    return;
+}
+
+/// 对外模型名 → 上游模型名（同一 provider 内覆盖）。
+export fn store_provider_model_put(d: &Db, provider_id: i64, model: &[byte],
+    upstream_model: &[byte], now: i64) !void {
+    if model.len == 0 || model.len > STORE_PROVIDER_MODEL_MAX || upstream_model.len == 0
+        || upstream_model.len > STORE_PROVIDER_MODEL_MAX {
+        return error.StoreFailed;
+    }
+    var st: DbStmt = dbx_prepare(d,
+        "insert or replace into provider_models(provider_id, model, upstream_model, created_at) values(?, ?, ?, ?)" as &const byte) catch {
+        return error.StoreFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_i64(&st, 1, provider_id) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_text(&st, 2, model) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_text(&st, 3, upstream_model) catch {
+        return error.StoreFailed;
+    };
+    dbx_bind_i64(&st, 4, now) catch {
+        return error.StoreFailed;
+    };
+    if dbx_step(&st) != 0 {
+        return error.StoreFailed;
+    }
+    return;
+}
+
+/// 按对外模型名选一个 enabled 的 provider（id 最小者），并给出上游模型名。
+/// 没有可用路由返回 false（不是错误）。
+export fn store_provider_route(d: &Db, model: &[byte], out: &StoreProvider,
+    upstream_out: &byte, cap: usize, upstream_len: &usize) !bool {
+    upstream_len[0] = 0;
+    store_provider_zero(out);
+    var st: DbStmt = dbx_prepare(d,
+        "select p.id, p.name, p.kind, p.scheme, p.host, p.port, p.base_path, p.auth_type, p.auth_name, p.secret, p.timeout_ms, p.enabled, m.upstream_model from provider_models m join providers p on p.id = m.provider_id where m.model = ? and p.enabled = 1 order by p.id limit 1" as &const byte) catch {
+        return error.StoreFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, model) catch {
+        return error.StoreFailed;
+    };
+    if dbx_step(&st) != 1 {
+        return false;
+    }
+    store_provider_fill(&st, out);
+    upstream_len[0] = dbx_col_text(&st, 12, upstream_out, cap);
+    return true;
 }

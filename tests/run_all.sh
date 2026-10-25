@@ -25,6 +25,7 @@ run src/core/money.uya tests/test_money.uya
 run src/core/dbx.uya tests/test_dbx.uya
 run src/core/dbx.uya src/core/schema.uya tests/test_schema.uya
 run src/core/dbx.uya src/core/schema.uya src/core/store.uya tests/test_store.uya
+run src/core/dbx.uya src/core/schema.uya src/core/store.uya tests/test_provider_store.uya
 run src/core/schedule.uya tests/test_schedule.uya
 run src/core/dbx.uya src/core/schema.uya src/core/money.uya src/core/schedule.uya src/core/price.uya tests/test_price.uya
 run src/core/dbx.uya src/core/schema.uya src/core/backup.uya tests/test_backup.uya
