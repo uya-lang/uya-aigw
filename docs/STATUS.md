@@ -30,8 +30,8 @@
   config/status，`--meta`/`--node-id`，standby 不备份）。
 - B2（进行中）：`uplink.uya` + `--uplink` 已通（node 注册/心跳）；config 快照与
   slug 归属待做。
-- B3（进行中）：epoch/fencing/drain 已落地（17 断言）并暴露
-  `/controller/epoch|assign|drain`（stale → 421）；再平衡与 3s 重分配待做。
+- B3（进行中）：epoch/fencing/drain + `epoch|assign|drain` 控制面（421）+ 批量
+  迁移/清零已落地；3s 自动重分配待做。
 
 ## 开发命令（A9）
 
@@ -60,8 +60,8 @@
   config/status，`--meta`/`--node-id`，standby 不备份）。
 - B2（进行中）：`uplink.uya` + `--uplink` 已通（node 注册/心跳）；config 快照与
   slug 归属待做。
-- B3（进行中）：epoch/fencing/drain 已落地（17 断言）并暴露
-  `/controller/epoch|assign|drain`（stale → 421）；再平衡与 3s 重分配待做。
+- B3（进行中）：epoch/fencing/drain + `epoch|assign|drain` 控制面（421）+ 批量
+  迁移/清零已落地；3s 自动重分配待做。
 
 ## 开发命令（A9）
 

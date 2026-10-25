@@ -365,3 +365,58 @@ export fn meta_node_set_status(d: &Db, node_id: &[byte], status: &[byte], now: i
     }
     return;
 }
+
+/// 某节点当前拥有的 slug 数。
+export fn meta_assign_count(d: &Db, node_id: &[byte]) !i64 {
+    var st: DbStmt = dbx_prepare(d,
+        "select count(*) from meta_assignments where node_id = ?" as &const byte) catch {
+        return error.MetaFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, node_id) catch { return error.MetaFailed; };
+    if dbx_step(&st) != 1 {
+        return 0 as i64;
+    }
+    return dbx_col_i64(&st, 0);
+}
+
+/// 把 from_node 的 slug 全部迁到 to_node（epoch 必须等于 to_node 当前 epoch）。
+/// 只迁移 epoch ≤ to_epoch 的归属；返回迁移条数。失败（epoch 不匹配）返回 StaleEpoch。
+export fn meta_reassign_all(d: &Db, from_node: &[byte], to_node: &[byte],
+    to_epoch: i64, now: i64) !i64 {
+    if from_node.len == 0 || to_node.len == 0 || to_epoch <= 0 {
+        return error.StaleEpoch;
+    }
+    const cur: i64 = try meta_epoch_get(d, to_node);
+    if cur != to_epoch {
+        return error.StaleEpoch;
+    }
+    var st: DbStmt = dbx_prepare(d,
+        "update meta_assignments set node_id = ?, epoch = ?, updated_at = ? where node_id = ? and epoch <= ?" as &const byte) catch {
+        return error.MetaFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, to_node) catch { return error.MetaFailed; };
+    dbx_bind_i64(&st, 2, to_epoch) catch { return error.MetaFailed; };
+    dbx_bind_i64(&st, 3, now) catch { return error.MetaFailed; };
+    dbx_bind_text(&st, 4, from_node) catch { return error.MetaFailed; };
+    dbx_bind_i64(&st, 5, to_epoch) catch { return error.MetaFailed; };
+    if dbx_step(&st) != 0 {
+        return error.MetaFailed;
+    }
+    return dbx_changes(d) as i64;
+}
+
+/// drain 完成后清空该节点的归属（返回删除条数）。
+export fn meta_clear_node(d: &Db, node_id: &[byte]) !i64 {
+    var st: DbStmt = dbx_prepare(d,
+        "delete from meta_assignments where node_id = ?" as &const byte) catch {
+        return error.MetaFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, node_id) catch { return error.MetaFailed; };
+    if dbx_step(&st) != 0 {
+        return error.MetaFailed;
+    }
+    return dbx_changes(d) as i64;
+}
