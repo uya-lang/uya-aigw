@@ -76,6 +76,13 @@ export fn lb_report(id: i64, ok: bool, now: i64) void {
     }
 }
 
+/// 强制熔断（一次硬失败后重试换 provider 用）。
+export fn lb_block_for(id: i64, now: i64, secs: i64) void {
+    const s: &LbState = lb_slot(id);
+    s.fails = LB_MAX_FAILS;
+    s.open_until = now +% secs;
+}
+
 export fn lb_fails(id: i64) i32 {
     const s: &LbState = lb_slot(id);
     return s.fails;

@@ -270,6 +270,19 @@ kill "$NB_PID" 2>/dev/null || true
 wait "$NB_PID" 2>/dev/null || true
 NB_PID=""
 
+# 4q) A8：失败转移（dead provider 优先 → 熔断后重试落到 live provider）
+FO=$(curl -s --max-time 10 -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  --data '{"model":"failover-model","messages":[{"role":"user","content":"hi"}]}' "$BASE/v1/chat/completions")
+echo "$FO" | grep -q 'hello-from-mock' || { echo "$FO" >&2; fail "failover"; }
+# 只有 dead 一家（且已被熔断）→ 明确报错，不静默成功
+FD=$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  --data '{"model":"fail-model","messages":[{"role":"user","content":"hi"}]}' "$BASE/v1/chat/completions")
+[ "$FD" = "400" ] || [ "$FD" = "502" ] || [ "$FD" = "503" ] || fail "all-dead unexpected $FD"
+# 熔断不影响其他模型
+MC=$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  --data '{"model":"mock-model","messages":[{"role":"user","content":"hi"}]}' "$BASE/v1/chat/completions")
+[ "$MC" = "200" ] || fail "mock-model after failover expected 200 got $MC"
+
 # 4p) A5：responses 透传 tools/reasoning + tool_calls → function_call
 TOOLS='{"model":"mock-model","input":"weather?","reasoning":{"effort":"high"},"tools":[{"type":"function","function":{"name":"get_weather","description":"d","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}],"tool_choice":"auto"}'
 TR=$(curl -s --max-time 10 -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' --data "$TOOLS" "$BASE/v1/responses")
@@ -399,5 +412,5 @@ kill "$SRV_PID" 2>/dev/null || true
 wait "$SRV_PID" 2>/dev/null || true
 SRV_PID=""
 COUNT=$(AIGW_MODE=count AIGW_DB="$SEED_DB" ./build/seed | sed -n 's/^COUNT=//p')
-[ "$COUNT" = "9" ] || fail "usage_ledger count=$COUNT"
+[ "$COUNT" = "11" ] || fail "usage_ledger count=$COUNT"
 echo "CHAT-ALL-OK status=$CODE count=$COUNT"

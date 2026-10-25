@@ -1364,6 +1364,14 @@ fn srv_chat(c: &SrvConn, stats: &ServeStats) void {
         };
         if failed {
             lb_report(plan.provider_id, false, store_now());
+            // A8：硬失败后先熔断该 provider，重试才会换下一家（否则同 session 亲和会挑回同一家）。
+            lb_block_for(plan.provider_id, store_now(), 30);
+            var dbgb: [byte: 48] = [0: 48];
+            var di: usize = 0;
+            while di < 24 {
+                dbgb[di] = 0;
+                di = di + 1;
+            }
             attempts = attempts +% 1;
             if attempts >= 3 {
                 srv_static(c, 502, SRV_JSON_502, keep);

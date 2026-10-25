@@ -40,7 +40,8 @@ A4/A5/A8 进度（子项已完成记录见 `TODO_DONE.md`）：
 - A5：`/v1/responses` 非流式 + `previous_response_id` 续轮 + 流式
   `response.created/output_text.delta/completed` + tools/reasoning 透传与 `function_call` 输出
   已落地；剩余：流式工具事件（`response.output_item.added/done`）。
-- A8：priority/weight/会话亲和/熔断 + 失败换 provider 重试已落地；剩余：插件级重绑。
+- A8：priority/weight/会话亲和/熔断 + 硬失败强制熔断后重试换 provider（`lb_block_for`）已落地；
+  剩余：插件级重绑（进程被杀后按新进程重连）。
 
 ---
 
