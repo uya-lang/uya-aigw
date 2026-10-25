@@ -1,0 +1,141 @@
+// src/core/responses.uya — A5 responses：previous_response_id 会话存储与 chat 互转
+//
+// 存储的是一条 response 的输入/输出文本；下一轮把上一轮 output 作为 assistant 消息
+// 拼到 chat messages 前面。结构化 tools/reasoning 暂不落库（透传给上游）。
+
+export const RESP_ID_MAX: usize = 64;
+export const RESP_MODEL_MAX: usize = 128;
+export const RESP_INPUT_MAX: usize = 4096;
+export const RESP_OUTPUT_MAX: usize = 8192;
+export const RESP_USAGE_MAX: usize = 1024;
+
+export error RespFailed;
+export error RespNotFound;
+
+export struct RespRow {
+    id: [byte: RESP_ID_MAX],
+    id_len: usize,
+    user_id: i64,
+    created_at: i64,
+    model: [byte: RESP_MODEL_MAX],
+    model_len: usize,
+    previous_id: [byte: RESP_ID_MAX],
+    previous_len: usize,
+    input_text: [byte: RESP_INPUT_MAX],
+    input_len: usize,
+    output_text: [byte: RESP_OUTPUT_MAX],
+    output_len: usize,
+    usage_json: [byte: RESP_USAGE_MAX],
+    usage_len: usize,
+    found: bool,
+}
+
+export fn resp_zero(out: &RespRow) void {
+    out.id_len = 0;
+    out.user_id = 0;
+    out.created_at = 0;
+    out.model_len = 0;
+    out.previous_len = 0;
+    out.input_len = 0;
+    out.output_len = 0;
+    out.usage_len = 0;
+    out.found = false;
+}
+
+export fn resp_store(d: &Db, id: &[byte], user_id: i64, now: i64, model: &[byte],
+    previous_id: &[byte], input_text: &[byte], output_text: &[byte],
+    usage_json: &[byte]) !void {
+    if id.len == 0 || id.len > RESP_ID_MAX {
+        return error.RespFailed;
+    }
+    var st: DbStmt = dbx_prepare(d,
+        "insert or replace into responses(id, user_id, created_at, model, previous_id, input_text, output_text, status, usage_json) values(?, ?, ?, ?, ?, ?, ?, 'completed', ?)" as &const byte) catch {
+        return error.RespFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, id) catch { return error.RespFailed; };
+    dbx_bind_i64(&st, 2, user_id) catch { return error.RespFailed; };
+    dbx_bind_i64(&st, 3, now) catch { return error.RespFailed; };
+    dbx_bind_text(&st, 4, model) catch { return error.RespFailed; };
+    dbx_bind_text(&st, 5, previous_id) catch { return error.RespFailed; };
+    dbx_bind_text(&st, 6, input_text) catch { return error.RespFailed; };
+    dbx_bind_text(&st, 7, output_text) catch { return error.RespFailed; };
+    dbx_bind_text(&st, 8, usage_json) catch { return error.RespFailed; };
+    if dbx_step(&st) != 0 {
+        return error.RespFailed;
+    }
+    return;
+}
+
+export fn resp_get(d: &Db, id: &[byte], out: &RespRow) !void {
+    resp_zero(out);
+    var st: DbStmt = dbx_prepare(d,
+        "select id, user_id, created_at, model, previous_id, input_text, output_text, usage_json from responses where id = ?" as &const byte) catch {
+        return error.RespFailed;
+    };
+    defer { dbx_finalize(&st); }
+    dbx_bind_text(&st, 1, id) catch { return error.RespFailed; };
+    if dbx_step(&st) != 1 {
+        return error.RespNotFound;
+    }
+    out.id_len = dbx_col_text(&st, 0, &out.id[0], RESP_ID_MAX);
+    out.user_id = dbx_col_i64(&st, 1);
+    out.created_at = dbx_col_i64(&st, 2);
+    out.model_len = dbx_col_text(&st, 3, &out.model[0], RESP_MODEL_MAX);
+    out.previous_len = dbx_col_text(&st, 4, &out.previous_id[0], RESP_ID_MAX);
+    out.input_len = dbx_col_text(&st, 5, &out.input_text[0], RESP_INPUT_MAX);
+    out.output_len = dbx_col_text(&st, 6, &out.output_text[0], RESP_OUTPUT_MAX);
+    out.usage_len = dbx_col_text(&st, 7, &out.usage_json[0], RESP_USAGE_MAX);
+    out.found = true;
+    return;
+}
+
+/// 把 responses 的输入（可带上一轮 output）转成 chat 请求体。
+export fn resp_build_chat(model: &[byte], previous_output: &[byte], input_text: &[byte],
+    out: &byte, cap: usize) usize {
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"model"[0: 5]);
+    jsonw_str(&w, model);
+    jsonw_key(&w, &"messages"[0: 8]);
+    jsonw_arr(&w);
+    if previous_output.len > 0 {
+        jsonw_obj(&w);
+        jsonw_key(&w, &"role"[0: 4]);
+        jsonw_str(&w, &"assistant"[0: 9]);
+        jsonw_key(&w, &"content"[0: 7]);
+        jsonw_str(&w, previous_output);
+        jsonw_end_obj(&w);
+    }
+    jsonw_obj(&w);
+    jsonw_key(&w, &"role"[0: 4]);
+    jsonw_str(&w, &"user"[0: 4]);
+    jsonw_key(&w, &"content"[0: 7]);
+    jsonw_str(&w, input_text);
+    jsonw_end_obj(&w);
+    jsonw_end_arr(&w);
+    jsonw_end_obj(&w);
+    const n: usize = jsonw_len(&w);
+    if n > cap {
+        return 0;
+    }
+    var i: usize = 0;
+    while i < n {
+        out[i] = w.out[i];
+        i = i + 1;
+    }
+    return n;
+}
+
+/// 从 chat completion 响应里取 choices[0].message.content。
+export fn resp_parse_output(d: &JsonDoc, root: i32, out: &byte, cap: usize) usize {
+    const choices: i32 = json_get(d, root, &"choices"[0: 7]);
+    const c0: i32 = json_arr_at(d, choices, 0);
+    const msg: i32 = json_get(d, c0, &"message"[0: 7]);
+    const content: i32 = json_get(d, msg, &"content"[0: 7]);
+    if json_kind(d, content) != JSON_STR {
+        return 0;
+    }
+    return json_str(d, content, out, cap);
+}

@@ -37,8 +37,9 @@ PY
 cat > "$TMP/mock.py" <<'PY'
 import http.server, ssl, sys
 port, cert, key, reqfile = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
-BODY = (b'{"id":"chatcmpl-e2e","object":"chat.completion","usage":{'
-        b'"prompt_tokens":100000,"completion_tokens":50000,'
+BODY = (b'{"id":"chatcmpl-e2e","object":"chat.completion",'
+        b'"choices":[{"message":{"role":"assistant","content":"hello-from-mock"}}],'
+        b'"usage":{"prompt_tokens":100000,"completion_tokens":50000,'
         b'"prompt_tokens_details":{"cached_tokens":10000}}}')
 USAGE = (b'{"usage":{"prompt_tokens":100000,"completion_tokens":50000,'
          b'"prompt_tokens_details":{"cached_tokens":10000}}}')
@@ -93,7 +94,7 @@ UYA_ROOT="$UYA_ROOT" "$UYA" build \
   src/core/money.uya src/core/reqlog.uya src/core/dbx.uya src/net/rsav.uya \
   src/core/schema.uya src/core/store.uya src/core/backup.uya src/core/journal.uya \
   src/core/runtime.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/rollup.uya \
-  src/core/billing.uya src/core/lb.uya src/core/chat.uya src/providers/upstream.uya \
+  src/core/billing.uya src/core/lb.uya src/core/responses.uya src/core/chat.uya src/providers/upstream.uya \
   src/providers/upstream_cfg.uya \
   src/net/x509min.uya src/net/chainx.uya src/net/urlx.uya src/net/dnsx.uya \
   src/net/tlsx.uya src/net/tlsx_conn.uya src/net/httpc.uya src/net/ssex.uya \
@@ -147,6 +148,17 @@ SCODE=$(curl -s -N --max-time 15 -o "$TMP/stream.txt" -w '%{http_code}' -X POST 
 grep -q 'data: {"i":0}' "$TMP/stream.txt" || fail "stream event missing"
 grep -q 'data: \[DONE\]' "$TMP/stream.txt" || fail "stream DONE missing"
 
+# 4b1) A5 responses：首轮 + previous_response_id 续轮
+R1=$(curl -s --max-time 15 -X POST -H "Authorization: Bearer $TOKEN" \
+  --data '{"model":"mock-model","input":"hello"}' "$BASE/v1/responses")
+echo "$R1" | grep -q '"output_text"' || { echo "$R1" >&2; fail "responses output"; }
+echo "$R1" | grep -q 'hello-from-mock' || { echo "$R1" >&2; fail "responses text"; }
+RID=$(echo "$R1" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+[ -n "$RID" ] || { echo "$R1" >&2; fail "responses id"; }
+R2=$(curl -s --max-time 15 -X POST -H "Authorization: Bearer $TOKEN" \
+  --data "{\"model\":\"mock-model\",\"input\":\"next\",\"previous_response_id\":\"$RID\"}" "$BASE/v1/responses")
+echo "$R2" | grep -q '"output_text"' || { echo "$R2" >&2; fail "responses continue"; }
+
 # 4b2) models：公开列表来自 provider_models
 MJSON=$(curl -s --max-time 10 "http://127.0.0.1:$PORT/v1/models")
 echo "$MJSON" | grep -q '"id":"mock-model"' || { echo "$MJSON" >&2; fail "models list"; }
@@ -155,8 +167,8 @@ echo "$MJSON" | grep -q '"id":"mock-model"' || { echo "$MJSON" >&2; fail "models
 UJSON=$(curl -s --max-time 10 -H "Authorization: Bearer $TOKEN" \
   "http://127.0.0.1:$PORT/v1/usage?from_day=0&to_day=999999")
 echo "$UJSON" | grep -q '"mock-model"' || { echo "$UJSON" >&2; fail "usage model missing"; }
-echo "$UJSON" | grep -q '"requests":2' || { echo "$UJSON" >&2; fail "usage totals"; }
-echo "$UJSON" | grep -q '"profit_nano":264' || { echo "$UJSON" >&2; fail "usage profit"; }
+echo "$UJSON" | grep -q '"requests":4' || { echo "$UJSON" >&2; fail "usage totals"; }
+echo "$UJSON" | grep -q '"profit_nano":528' || { echo "$UJSON" >&2; fail "usage profit"; }
 
 # 4d) A7 管理 REST（--admin-key）
 AH=$(curl -s --max-time 5 -H 'Authorization: Bearer test-admin' "$BASE/admin/health")
@@ -176,5 +188,5 @@ kill "$SRV_PID" 2>/dev/null || true
 wait "$SRV_PID" 2>/dev/null || true
 SRV_PID=""
 COUNT=$(AIGW_MODE=count AIGW_DB="$SEED_DB" ./build/seed | sed -n 's/^COUNT=//p')
-[ "$COUNT" = "2" ] || fail "usage_ledger count=$COUNT"
+[ "$COUNT" = "4" ] || fail "usage_ledger count=$COUNT"
 echo "CHAT-ALL-OK status=$CODE count=$COUNT"
