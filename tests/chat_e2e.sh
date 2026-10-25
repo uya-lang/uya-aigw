@@ -222,6 +222,25 @@ echo "$CST" | grep -q '"node-a"' || { echo "$CST" >&2; fail "controller status a
 echo "$CST" | grep -q '"node-b"' || { echo "$CST" >&2; fail "controller status b"; }
 echo "$CST" | grep -q '"leader":"node-a"' || { echo "$CST" >&2; fail "controller leader"; }
 
+# B3：epoch / 归属 fencing（stale → 421）/ drain
+CE=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer test-admin' --data '{"id":"node-b"}' "$BASE/controller/epoch")
+echo "$CE" | grep -q '"epoch":1' || { echo "$CE" >&2; fail "epoch bump"; }
+CA1=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer test-admin' \
+  --data '{"slug":"s1","node_id":"node-b","epoch":1}' "$BASE/controller/assign")
+echo "$CA1" | grep -q '"ok":true' || { echo "$CA1" >&2; fail "assign ok"; }
+CE2=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer test-admin' --data '{"id":"node-b"}' "$BASE/controller/epoch")
+echo "$CE2" | grep -q '"epoch":2' || { echo "$CE2" >&2; fail "epoch bump2"; }
+CA2=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' -X POST -H 'Authorization: Bearer test-admin' \
+  --data '{"slug":"s1","node_id":"node-b","epoch":1}' "$BASE/controller/assign")
+[ "$CA2" = "421" ] || fail "stale epoch expected 421, got $CA2"
+CA3=$(curl -s --max-time 5 "$BASE/controller/assign?slug=s1")
+echo "$CA3" | grep -q '"node_id":"node-b"' || { echo "$CA3" >&2; fail "assign get"; }
+echo "$CA3" | grep -q '"epoch":1' || { echo "$CA3" >&2; fail "assign epoch"; }
+CD=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer test-admin' --data '{"id":"node-b"}' "$BASE/controller/drain")
+echo "$CD" | grep -q '"ok":true' || { echo "$CD" >&2; fail "drain"; }
+CST3=$(curl -s --max-time 5 -H 'Authorization: Bearer test-admin' "$BASE/controller/status")
+echo "$CST3" | grep -q '"status":"draining"' || { echo "$CST3" >&2; fail "drain status"; }
+
 # 4g) B2：node-b 通过 uplink 注册到 controller
 mkdir -p "$TMP/nodeb"
 ./build/aigw serve --host 127.0.0.1 --port 0 --db "$TMP/nodeb/aigw.db" \

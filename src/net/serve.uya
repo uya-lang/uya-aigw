@@ -80,6 +80,9 @@ const ROUTE_ADMIN_BILLING: i32 = 12;
 const ROUTE_ADMIN_BACKUP: i32 = 13;
 const ROUTE_RESPONSES: i32 = 14;
 const ROUTE_MCP: i32 = 15;
+const ROUTE_CTL_EPOCH: i32 = 21;
+const ROUTE_CTL_ASSIGN: i32 = 22;
+const ROUTE_CTL_DRAIN: i32 = 23;
 const ROUTE_CTL_REGISTER: i32 = 16;
 const ROUTE_CTL_HEARTBEAT: i32 = 17;
 const ROUTE_CTL_CONFIG: i32 = 18;
@@ -99,6 +102,7 @@ const SRV_JSON_401: &[byte] = &"{\"error\":\"unauthorized\"}"[0: 24];
 const SRV_JSON_413: &[byte] = &"{\"error\":\"payload too large\"}"[0: 29];
 const SRV_JSON_503: &[byte] = &"{\"error\":\"service unavailable\"}"[0: 31];
 const SRV_JSON_502: &[byte] = &"{\"error\":\"upstream failed\"}"[0: 27];
+const SRV_JSON_421: &[byte] = &"{\"error\":\"stale epoch\"}"[0: 23];
 const SRV_CTYPE_JSON: &[byte] = &"application/json"[0: 16];
 const SRV_CTYPE_SSE: &[byte] = &"text/event-stream"[0: 17];
 const SRV_SSE_LINE: &[byte] = &"data: {}\n\n"[0: 10];
@@ -575,6 +579,15 @@ fn srv_route_of(req: &HsrvReq) i32 {
     }
     if srv_path_is(req, &"/v1/me"[0: 6]) {
         return ROUTE_ME;
+    }
+    if srv_path_is(req, &"/controller/epoch"[0: 17]) {
+        return ROUTE_CTL_EPOCH;
+    }
+    if srv_path_is(req, &"/controller/assign"[0: 18]) {
+        return ROUTE_CTL_ASSIGN;
+    }
+    if srv_path_is(req, &"/controller/drain"[0: 17]) {
+        return ROUTE_CTL_DRAIN;
     }
     if srv_path_is(req, &"/controller/register"[0: 20]) {
         return ROUTE_CTL_REGISTER;
@@ -1123,6 +1136,18 @@ fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
     }
     if c.route == ROUTE_ME {
         srv_me(c, stats);
+        return;
+    }
+    if c.route == ROUTE_CTL_EPOCH {
+        srv_ctl_epoch(c, stats);
+        return;
+    }
+    if c.route == ROUTE_CTL_ASSIGN {
+        srv_ctl_assign(c, stats);
+        return;
+    }
+    if c.route == ROUTE_CTL_DRAIN {
+        srv_ctl_drain(c, stats);
         return;
     }
     if c.route == ROUTE_CTL_REGISTER {
@@ -3028,6 +3053,150 @@ fn srv_ctl_status(c: &SrvConn, stats: &ServeStats) void {
         i = i + 1;
     }
     jsonw_end_arr(&w);
+    jsonw_end_obj(&w);
+    srv_static(c, 200, jsonw_span(&w), keep);
+}
+
+
+// B3：epoch / 归属 / drain 控制面
+fn srv_ctl_epoch(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    if !g_meta_ready {
+        srv_static(c, 503, SRV_JSON_503, keep);
+        return;
+    }
+    if !srv_admin_ok(c) {
+        srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    }
+    var d: JsonDoc = JsonDoc{};
+    json_parse(&d, c.body[0: c.body_len]) catch {
+        srv_static(c, 400, SRV_JSON_400, keep);
+        return;
+    };
+    var id: [byte: 64] = [0: 64];
+    const idn: usize = json_str(&d, json_get(&d, json_root(&d), &"id"[0: 2]), &id[0], 64);
+    if idn == 0 {
+        srv_static(c, 400, SRV_JSON_400, keep);
+        return;
+    }
+    var ep: i64 = 0;
+    ep = meta_epoch_bump(&g_meta, id[0: idn], store_now()) catch {
+        srv_static(c, 502, SRV_JSON_502, keep);
+        return;
+    };
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"ok"[0: 2]);
+    jsonw_bool(&w, true);
+    jsonw_key(&w, &"epoch"[0: 5]);
+    jsonw_i64(&w, ep);
+    jsonw_end_obj(&w);
+    srv_static(c, 200, jsonw_span(&w), keep);
+}
+
+fn srv_ctl_assign(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    if !g_meta_ready {
+        srv_static(c, 503, SRV_JSON_503, keep);
+        return;
+    }
+    if c.body_len == 0 {
+        var slug: [byte: 128] = [0: 128];
+        const sn: usize = srv_query_str(&c.path[0], c.path_len, &"slug"[0: 4], 4, &slug[0], 128);
+        if sn == 0 {
+            srv_static(c, 400, SRV_JSON_400, keep);
+            return;
+        }
+        var nb: [byte: 64] = [0: 64];
+        var ep: i64 = 0;
+        const nn: usize = meta_assign_get(&g_meta, slug[0: sn], &nb[0], 64, &ep) catch {
+            srv_static(c, 502, SRV_JSON_502, keep);
+            return;
+        };
+        if nn == 0 {
+            srv_static(c, 404, SRV_JSON_404, keep);
+            return;
+        }
+        var w: JsonW = JsonW{};
+        jsonw_init(&w);
+        jsonw_obj(&w);
+        jsonw_key(&w, &"slug"[0: 4]);
+        jsonw_str(&w, slug[0: sn]);
+        jsonw_key(&w, &"node_id"[0: 7]);
+        jsonw_str(&w, nb[0: nn]);
+        jsonw_key(&w, &"epoch"[0: 5]);
+        jsonw_i64(&w, ep);
+        jsonw_end_obj(&w);
+        srv_static(c, 200, jsonw_span(&w), keep);
+        return;
+    }
+    if !srv_admin_ok(c) {
+        srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    }
+    var d: JsonDoc = JsonDoc{};
+    json_parse(&d, c.body[0: c.body_len]) catch {
+        srv_static(c, 400, SRV_JSON_400, keep);
+        return;
+    };
+    const root: i32 = json_root(&d);
+    var slug: [byte: 128] = [0: 128];
+    const sn: usize = json_str(&d, json_get(&d, root, &"slug"[0: 4]), &slug[0], 128);
+    var nb: [byte: 64] = [0: 64];
+    const nn: usize = json_str(&d, json_get(&d, root, &"node_id"[0: 7]), &nb[0], 64);
+    const ep: i64 = json_i64(&d, json_get(&d, root, &"epoch"[0: 5]));
+    if sn == 0 || nn == 0 || ep <= 0 {
+        srv_static(c, 400, SRV_JSON_400, keep);
+        return;
+    }
+    meta_assign(&g_meta, slug[0: sn], nb[0: nn], ep, store_now()) catch {
+        srv_static(c, 421, SRV_JSON_421, keep);
+        return;
+    };
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"ok"[0: 2]);
+    jsonw_bool(&w, true);
+    jsonw_end_obj(&w);
+    srv_static(c, 200, jsonw_span(&w), keep);
+}
+
+fn srv_ctl_drain(c: &SrvConn, stats: &ServeStats) void {
+    const keep: bool = c.keep;
+    stats.requests = stats.requests +% 1;
+    if !g_meta_ready {
+        srv_static(c, 503, SRV_JSON_503, keep);
+        return;
+    }
+    if !srv_admin_ok(c) {
+        srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    }
+    var d: JsonDoc = JsonDoc{};
+    json_parse(&d, c.body[0: c.body_len]) catch {
+        srv_static(c, 400, SRV_JSON_400, keep);
+        return;
+    };
+    var id: [byte: 64] = [0: 64];
+    const idn: usize = json_str(&d, json_get(&d, json_root(&d), &"id"[0: 2]), &id[0], 64);
+    if idn == 0 {
+        srv_static(c, 400, SRV_JSON_400, keep);
+        return;
+    }
+    meta_node_set_status(&g_meta, id[0: idn], &"draining"[0: 8], store_now()) catch {
+        srv_static(c, 404, SRV_JSON_404, keep);
+        return;
+    };
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"ok"[0: 2]);
+    jsonw_bool(&w, true);
     jsonw_end_obj(&w);
     srv_static(c, 200, jsonw_span(&w), keep);
 }
