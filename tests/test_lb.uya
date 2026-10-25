@@ -128,6 +128,27 @@ fn test_weight_zero() !void {
     try assert_eq_i64(try pick_id(&d, &"q"[0: 1], T0), a);
 }
 
+fn test_force_block() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    const a: i64 = try add_provider(&d, &"a"[0: 1], 18003);
+    const b: i64 = try add_provider(&d, &"b"[0: 1], 18004);
+    try store_provider_set_priority(&d, a, 0, 1, T0);
+    try store_provider_set_priority(&d, b, 1, 1, T0);
+    lb_reset();
+    // 首选 a（priority 0）
+    try assert_eq_i64(try pick_id(&d, &"f"[0: 1], T0), a);
+    // 硬失败后强制熔断 → 立刻改选 b（不必等 LB_MAX_FAILS 次）
+    lb_report(a, false, T0);
+    lb_block_for(a, T0, 30);
+    try assert_eq_i64(try pick_id(&d, &"f"[0: 1], T0), b);
+    // 熔断窗口内始终是 b；窗口外 a 回来
+    try assert_eq_i64(try pick_id(&d, &"f"[0: 1], T0 + 10), b);
+    try assert_eq_i64(try pick_id(&d, &"f"[0: 1], T0 + 31), a);
+}
+
 test "priority_and_affinity" { run_test("priority_and_affinity", test_priority_and_affinity); }
 test "circuit" { run_test("circuit", test_circuit); }
 test "weight_zero" { run_test("weight_zero", test_weight_zero); }
+test "force_block" { run_test("force_block", test_force_block); }
