@@ -1,0 +1,640 @@
+// src/plugins/pool.uya — A3 插件池：常驻 min/max、复用、idle 回收、崩溃退避、cancel、ping/pong
+//
+// 插件是 stdio 子进程：父进程写一行 JSON 到 stdin，从 stdout 读一行事件（A4 的协议层
+// 在 pool 之上）。本模块只管**进程生命周期与行 IO**，不解析 JSON：
+//
+//   * 常驻：`plugin_pool_init_at(cmd, min, ...)` 预热 `min` 个进程；`plugin_pool_tick_at` 发现低于 min
+//     会补足（除非处于崩溃退避窗口）。
+//   * 复用：acquire 先拿 IDLE 槽；release 归还；同一进程可反复用（插件 prompt cache 的
+//     前提）。
+//   * 扩容：IDLE 用完后、live < max 时现场 spawn。
+//   * 缩容：tick 把空闲超过 `idle_ms` 且 live > min 的进程杀掉。
+//   * 崩溃：子进程退出由 tick 的 waitpid(WNOHANG) 发现；崩溃次数用于指数退避
+//     （`backoff_ms * crashes`，封顶 30s），退避窗口内 acquire 返回 PluginPoolBackoff。
+//   * cancel：请求方主动放弃（断连/超时），SIGKILL + 收尸，不计崩溃数。
+//   * 行 IO：非阻塞 fd + poll 超时；读缓冲按行分帧，半行留在槽里下次续读。
+//
+// 单线程前提：池状态无锁；fd 交给 epoll（A4）时用 `plugin_pool_out_fd` / `plugin_pool_in_fd` 注册。
+
+use libc.syscall;
+use libc.errno;
+
+@c_import("pool_shim.c");
+
+extern fn aigw_pool_spawn(cmd: *const byte, pid_out: &i32, in_fd: &i32, out_fd: &i32) i32;
+extern fn aigw_pool_wait_nohang(pid: i32, status: &i32) i32;
+extern fn aigw_pool_wait(pid: i32, status: &i32) i32;
+extern fn aigw_pool_kill(pid: i32, sig: i32) i32;
+extern fn aigw_pool_poll(fd: i32, events: i32, timeout_ms: i32) i32;
+
+/// 池容量上限（编译期固定，槽表放 .bss）。
+export const PLUGIN_POOL_MAX_SLOTS: usize = 8;
+/// 单行读取上限；超过按协议错误处理。
+export const PLUGIN_POOL_LINE_CAP: usize = 8192;
+/// 背退封顶（毫秒）。
+const PLUGIN_POOL_BACKOFF_MAX_MS: i64 = 30000;
+/// SIGKILL。
+const PLUGIN_POOL_SIGKILL: i32 = 9;
+/// poll 事件位。
+const PLUGIN_POOL_POLLIN: i32 = 1;
+const PLUGIN_POOL_POLLOUT: i32 = 4;
+
+// 槽状态
+export const PLUGIN_POOL_STATE_FREE: i32 = 0;
+export const PLUGIN_POOL_STATE_IDLE: i32 = 1;
+export const PLUGIN_POOL_STATE_BUSY: i32 = 2;
+
+export error PluginPoolNotReady;
+export error PluginPoolAlreadyInit;
+export error PluginPoolExhausted;
+export error PluginPoolSpawnFailed;
+export error PluginPoolBackoff;
+export error PluginPoolTimeout;
+export error PluginPoolEof;
+export error PluginPoolIo;
+export error PluginPoolTooLong;
+export error PluginPoolSlotInvalid;
+export error PluginPoolBadConfig;
+
+/// 一个插件进程槽。
+struct PluginPoolSlot {
+    pid: i32,
+    in_fd: i32,
+    out_fd: i32,
+    state: i32,
+    last_used: i64,
+    crashes: i32,
+    // 行分帧缓冲：半行留在这里，下一次 read 续上
+    buf: [byte: PLUGIN_POOL_LINE_CAP],
+    buf_len: usize,
+}
+
+var g_pp_slots: [PluginPoolSlot: PLUGIN_POOL_MAX_SLOTS] = [];
+var g_pp_cmd: [byte: 512] = [0: 512];
+var g_pp_cmd_len: usize = 0;
+var g_pp_min: i32 = 0;
+var g_pp_max: i32 = 4;
+var g_pp_idle_ms: i64 = 60000;
+var g_pp_backoff_ms: i64 = 500;
+var g_pp_block_until: i64 = 0;
+var g_pp_crashes: i32 = 0;
+var g_pp_ready: bool = false;
+
+// ---------------------------------------------------------------
+// 小工具
+// ---------------------------------------------------------------
+
+fn plugin_pool_slot(idx: i32) &PluginPoolSlot {
+    if idx >= 0 && (idx as usize) < PLUGIN_POOL_MAX_SLOTS {
+        return &g_pp_slots[idx as usize];
+    }
+    return &g_pp_slots[0];
+}
+
+fn plugin_pool_valid(idx: i32) bool {
+    return idx >= 0 && (idx as usize) < PLUGIN_POOL_MAX_SLOTS;
+}
+
+/// 把模块级命令缓冲拷成 C 字符串，返回长度。
+fn plugin_pool_cmd_cstr(dst: &byte, cap: usize) usize {
+    var i: usize = 0;
+    while i < g_pp_cmd_len && i + 1 < cap {
+        dst[i] = g_pp_cmd[i];
+        i = i + 1;
+    }
+    dst[i] = 0 as byte;
+    return i;
+}
+
+fn plugin_pool_is_eagain(err: i32) bool {
+    return err == EAGAIN || err == EWOULDBLOCK;
+}
+
+/// 当前 unix 秒（和 store_now 同源，但不把整个 store 拖进池的依赖里）。
+fn plugin_pool_now() i64 {
+    var ts: TimeSpec = TimeSpec{};
+    const r: !i32 = sys_clock_gettime(0, &ts);
+    _ = r catch {
+        return 0;
+    };
+    return ts.tv_sec;
+}
+
+fn plugin_pool_close_fds(s: &PluginPoolSlot) void {
+    if s.in_fd >= 0 {
+        _ = sys_close(s.in_fd) catch {};
+        s.in_fd = 0 - 1;
+    }
+    if s.out_fd >= 0 {
+        _ = sys_close(s.out_fd) catch {};
+        s.out_fd = 0 - 1;
+    }
+}
+
+/// 收尸 + 关 fd + 清槽。
+fn plugin_pool_reap(s: &PluginPoolSlot) void {
+    if s.pid > 0 {
+        var st: i32 = 0;
+        _ = aigw_pool_wait(s.pid, &st);
+        s.pid = 0 - 1;
+    }
+    plugin_pool_close_fds(s);
+    s.state = PLUGIN_POOL_STATE_FREE;
+    s.buf_len = 0;
+}
+
+fn plugin_pool_crash_block(now: i64) void {
+    g_pp_crashes = g_pp_crashes +% 1;
+    var wait_ms: i64 = g_pp_backoff_ms *% (g_pp_crashes as i64);
+    if wait_ms > PLUGIN_POOL_BACKOFF_MAX_MS {
+        wait_ms = PLUGIN_POOL_BACKOFF_MAX_MS;
+    }
+    if wait_ms < 0 {
+        wait_ms = 0;
+    }
+    g_pp_block_until = now +% wait_ms;
+}
+
+// ---------------------------------------------------------------
+// 生命周期
+// ---------------------------------------------------------------
+
+/// 预热/新建一个进程到槽里。`state` 是成功后的状态（IDLE 或 BUSY）。
+fn plugin_pool_spawn_slot(idx: i32, now: i64, state: i32) !void {
+    if !plugin_pool_valid(idx) {
+        return error.PluginPoolSlotInvalid;
+    }
+    var cmd: [byte: 512] = [0: 512];
+    if plugin_pool_cmd_cstr(&cmd[0], 512) == 0 {
+        return error.PluginPoolSpawnFailed;
+    }
+    var pid: i32 = 0;
+    var infd: i32 = 0 - 1;
+    var outfd: i32 = 0 - 1;
+    const rc: i32 = aigw_pool_spawn(&cmd[0] as *const byte, &pid, &infd, &outfd);
+    if rc != 0 || pid <= 0 || infd < 0 || outfd < 0 {
+        return error.PluginPoolSpawnFailed;
+    }
+    const s: &PluginPoolSlot = plugin_pool_slot(idx);
+    s.pid = pid;
+    s.in_fd = infd;
+    s.out_fd = outfd;
+    s.state = state;
+    s.last_used = now;
+    s.buf_len = 0;
+    return;
+}
+
+/// 配置 + 预热。已有池在用时返回 PluginPoolAlreadyInit（先 shutdown）。
+export fn plugin_pool_init_at(cmd: &[byte], min: i32, max: i32, idle_ms: i64,
+    backoff_ms: i64, now: i64) !void {
+    if g_pp_ready {
+        return error.PluginPoolAlreadyInit;
+    }
+    if cmd.len == 0 || cmd.len >= 512 || min < 0 || max < min || max > (PLUGIN_POOL_MAX_SLOTS as i32)
+        || idle_ms < 0 || backoff_ms < 0 {
+        return error.PluginPoolBadConfig;
+    }
+    var i: usize = 0;
+    while i < PLUGIN_POOL_MAX_SLOTS {
+        g_pp_slots[i].pid = 0 - 1;
+        g_pp_slots[i].in_fd = 0 - 1;
+        g_pp_slots[i].out_fd = 0 - 1;
+        g_pp_slots[i].state = PLUGIN_POOL_STATE_FREE;
+        g_pp_slots[i].last_used = 0;
+        g_pp_slots[i].crashes = 0;
+        g_pp_slots[i].buf_len = 0;
+        i = i + 1;
+    }
+    g_pp_cmd_len = 0;
+    i = 0;
+    while i < cmd.len {
+        g_pp_cmd[i] = cmd[i];
+        i = i + 1;
+    }
+    g_pp_cmd_len = cmd.len;
+    g_pp_min = min;
+    g_pp_max = max;
+    g_pp_idle_ms = idle_ms;
+    g_pp_backoff_ms = backoff_ms;
+    g_pp_block_until = 0;
+    g_pp_crashes = 0;
+    g_pp_ready = true;
+    var n: i32 = 0;
+    while n < g_pp_min {
+        var idx: i32 = 0 - 1;
+        var j: usize = 0;
+        while j < PLUGIN_POOL_MAX_SLOTS {
+            if g_pp_slots[j].state == PLUGIN_POOL_STATE_FREE {
+                idx = j as i32;
+                break;
+            }
+            j = j + 1;
+        }
+        if idx < 0 {
+            break;
+        }
+        plugin_pool_spawn_slot(idx, now, PLUGIN_POOL_STATE_IDLE) catch {
+            plugin_pool_shutdown();
+            return error.PluginPoolSpawnFailed;
+        };
+        n = n + 1;
+    }
+    return;
+}
+
+/// 同上，用真实时钟。
+export fn plugin_pool_init(cmd: &[byte], min: i32, max: i32, idle_ms: i64, backoff_ms: i64) !void {
+    return plugin_pool_init_at(cmd, min, max, idle_ms, backoff_ms, plugin_pool_now());
+}
+
+/// 杀掉所有进程、清空状态。可重复调用。
+export fn plugin_pool_shutdown() void {
+    var i: usize = 0;
+    while i < PLUGIN_POOL_MAX_SLOTS {
+        if g_pp_slots[i].state != PLUGIN_POOL_STATE_FREE {
+            if g_pp_slots[i].pid > 0 {
+                _ = aigw_pool_kill(g_pp_slots[i].pid, PLUGIN_POOL_SIGKILL);
+            }
+            plugin_pool_reap(&g_pp_slots[i]);
+        }
+        i = i + 1;
+    }
+    g_pp_ready = false;
+    g_pp_cmd_len = 0;
+    g_pp_block_until = 0;
+    g_pp_crashes = 0;
+}
+
+// ---------------------------------------------------------------
+// 取用 / 归还 / 故障
+// ---------------------------------------------------------------
+
+/// 取一个进程：优先 IDLE，其次扩容。返回槽号。
+export fn plugin_pool_acquire(now: i64) !i32 {
+    if !g_pp_ready {
+        return error.PluginPoolNotReady;
+    }
+    var i: usize = 0;
+    while i < PLUGIN_POOL_MAX_SLOTS {
+        if g_pp_slots[i].state == PLUGIN_POOL_STATE_IDLE {
+            g_pp_slots[i].state = PLUGIN_POOL_STATE_BUSY;
+            g_pp_slots[i].last_used = now;
+            g_pp_slots[i].buf_len = 0;
+            return i as i32;
+        }
+        i = i + 1;
+    }
+    if plugin_pool_live() >= g_pp_max {
+        return error.PluginPoolExhausted;
+    }
+    if now < g_pp_block_until {
+        return error.PluginPoolBackoff;
+    }
+    i = 0;
+    while i < PLUGIN_POOL_MAX_SLOTS {
+        if g_pp_slots[i].state == PLUGIN_POOL_STATE_FREE {
+            plugin_pool_spawn_slot(i as i32, now, PLUGIN_POOL_STATE_BUSY) catch {
+                return error.PluginPoolSpawnFailed;
+            };
+            return i as i32;
+        }
+        i = i + 1;
+    }
+    return error.PluginPoolExhausted;
+}
+
+/// 归还：置 IDLE（丢弃未成行的半包，避免串到下一个请求）。
+export fn plugin_pool_release(idx: i32, now: i64) void {
+    if !plugin_pool_valid(idx) {
+        return;
+    }
+    const s: &PluginPoolSlot = plugin_pool_slot(idx);
+    if s.state != PLUGIN_POOL_STATE_BUSY {
+        return;
+    }
+    s.state = PLUGIN_POOL_STATE_IDLE;
+    s.last_used = now;
+    s.buf_len = 0;
+}
+
+/// 进程坏了（协议错误/崩溃）：杀掉收尸、记一次崩溃并进入退避。
+export fn plugin_pool_mark_dead(idx: i32, now: i64) void {
+    if !plugin_pool_valid(idx) {
+        return;
+    }
+    const s: &PluginPoolSlot = plugin_pool_slot(idx);
+    if s.state == PLUGIN_POOL_STATE_FREE {
+        return;
+    }
+    if s.pid > 0 {
+        _ = aigw_pool_kill(s.pid, PLUGIN_POOL_SIGKILL);
+    }
+    plugin_pool_reap(s);
+    s.crashes = s.crashes +% 1;
+    plugin_pool_crash_block(now);
+}
+
+/// 主动取消（断连/超时）：杀进程但不计崩溃、不进退避。
+export fn plugin_pool_cancel(idx: i32) void {
+    if !plugin_pool_valid(idx) {
+        return;
+    }
+    const s: &PluginPoolSlot = plugin_pool_slot(idx);
+    if s.state == PLUGIN_POOL_STATE_FREE {
+        return;
+    }
+    if s.pid > 0 {
+        _ = aigw_pool_kill(s.pid, PLUGIN_POOL_SIGKILL);
+    }
+    plugin_pool_reap(s);
+}
+
+/// 维护：收尸 → 缩容 → 补足 min。事件循环/管理线程定期调用。
+export fn plugin_pool_tick_at(now: i64) void {
+    if !g_pp_ready {
+        return;
+    }
+    // 1) 收尸：进程自己退了（崩溃/被外部杀）
+    var i: usize = 0;
+    while i < PLUGIN_POOL_MAX_SLOTS {
+        if g_pp_slots[i].state != PLUGIN_POOL_STATE_FREE && g_pp_slots[i].pid > 0 {
+            var st: i32 = 0;
+            const rc: i32 = aigw_pool_wait_nohang(g_pp_slots[i].pid, &st);
+            if rc > 0 {
+                plugin_pool_close_fds(&g_pp_slots[i]);
+                g_pp_slots[i].pid = 0 - 1;
+                g_pp_slots[i].state = PLUGIN_POOL_STATE_FREE;
+                g_pp_slots[i].buf_len = 0;
+                g_pp_slots[i].crashes = g_pp_slots[i].crashes +% 1;
+                plugin_pool_crash_block(now);
+            }
+        }
+        i = i + 1;
+    }
+    // 2) 缩容：空闲超时且多于 min
+    var live: i32 = plugin_pool_live();
+    i = 0;
+    while i < PLUGIN_POOL_MAX_SLOTS {
+        if live <= g_pp_min {
+            break;
+        }
+        const s: &PluginPoolSlot = &g_pp_slots[i];
+        if s.state == PLUGIN_POOL_STATE_IDLE && now -% s.last_used >= g_pp_idle_ms {
+            if s.pid > 0 {
+                _ = aigw_pool_kill(s.pid, PLUGIN_POOL_SIGKILL);
+            }
+            plugin_pool_reap(s);
+            live = live -% 1;
+        }
+        i = i + 1;
+    }
+    // 3) 常驻补足：退避窗口内不补，避免崩溃循环
+    if now < g_pp_block_until {
+        return;
+    }
+    var need: i32 = g_pp_min -% plugin_pool_live();
+    while need > 0 {
+        var idx: i32 = 0 - 1;
+        var j: usize = 0;
+        while j < PLUGIN_POOL_MAX_SLOTS {
+            if g_pp_slots[j].state == PLUGIN_POOL_STATE_FREE {
+                idx = j as i32;
+                break;
+            }
+            j = j + 1;
+        }
+        if idx < 0 {
+            break;
+        }
+        plugin_pool_spawn_slot(idx, now, PLUGIN_POOL_STATE_IDLE) catch {
+            break;
+        };
+        need = need - 1;
+    }
+}
+
+/// 同上，用真实时钟。
+export fn plugin_pool_tick() void {
+    if !g_pp_ready {
+        return;
+    }
+    plugin_pool_tick_at(plugin_pool_now());
+}
+
+// ---------------------------------------------------------------
+// 行 IO
+// ---------------------------------------------------------------
+
+/// 写一段字节到插件 stdin（处理 EAGAIN/短写）。
+export fn plugin_pool_send(idx: i32, data: &[byte]) !void {
+    if !plugin_pool_valid(idx) {
+        return error.PluginPoolSlotInvalid;
+    }
+    const s: &PluginPoolSlot = plugin_pool_slot(idx);
+    if s.state != PLUGIN_POOL_STATE_BUSY || s.in_fd < 0 {
+        return error.PluginPoolSlotInvalid;
+    }
+    var off: usize = 0;
+    var guard: i32 = 0;
+    while off < data.len {
+        guard = guard +% 1;
+        if guard > 100000 {
+            return error.PluginPoolIo;
+        }
+        const at: &const byte = &data.ptr[off];
+        const r: !isize = sys_write(s.in_fd, at, data.len - off);
+        var again: bool = false;
+        var n: isize = 0;
+        n = r catch |err| {
+            if plugin_pool_is_eagain(@error_id(err) as i32) {
+                again = true;
+                0 as isize;
+            } else {
+                return error.PluginPoolIo;
+            }
+        };
+        if again {
+            const pr: i32 = aigw_pool_poll(s.in_fd, PLUGIN_POOL_POLLOUT, 5000);
+            if pr == 0 {
+                return error.PluginPoolTimeout;
+            }
+            if pr < 0 {
+                return error.PluginPoolIo;
+            }
+            continue;
+        }
+        if n <= 0 {
+            return error.PluginPoolIo;
+        }
+        off = off +% (n as usize);
+    }
+    return;
+}
+
+/// 读一行（含换行）。超时返回 PluginPoolTimeout；EOF 返回 PluginPoolEof。
+export fn plugin_pool_read_line(idx: i32, out: &byte, cap: usize, timeout_ms: i32) !usize {
+    if !plugin_pool_valid(idx) || cap == 0 {
+        return error.PluginPoolSlotInvalid;
+    }
+    const s: &PluginPoolSlot = plugin_pool_slot(idx);
+    if s.state == PLUGIN_POOL_STATE_FREE || s.out_fd < 0 {
+        return error.PluginPoolSlotInvalid;
+    }
+    var guard: i32 = 0;
+    while guard < 100000 {
+        guard = guard +% 1;
+        // 缓冲里已有完整行？
+        var nl: i64 = 0 - 1;
+        var k: usize = 0;
+        while k < s.buf_len {
+            if s.buf[k] == (10 as byte) {
+                nl = k as i64;
+                break;
+            }
+            k = k + 1;
+        }
+        if nl >= 0 {
+            const avail: usize = (nl as usize) + 1;
+            var n: usize = avail;
+            if n > cap {
+                n = cap;
+            }
+            var q: usize = 0;
+            while q < n {
+                out[q] = s.buf[q];
+                q = q + 1;
+            }
+            var m: usize = avail;
+            var w: usize = 0;
+            while m < s.buf_len {
+                s.buf[w] = s.buf[m];
+                w = w + 1;
+                m = m + 1;
+            }
+            s.buf_len = s.buf_len -% avail;
+            return n;
+        }
+        if s.buf_len >= PLUGIN_POOL_LINE_CAP {
+            return error.PluginPoolTooLong;
+        }
+        // 等可读
+        const pr: i32 = aigw_pool_poll(s.out_fd, PLUGIN_POOL_POLLIN, timeout_ms);
+        if pr == 0 {
+            return error.PluginPoolTimeout;
+        }
+        if pr < 0 {
+            return error.PluginPoolEof;
+        }
+        const r: !isize = sys_read(s.out_fd, &s.buf[s.buf_len], PLUGIN_POOL_LINE_CAP - s.buf_len);
+        var again: bool = false;
+        var got: isize = 0;
+        got = r catch |err| {
+            if plugin_pool_is_eagain(@error_id(err) as i32) {
+                again = true;
+                0 as isize;
+            } else {
+                return error.PluginPoolIo;
+            }
+        };
+        if again {
+            continue;
+        }
+        if got == 0 {
+            return error.PluginPoolEof;
+        }
+        s.buf_len = s.buf_len +% (got as usize);
+    }
+    return error.PluginPoolIo;
+}
+
+/// 子串查找（协议层 A4 会换成真正的 JSON 解析；这里只给 ping/pong 用）。
+fn plugin_pool_contains(hay: &[byte], needle: &[byte]) bool {
+    if needle.len == 0 || hay.len < needle.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i + needle.len <= hay.len {
+        var j: usize = 0;
+        var same: bool = true;
+        while j < needle.len {
+            if hay[i + j] != needle[j] {
+                same = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if same {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// ping/pong 健康检查：写一行 ping，读到含 `"pong"` 的行才算通过。
+export fn plugin_pool_ping(idx: i32, timeout_ms: i32) !void {
+    try plugin_pool_send(idx, &"{\"id\":0,\"method\":\"ping\"}"[0: 24]);
+    try plugin_pool_send(idx, &"\n"[0: 1]);
+    var line: [byte: 256] = [0: 256];
+    const n: usize = try plugin_pool_read_line(idx, &line[0], 256, timeout_ms);
+    if !plugin_pool_contains(line[0: n], &"\"pong\""[0: 6]) {
+        return error.PluginPoolIo;
+    }
+    return;
+}
+
+// ---------------------------------------------------------------
+// 只读访问（测试 / A4 的 epoll 注册）
+// ---------------------------------------------------------------
+
+export fn plugin_pool_live() i32 {
+    var n: i32 = 0;
+    var i: usize = 0;
+    while i < PLUGIN_POOL_MAX_SLOTS {
+        if g_pp_slots[i].state != PLUGIN_POOL_STATE_FREE {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+export fn plugin_pool_ready() bool {
+    return g_pp_ready;
+}
+
+export fn plugin_pool_pid_of(idx: i32) i32 {
+    if idx < 0 || (idx as usize) >= PLUGIN_POOL_MAX_SLOTS {
+        return 0 - 1;
+    }
+    return g_pp_slots[idx as usize].pid;
+}
+
+export fn plugin_pool_state_of(idx: i32) i32 {
+    if idx < 0 || (idx as usize) >= PLUGIN_POOL_MAX_SLOTS {
+        return 0 - 1;
+    }
+    return g_pp_slots[idx as usize].state;
+}
+
+export fn plugin_pool_crashes_of(idx: i32) i32 {
+    if idx < 0 || (idx as usize) >= PLUGIN_POOL_MAX_SLOTS {
+        return 0 - 1;
+    }
+    return g_pp_slots[idx as usize].crashes;
+}
+
+export fn plugin_pool_in_fd(idx: i32) i32 {
+    if idx < 0 || (idx as usize) >= PLUGIN_POOL_MAX_SLOTS {
+        return 0 - 1;
+    }
+    return g_pp_slots[idx as usize].in_fd;
+}
+
+export fn plugin_pool_out_fd(idx: i32) i32 {
+    if idx < 0 || (idx as usize) >= PLUGIN_POOL_MAX_SLOTS {
+        return 0 - 1;
+    }
+    return g_pp_slots[idx as usize].out_fd;
+}

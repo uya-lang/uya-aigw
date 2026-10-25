@@ -23,6 +23,9 @@
   amalgamation（离线不可得），见 TODO A0。
 - A4（日志部分）：`src/core/reqlog.uya`，一行 `k=v` 的每请求日志（含 cost/tok-s），
   `tests/test_reqlog.uya` 全过。
+- A3（已落地）：`src/plugins/pool.uya` 插件池（stdio JSONL 子进程）：预热 min、复用、
+  扩容到 max、空闲缩容到 min、崩溃指数退避、cancel、ping/pong；非阻塞 fd + poll 超时
+  与按行分帧。`tests/test_pool.uya` 24 断言（`tests/plugin_echo.py` 作最小插件）。
 - A2（已落地）：`schema.uya` 台阶式迁移（v1 身份、v2 价目、v3 用量账本）、`store.uya`
   用户/Key/OTP/会话（`tests/test_store.uya` 含登录→建 key→鉴权端到端）、`schedule.uya`
   分时规则（`tests/test_schedule.uya` 28 断言）、`backup.uya` VACUUM INTO 快照 + 保留
@@ -42,12 +45,17 @@
 0. ~~A1 事件循环~~（已完成：单线程 epoll + 512 并发 SSE + 优雅停机）
 
 1. ~~TLS-09 → TLS-10 → TLS-11~~（已完成；TLS-09E 流式读超时未落地，findings §9）
-2. Phase A：A0 SQLite+money spike、A1 事件循环、A2 schema/认证/备份 … A9 文档/e2e
+2. Phase A：A0 SQLite+money spike、A1 事件循环、A2 schema/认证/备份/journal、A3 插件池、A4 chat … A9 文档/e2e
 3. Phase B：controller/node/edge、lease/epoch、ingest/journal
 4. Phase C：用户端/管理端后台
+5. A4 拆解：① `src/core/json.uya`（有界 DOM 解析 + 字符串转义/构造）；
+   ② schema v4 `providers`（base_url/host/port/auth/secret/超时/启用）与 store CRUD；
+   ③ `POST /v1/chat/completions`：Bearer 鉴权 → `htc_open_async` 上游 → usage 解析 →
+   `price_quote` → `usage_ledger` + `journal_append`；④ SSE 透传与 `[DONE]` 对齐。
+   测试用 `tests/plugin_echo.py` 同构的 mock provider（Python）跑 e2e。
 
 ## 已知边界
 
 - spike 只验证 TLS 1.2（`s_server -tls1_2`）；TLS 1.3 待补测
 - 不做 HTTP/2/3、gzip、入站 TLS（建议 nginx/caddy）
-- 备份/journal/计费/集群/后台尚未实现（设计与 TODO 已就绪）
+- 请求路径（chat → usage → 计费/journal）与集群/后台尚未实现（设计与 TODO 已就绪）
