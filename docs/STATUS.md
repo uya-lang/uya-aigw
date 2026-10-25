@@ -158,3 +158,13 @@
 - spike 只验证 TLS 1.2（`s_server -tls1_2`）；TLS 1.3 待补测
 - 不做 HTTP/2/3、gzip、入站 TLS（建议 nginx/caddy）
 - 请求路径（chat → usage → 计费/journal）与集群/后台尚未实现（设计与 TODO 已就绪）
+
+## 性能基线（本机实测）
+
+| 场景 | 命令 | 结果 |
+|---|---|---|
+| 网关侧 SSE 并发 | `make load-sse` | 1000 条连接 × 20 事件，全部读完且 10s 内判定，实测 ≈0.55s |
+| 集群端到端 | `make cluster-e2e` | 1 controller + 3 node 注册/快照/路由/代理/drain/ingest/spool 全绿 |
+| 请求路径回归 | `make ui-e2e` | OTP→登录→建 Key→chat/responses（含 tools 透传与失败转移）→后台接口全绿 |
+
+> 说明：A4 的「批量落库 / 快路径 / p99 压测」尚未实现，上面只是当前实现的并发基线。
