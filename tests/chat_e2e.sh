@@ -56,6 +56,18 @@ class H(http.server.BaseHTTPRequestHandler):
         data = self.rfile.read(n)
         with open(reqfile, "wb") as f:
             f.write(data)
+        if b'"tools"' in data:
+            tb = (b'{"id":"chatcmpl-tool","object":"chat.completion",'
+                  b'"choices":[{"message":{"role":"assistant","content":null,'
+                  b'"tool_calls":[{"id":"call_1","type":"function",'
+                  b'"function":{"name":"get_weather","arguments":"{\\"city\\":\\"SF\\"}"}}]}}],'
+                  b'"usage":{"prompt_tokens":10,"completion_tokens":5}}')
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(tb)))
+            self.end_headers()
+            self.wfile.write(tb); self.wfile.flush()
+            return
         if "text/event-stream" in (self.headers.get("Accept") or ""):
             data = SSE
             self.send_response(200)
@@ -258,6 +270,23 @@ kill "$NB_PID" 2>/dev/null || true
 wait "$NB_PID" 2>/dev/null || true
 NB_PID=""
 
+# 4p) A5：responses 透传 tools/reasoning + tool_calls → function_call
+TOOLS='{"model":"mock-model","input":"weather?","reasoning":{"effort":"high"},"tools":[{"type":"function","function":{"name":"get_weather","description":"d","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}],"tool_choice":"auto"}'
+TR=$(curl -s --max-time 10 -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' --data "$TOOLS" "$BASE/v1/responses")
+echo "$TR" | grep -q '"type":"function_call"' || { echo "$TR" >&2; fail "responses function_call"; }
+echo "$TR" | grep -q '"name":"get_weather"' || { echo "$TR" >&2; fail "responses tool name"; }
+echo "$TR" | grep -q '"call_id":"call_1"' || { echo "$TR" >&2; fail "responses call_id"; }
+echo "$TR" | grep -q '"status":"completed"' || { echo "$TR" >&2; fail "responses status"; }
+# 上游确实收到了 tools/tool_choice/reasoning（mock 落了最后一次请求体）
+grep -q '"tools"' "$TMP/req.json" || { cat "$TMP/req.json" >&2; fail "tools forwarded"; }
+grep -q '"get_weather"' "$TMP/req.json" || { cat "$TMP/req.json" >&2; fail "tool name forwarded"; }
+grep -q '"tool_choice":"auto"' "$TMP/req.json" || { cat "$TMP/req.json" >&2; fail "tool_choice forwarded"; }
+grep -q '"effort":"high"' "$TMP/req.json" || { cat "$TMP/req.json" >&2; fail "reasoning forwarded"; }
+# chat 路径原样透传 tools
+CTOOLS='{"model":"mock-model","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"chat_tool","parameters":{"type":"object"}}}]}'
+curl -s --max-time 10 -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' --data "$CTOOLS" "$BASE/v1/chat/completions" >/dev/null
+grep -q '"chat_tool"' "$TMP/req.json" || { cat "$TMP/req.json" >&2; fail "chat tools forwarded"; }
+
 # 4o) C3：模型绑定 + 价目条目编辑
 AB=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer test-admin' -H 'Content-Type: application/json' \
   --data '{"provider":"mock","model":"price-model","upstream_model":"mock-1"}' "$BASE/admin/bind")
@@ -370,5 +399,5 @@ kill "$SRV_PID" 2>/dev/null || true
 wait "$SRV_PID" 2>/dev/null || true
 SRV_PID=""
 COUNT=$(AIGW_MODE=count AIGW_DB="$SEED_DB" ./build/seed | sed -n 's/^COUNT=//p')
-[ "$COUNT" = "7" ] || fail "usage_ledger count=$COUNT"
+[ "$COUNT" = "9" ] || fail "usage_ledger count=$COUNT"
 echo "CHAT-ALL-OK status=$CODE count=$COUNT"

@@ -76,5 +76,37 @@ fn test_build_and_parse() !void {
     try assert_eq_bool(contains(out[0: on], &"answer"[0: 6]), true);
 }
 
+fn test_augment() !void {
+    // 原 payload 末尾 '}' 前插入 tools / reasoning
+    const payload: &[byte] = &"{\"model\":\"m\",\"messages\":[],\"stream\":false}"[0: 42];
+    const src: &[byte] = &"{\"model\":\"m\",\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}}}}],\"reasoning\":{\"effort\":\"high\"},\"input\":\"hi\"}"[0: 190];
+    var out: [byte: 512] = [0: 512];
+    const n: usize = resp_augment_payload(payload, src, &out[0], 512);
+    try assert_eq_bool(n > 0, true);
+    try assert_eq_bool(contains(out[0: n], &"\"tools\":[{\"type\":\"function\""[0: 27]), true);
+    try assert_eq_bool(contains(out[0: n], &"\"get_weather\""[0: 13]), true);
+    try assert_eq_bool(contains(out[0: n], &"\"reasoning\":{\"effort\":\"high\"}"[0: 29]), true);
+    // 原字段保留
+    try assert_eq_bool(contains(out[0: n], &"\"stream\":false"[0: 14]), true);
+    // 没有可透传字段 → 返回 0（调用方保留原 payload）
+    const plain: &[byte] = &"{\"model\":\"m\",\"input\":\"hi\"}"[0: 26];
+    try assert_eq_i32(resp_augment_payload(payload, plain, &out[0], 512) as i32, 0);
+    // 容量不足 → 0
+    try assert_eq_i32(resp_augment_payload(payload, src, &out[0], 16) as i32, 0);
+    // 原始值提取：字符串/数字/嵌套数组
+    var v: [byte: 256] = [0: 256];
+    var vn: usize = resp_raw_value(src, &"input"[0: 5], &v[0], 256);
+    try assert_eq_bool(contains(v[0: vn], &"\"hi\""[0: 4]), true);
+    const src2: &[byte] = &"{\"a\":{\"b\":[1,2,{\"c\":3}]},\"n\":42,\"s\":\"a}b\"}"[0: 42];
+    vn = resp_raw_value(src2, &"a"[0: 1], &v[0], 256);
+    try assert_eq_bool(contains(v[0: vn], &"{\"b\":[1,2,{\"c\":3}]}"[0: 19]), true);
+    vn = resp_raw_value(src2, &"n"[0: 1], &v[0], 256);
+    try assert_eq_bool(contains(v[0: vn], &"42"[0: 2]), true);
+    vn = resp_raw_value(src2, &"s"[0: 1], &v[0], 256);
+    try assert_eq_bool(contains(v[0: vn], &"\"a}b\""[0: 5]), true);
+    try assert_eq_i32(resp_raw_value(src2, &"missing"[0: 7], &v[0], 256) as i32, 0);
+}
+
 test "store_roundtrip" { run_test("store_roundtrip", test_store_roundtrip); }
 test "build_and_parse" { run_test("build_and_parse", test_build_and_parse); }
+test "augment" { run_test("augment", test_augment); }

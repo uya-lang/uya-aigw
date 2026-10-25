@@ -2845,8 +2845,15 @@ fn srv_responses(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 502, SRV_JSON_502, keep);
         return;
     }
+    // A5：tools/tool_choice/reasoning 透传给上游（chat 路径原样转发，responses 需拼回）。
+    var aug: [byte: 32768] = [0: 32768];
+    const augn: usize = resp_augment_payload(payload[0: pln], c.body[0: c.body_len], &aug[0], 32768);
     var plan: ChatPlan = ChatPlan{};
-    chat_prepare_session(runtime_db(), payload[0: pln], tok[0: tn], store_now(), &plan) catch {
+    var use_payload: &[byte] = payload[0: pln];
+    if augn > 0 {
+        use_payload = aug[0: augn];
+    }
+    chat_prepare_session(runtime_db(), use_payload, tok[0: tn], store_now(), &plan) catch {
         srv_static(c, 400, SRV_JSON_400, keep);
         return;
     };
@@ -2898,7 +2905,20 @@ fn srv_responses(c: &SrvConn, stats: &ServeStats) void {
     };
     const out_len: usize = resp_parse_output(&d, json_root(&d), &out_text[0], RESP_OUTPUT_MAX);
     const has_usage: bool = billing_usage_parse(&d, json_root(&d), &usage);
-    if out_len == 0 || !has_usage {
+    var tcs: i32 = 0 - 1;
+    var msg: i32 = 0 - 1;
+    const ch0: i32 = json_arr_at(&d, json_get(&d, json_root(&d), &"choices"[0: 7]), 0);
+    if ch0 >= 0 {
+        msg = json_get(&d, ch0, &"message"[0: 7]);
+    }
+    if msg >= 0 {
+        tcs = json_get(&d, msg, &"tool_calls"[0: 10]);
+    }
+    var tcn: usize = 0;
+    if tcs >= 0 {
+        tcn = json_arr_len(&d, tcs);
+    }
+    if (out_len == 0 && tcn == 0) || !has_usage {
         srv_static(c, 502, SRV_JSON_502, keep);
         return;
     }
@@ -2929,23 +2949,55 @@ fn srv_responses(c: &SrvConn, stats: &ServeStats) void {
     jsonw_str(&w, plan.model[0: plan.model_len]);
     jsonw_key(&w, &"previous_response_id"[0: 20]);
     jsonw_str(&w, prev[0: pn]);
+    jsonw_key(&w, &"status"[0: 6]);
+    jsonw_str(&w, &"completed"[0: 9]);
     jsonw_key(&w, &"output"[0: 6]);
     jsonw_arr(&w);
-    jsonw_obj(&w);
-    jsonw_key(&w, &"type"[0: 4]);
-    jsonw_str(&w, &"message"[0: 7]);
-    jsonw_key(&w, &"role"[0: 4]);
-    jsonw_str(&w, &"assistant"[0: 9]);
-    jsonw_key(&w, &"content"[0: 7]);
-    jsonw_arr(&w);
-    jsonw_obj(&w);
-    jsonw_key(&w, &"type"[0: 4]);
-    jsonw_str(&w, &"output_text"[0: 11]);
-    jsonw_key(&w, &"text"[0: 4]);
-    jsonw_str(&w, out_text[0: out_len]);
-    jsonw_end_obj(&w);
-    jsonw_end_arr(&w);
-    jsonw_end_obj(&w);
+    if out_len > 0 || tcn == 0 {
+        jsonw_obj(&w);
+        jsonw_key(&w, &"type"[0: 4]);
+        jsonw_str(&w, &"message"[0: 7]);
+        jsonw_key(&w, &"role"[0: 4]);
+        jsonw_str(&w, &"assistant"[0: 9]);
+        jsonw_key(&w, &"content"[0: 7]);
+        jsonw_arr(&w);
+        jsonw_obj(&w);
+        jsonw_key(&w, &"type"[0: 4]);
+        jsonw_str(&w, &"output_text"[0: 11]);
+        jsonw_key(&w, &"text"[0: 4]);
+        jsonw_str(&w, out_text[0: out_len]);
+        jsonw_end_obj(&w);
+        jsonw_end_arr(&w);
+        jsonw_end_obj(&w);
+    }
+    var ti: usize = 0;
+    while ti < tcn {
+        const tc: i32 = json_arr_at(&d, tcs, ti);
+        var cid: [byte: 128] = [0: 128];
+        const cn: usize = json_str(&d, json_get(&d, tc, &"id"[0: 2]), &cid[0], 128);
+        var fname: [byte: 128] = [0: 128];
+        var fargs: [byte: 2048] = [0: 2048];
+        var fn_n: usize = 0;
+        var fa_n: usize = 0;
+        const fobj: i32 = json_get(&d, tc, &"function"[0: 8]);
+        if fobj >= 0 {
+            fn_n = json_str(&d, json_get(&d, fobj, &"name"[0: 4]), &fname[0], 128);
+            fa_n = json_str(&d, json_get(&d, fobj, &"arguments"[0: 9]), &fargs[0], 2048);
+        }
+        jsonw_obj(&w);
+        jsonw_key(&w, &"type"[0: 4]);
+        jsonw_str(&w, &"function_call"[0: 13]);
+        jsonw_key(&w, &"id"[0: 2]);
+        jsonw_str(&w, cid[0: cn]);
+        jsonw_key(&w, &"call_id"[0: 7]);
+        jsonw_str(&w, cid[0: cn]);
+        jsonw_key(&w, &"name"[0: 4]);
+        jsonw_str(&w, fname[0: fn_n]);
+        jsonw_key(&w, &"arguments"[0: 9]);
+        jsonw_str(&w, fargs[0: fa_n]);
+        jsonw_end_obj(&w);
+        ti = ti + 1;
+    }
     jsonw_end_arr(&w);
     jsonw_key(&w, &"usage"[0: 5]);
     jsonw_obj(&w);

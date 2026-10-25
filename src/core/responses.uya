@@ -141,3 +141,193 @@ export fn resp_parse_output(d: &JsonDoc, root: i32, out: &byte, cap: usize) usiz
     }
     return json_str(d, content, out, cap);
 }
+
+// ---- A5：tools / tool_choice / parallel_tool_calls / reasoning 透传 ----
+
+fn resp_put(out: &byte, cap: usize, at: &usize, s: &[byte]) bool {
+    var i: usize = 0;
+    while i < s.len {
+        if at[0] + i >= cap {
+            return false;
+        }
+        out[at[0] + i] = s[i];
+        i = i + 1;
+    }
+    at[0] = at[0] + i;
+    return true;
+}
+
+/// 在 src 里找 `"key":<value>` 的值结束位置（含嵌套括号/字符串转义）。
+fn resp_value_end(src: &[byte], start: usize) usize {
+    if start >= src.len {
+        return 0 as usize;
+    }
+    const c: byte = src[start];
+    if c == (123 as byte) || c == (91 as byte) {
+        var depth: i32 = 0;
+        var i: usize = start;
+        var in_str: bool = false;
+        var esc: bool = false;
+        while i < src.len {
+            const b: byte = src[i];
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if b == (92 as byte) {
+                    esc = true;
+                } else if b == (34 as byte) {
+                    in_str = false;
+                }
+            } else {
+                if b == (34 as byte) {
+                    in_str = true;
+                } else if b == (123 as byte) || b == (91 as byte) {
+                    depth = depth + 1;
+                } else if b == (125 as byte) || b == (93 as byte) {
+                    depth = depth - 1;
+                    if depth <= 0 {
+                        return i + 1;
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        return 0 as usize;
+    }
+    if c == (34 as byte) {
+        var i: usize = start + 1;
+        var esc: bool = false;
+        while i < src.len {
+            const b: byte = src[i];
+            if esc {
+                esc = false;
+            } else if b == (92 as byte) {
+                esc = true;
+            } else if b == (34 as byte) {
+                return i + 1;
+            }
+            i = i + 1;
+        }
+        return 0 as usize;
+    }
+    var i: usize = start;
+    while i < src.len {
+        const b: byte = src[i];
+        if b == (44 as byte) || b == (125 as byte) || b == (93 as byte) || b == (32 as byte) || b == (10 as byte) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return i;
+}
+
+/// 把 src 里 `"key"` 的原始值（不含 key）拷到 out，返回字节数；不存在返回 0。
+export fn resp_raw_value(src: &[byte], key: &[byte], out: &byte, cap: usize) usize {
+    if key.len == 0 || src.len < key.len + 2 {
+        return 0 as usize;
+    }
+    var i: usize = 0;
+    while i < src.len && src.len - i > key.len + 1 {
+        if src[i] == (34 as byte) {
+            var same: bool = true;
+            var k: usize = 0;
+            while k < key.len {
+                if src[i + 1 + k] != key[k] {
+                    same = false;
+                    break;
+                }
+                k = k + 1;
+            }
+            if same && src[i + 1 + key.len] == (34 as byte) {
+                var j: usize = i + 2 + key.len;
+                while j < src.len {
+                    const b: byte = src[j];
+                    if b == (58 as byte) || b == (32 as byte) || b == (9 as byte) || b == (10 as byte) || b == (13 as byte) {
+                        j = j + 1;
+                    } else {
+                        break;
+                    }
+                }
+                const end: usize = resp_value_end(src, j);
+                if end > j {
+                    var n: usize = 0;
+                    while j + n < end && n < cap {
+                        out[n] = src[j + n];
+                        n = n + 1;
+                    }
+                    if j + n >= end {
+                        return n;
+                    }
+                    return 0 as usize;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0 as usize;
+}
+
+/// 把 src 里的 tools/tool_choice/parallel_tool_calls/reasoning 透传进 chat payload。
+/// 返回新 payload 长度；容量不足或无事可做返回 0（调用方保留原 payload）。
+export fn resp_augment_payload(payload: &[byte], src: &[byte], out: &byte, cap: usize) usize {
+    if payload.len < 2 || cap == 0 {
+        return 0 as usize;
+    }
+    if payload[payload.len - 1] != (125 as byte) {
+        return 0 as usize;
+    }
+    var at: usize = 0;
+    if !resp_put(out, cap, &at, payload[0: payload.len - 1]) {
+        return 0 as usize;
+    }
+    var added: bool = false;
+    var tmp: [byte: 8192] = [0: 8192];
+    var n: usize = 0;
+    n = resp_raw_value(src, &"tools"[0: 5], &tmp[0], 8192);
+    if n > 0 {
+        if !resp_put(out, cap, &at, &",\"tools\":"[0: 9]) {
+            return 0 as usize;
+        }
+        if !resp_put(out, cap, &at, tmp[0: n]) {
+            return 0 as usize;
+        }
+        added = true;
+    }
+    n = resp_raw_value(src, &"tool_choice"[0: 11], &tmp[0], 8192);
+    if n > 0 {
+        if !resp_put(out, cap, &at, &",\"tool_choice\":"[0: 15]) {
+            return 0 as usize;
+        }
+        if !resp_put(out, cap, &at, tmp[0: n]) {
+            return 0 as usize;
+        }
+        added = true;
+    }
+    n = resp_raw_value(src, &"parallel_tool_calls"[0: 19], &tmp[0], 8192);
+    if n > 0 {
+        if !resp_put(out, cap, &at, &",\"parallel_tool_calls\":"[0: 23]) {
+            return 0 as usize;
+        }
+        if !resp_put(out, cap, &at, tmp[0: n]) {
+            return 0 as usize;
+        }
+        added = true;
+    }
+    n = resp_raw_value(src, &"reasoning"[0: 9], &tmp[0], 8192);
+    if n > 0 {
+        if !resp_put(out, cap, &at, &",\"reasoning\":"[0: 13]) {
+            return 0 as usize;
+        }
+        if !resp_put(out, cap, &at, tmp[0: n]) {
+            return 0 as usize;
+        }
+        added = true;
+    }
+    if !added {
+        return 0 as usize;
+    }
+    if !resp_put(out, cap, &at, &"}"[0: 1]) {
+        return 0 as usize;
+    }
+    return at;
+}

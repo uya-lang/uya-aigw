@@ -38,7 +38,8 @@ A4/A5/A8 进度（子项已完成记录见 `TODO_DONE.md`）：
 - A4：chat 非流/流式、鉴权→路由→上游 TLS→分时价→journal/ledger、SSE、金额 e2e 已落地；
   剩余：快路径、批量落库、上游异步化（p99）。
 - A5：`/v1/responses` 非流式 + `previous_response_id` 续轮 + 流式
-  `response.created/output_text.delta/completed` 已落地；剩余：reasoning/tools 透传。
+  `response.created/output_text.delta/completed` + tools/reasoning 透传与 `function_call` 输出
+  已落地；剩余：流式工具事件（`response.output_item.added/done`）。
 - A8：priority/weight/会话亲和/熔断 + 失败换 provider 重试已落地；剩余：插件级重绑。
 
 ---
