@@ -231,8 +231,80 @@ fn test_fast_path() !void {
     try assert_eq_bool(bad, true);
 }
 
+const BIG_PRE: &[byte] = &"{\"model\":\"gpt-4o\",\"messages\":[{\"role\":\"user\",\"content\":\""[0: 56];
+const BIG_SUF: &[byte] = &"\"}]}"[0: 4];
+
+/// 组装一个 >32 KiB 的合法请求体：前缀 + 150000 个 'a' + 后缀。
+fn big_body(buf: &byte, cap: usize) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while i < 56 && n < cap {
+        buf[n] = BIG_PRE[i];
+        n = n + 1;
+        i = i + 1;
+    }
+    i = 0;
+    while i < 150000 && n < cap {
+        buf[n] = 'a' as byte;
+        n = n + 1;
+        i = i + 1;
+    }
+    i = 0;
+    while i < 4 && n < cap {
+        buf[n] = BIG_SUF[i];
+        n = n + 1;
+        i = i + 1;
+    }
+    return n;
+}
+
+/// 大请求体（原 32 KiB 上限会回 413）：默认上限下可解析、model 重写、内容不截断。
+fn test_large_body() !void {
+    var d: Db = Db{ h: null };
+    defer { dbx_close(&d); }
+    try open_db(&d);
+    try setup(&d);
+
+    var body: [byte: 200000] = [0: 200000];
+    const bn: usize = big_body(&body[0], 200000);
+    try assert_eq_bool(bn > 150000, true);
+
+    var plan: ChatPlan = ChatPlan{};
+    defer { chat_plan_free(&plan); }
+    try chat_prepare(&d, body[0: bn], T0, &plan);
+    try assert_eq_i32(plan.payload_len as i32, (bn + 5) as i32);
+    try assert_eq_bool(buf_valid(&plan.payload_big), true);
+    const out: &[byte] = chat_payload(&plan);
+    try assert_eq_bool(contains(out, &"\"model\":\"gpt-4o-2024\""[0: 21]), true);
+    const tail: &[byte] = out[out.len - 4: 4];
+    try assert_eq_bool(eq_bytes(tail, &"\"}]}"[0: 4]), true);
+
+    // 快路径同样支持大包
+    var fast: ChatPlan = ChatPlan{};
+    defer { chat_plan_free(&fast); }
+    try assert_eq_bool(try chat_prepare_fast(&d, body[0: bn], &""[0: 0], T0, &fast), true);
+    try assert_eq_i32(fast.payload_len as i32, (bn + 5) as i32);
+
+    // 同一个 plan 再处理小包：大缓冲要释放，回到内联
+    try chat_prepare(&d, &"{\"model\":\"gpt-4o\",\"messages\":[]}"[0: 32], T0, &plan);
+    try assert_eq_bool(buf_valid(&plan.payload_big), false);
+    try assert_eq_i32(plan.payload_len as i32, 37);
+
+    // 显式调低上限后，同一个大包必须回 ChatTooLarge
+    chat_set_body_max(1024);
+    var over: bool = false;
+    var p2: ChatPlan = ChatPlan{};
+    _ = chat_prepare(&d, body[0: bn], T0, &p2) catch |_| {
+        over = true;
+    };
+    try assert_eq_bool(over, true);
+    chat_plan_free(&p2);
+    chat_set_body_max(CHAT_BODY_MAX_DEFAULT);
+}
+
 test "prepare" { run_test("prepare", test_prepare); }
 test "fast_path" { run_test("fast_path", test_fast_path); }
 test "bearer" { run_test("bearer", test_bearer); }
 test "prepare_errors" { run_test("prepare_errors", test_prepare_errors); }
 test "settle" { run_test("settle", test_settle); }
+test "large_body" { run_test("large_body", test_large_body); }

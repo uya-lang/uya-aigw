@@ -55,7 +55,7 @@ run src/core/dbx.uya src/core/schema.uya src/core/money.uya src/core/schedule.uy
 run src/core/dbx.uya src/core/schema.uya src/core/store.uya src/core/money.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/backup.uya src/core/journal.uya src/core/billing.uya src/core/batch.uya src/cluster/shard.uya tests/test_batch.uya
 run src/core/notify.uya src/cluster/spool.uya src/core/json.uya tests/test_notify.uya
 run src/net/smtp_msg.uya tests/test_smtp.uya
-run src/core/dbx.uya src/core/schema.uya src/core/store.uya src/core/money.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/backup.uya src/core/journal.uya src/core/billing.uya src/core/batch.uya src/core/lb.uya src/core/responses.uya src/core/chat.uya src/cluster/shard.uya tests/test_chat.uya
+run src/foundation/buf.uya src/core/dbx.uya src/core/schema.uya src/core/store.uya src/core/money.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/backup.uya src/core/journal.uya src/core/billing.uya src/core/batch.uya src/core/lb.uya src/core/responses.uya src/core/chat.uya src/cluster/shard.uya tests/test_chat.uya
 run src/foundation/buf.uya src/net/httpsrv.uya tests/test_httpsrv.uya
 run src/foundation/buf.uya src/core/money.uya src/core/reqlog.uya tests/test_reqlog.uya
 
@@ -63,12 +63,20 @@ echo "== provider e2e (TLS + chain + CL/chunked/SSE)"
 ./tests/provider_spike.sh 2>&1 | grep -a "PROV-ALL-OK"
 echo "== cli probe/pin"
 ./tests/tls_cli_spike.sh 2>&1 | grep -a "CLI-ALL-OK"
+# 每个 e2e 脚本编译的文件集合不同，而 uya 0.11 的 `.uyacache` 按
+# `uya_cimport_N.o` **位置**命名，跨脚本复用会错配（manifest 已记录旧对象，
+# make 按 mtime 认为不用重编）。Makefile 的 e2e 目标同样是每个脚本前清一次。
+rm -rf .uyacache
 echo "== http server (A1)"
 ./tests/serve_smoke.sh 2>&1 | grep -a "SERVE-ALL-OK"
+rm -rf .uyacache
 echo "== chat e2e (auth/route/upstream/ledger)"
 ./tests/chat_e2e.sh 2>&1 | grep -a "CHAT-ALL-OK"
+rm -rf .uyacache
 ./tests/cluster_e2e.sh 2>&1 | grep -a "CLUSTER-ALL-OK"
+rm -rf .uyacache
 echo "== mail (SMTP 投递)"
 ./tests/mail_e2e.sh 2>&1 | grep -a "MAIL-OK"
+rm -rf .uyacache
 ./tests/sse_load.sh 1000 20 2>&1 | grep -a "LOAD-OK"
 echo "ALL GREEN"

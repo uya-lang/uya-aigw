@@ -112,8 +112,17 @@ const ROUTE_CTL_HEARTBEAT: i32 = 17;
 const ROUTE_CTL_CONFIG: i32 = 18;
 const ROUTE_CTL_STATUS: i32 = 19;
 
-/// chat 请求体上限（与 CHAT_PAYLOAD_MAX 一致；超了回 413）。
-const SRV_BODY_CAP: usize = 32768;
+/// 请求体内联缓冲：≤ 这个长度不分配堆内存。
+const SRV_BODY_INLINE: usize = 32768;
+/// 同时驻留的大请求体上限。每个大包独占一个堆缓冲，请求结束即还；这样即使
+/// 1024 条连接都声明了 `Content-Length: 8MiB`，内存也被 BSS 内联部分兜住。
+const SRV_BIG_MAX: i32 = 32;
+
+/// 请求体上限（字节）。默认与 chat 的 `CHAT_BODY_MAX_DEFAULT` 一致，
+/// `--max-body` / `AIGW_MAX_BODY` 可改；抓包上限与 chat 重写上限始终同步。
+var g_body_max: usize = CHAT_BODY_MAX_DEFAULT;
+var g_body_max_cli: bool = false;
+var g_big_active: i32 = 0;
 
 // 固定回包体（切片字面量放模块级常量：编译器已修，但这样也不会碰异步帧退化）
 const SRV_JSON_HEALTH: &[byte] = &"{\"ok\":true}"[0: 11];
@@ -173,9 +182,14 @@ struct SrvConn {
     auth_len: usize,
     path: [byte: 1024],
     path_len: usize,
-    body: [byte: SRV_BODY_CAP],
+    body: [byte: SRV_BODY_INLINE],
     body_len: usize,
+    /// 请求体超过内联缓冲时才有值（`len` 与 `body_len` 同步）。
+    body_big: Buf,
+    /// 非 chunked 时已知的 Content-Length（给堆缓冲估容量）。
+    body_hint: usize,
     body_overflow: bool,
+    body_busy: bool,
     // 包体
     body_left: u64,
     chunked: bool,
@@ -711,6 +725,7 @@ fn srv_close_slot(slot: i32) void {
     }
     srv_up_abort_ci(slot);
     const i: usize = slot as usize;
+    srv_body_reset(&g_conns[i]);
     const fd: i32 = g_conns[i].fd;
     if fd >= 0 {
         _ = sys_epoll_ctl_del(g_epfd, fd) catch {};
@@ -1193,7 +1208,7 @@ fn srv_chat_stream(c: &SrvConn, plan: &ChatPlan, cfg: &const HttppConfig, nowu: 
     defer { htc_call_free(&call); }
     const deadline: u64 = nowu +% 10000;
     const o: !i32 = wait_i32(htc_open_async(cfg, &g_up_ctx, &"POST"[0: 4],
-        plan.path[0: plan.path_len], plan.payload[0: plan.payload_len], true, nowu, deadline, &call));
+        plan.path[0: plan.path_len], chat_payload(plan), true, nowu, deadline, &call));
     const orc: i32 = o catch |_| {
         lb_report(plan.provider_id, false, store_now());
         lg.status = 502;
@@ -1741,6 +1756,7 @@ fn srv_up_release(j: i32) void {
     job.has_fut = false;
     job.used = false;
     htc_call_free(&job.call);
+    chat_plan_free(&job.plan);
 }
 
 fn srv_up_alloc(ci: i32) i32 {
@@ -2114,7 +2130,7 @@ fn srv_up_fail(j: i32, stats: &ServeStats, drive: bool, err_id: i32) void {
         srv_up_respond(j, 502, SRV_JSON_502, stats, drive);
         return;
     }
-    chat_prepare_span_session(runtime_db(), &c.body[0], c.body_len,
+    chat_prepare_span_session(runtime_db(), srv_body_ptr(c), c.body_len,
         job.tok[0: job.tok_len], store_now(), &job.plan) catch {
         srv_up_respond(j, 502, SRV_JSON_502, stats, drive);
         return;
@@ -2153,7 +2169,7 @@ fn srv_up_spawn(j: i32, stats: &ServeStats, drive: bool) void {
         var st: i32 = 0;
         var rn: usize = 0;
         plug_chat(&job.plan.upstream_model[0], job.plan.upstream_len,
-            job.plan.payload[0: job.plan.payload_len], job.plan.timeout_ms,
+            chat_payload(&job.plan), job.plan.timeout_ms,
             job.nowu as i64, &job.resp[0], 8192, &st, &rn) catch {
             failed = true;
         };
@@ -2202,7 +2218,7 @@ fn srv_up_spawn(j: i32, stats: &ServeStats, drive: bool) void {
     }
     job.fut = htc_open_async(&job.cfg, &g_up_ctx, &"POST"[0: 4],
         job.plan.path[0: job.plan.path_len],
-        job.plan.payload[0: job.plan.payload_len],
+        chat_payload(&job.plan),
         as_stream, nowu, dl, &job.call);
 }
 
@@ -2682,8 +2698,9 @@ fn srv_chat_async_try(c: &SrvConn, stats: &ServeStats) bool {
         srv_up_respond(j, 503, SRV_JSON_503, stats, false);
         return true;
     }
-    if c.body_overflow {
-        srv_up_respond(j, 413, SRV_JSON_413, stats, false);
+    const berr: i32 = srv_body_err(c);
+    if berr != 0 {
+        srv_up_respond(j, berr, srv_body_err_json(berr), stats, false);
         return true;
     }
     var tok: [byte: 256] = [0: 256];
@@ -2705,7 +2722,7 @@ fn srv_chat_async_try(c: &SrvConn, stats: &ServeStats) bool {
         ti = ti + 1;
     }
     job.tok_len = ti;
-    chat_prepare_span_session(runtime_db(), &c.body[0], c.body_len, tok[0: tn],
+    chat_prepare_span_session(runtime_db(), srv_body_ptr(c), c.body_len, tok[0: tn],
         store_now(), &job.plan) catch {
         srv_up_respond(j, 400, SRV_JSON_400, stats, false);
         return true;
@@ -2744,9 +2761,10 @@ fn srv_chat_block(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 503, SRV_JSON_503, keep);
         return;
     }
-    if c.body_overflow {
-        lg.status = 413;
-        srv_static(c, 413, SRV_JSON_413, keep);
+    const berr: i32 = srv_body_err(c);
+    if berr != 0 {
+        lg.status = berr;
+        srv_static(c, berr, srv_body_err_json(berr), keep);
         return;
     }
     var tok: [byte: 256] = [0: 256];
@@ -2765,7 +2783,8 @@ fn srv_chat_block(c: &SrvConn, stats: &ServeStats) void {
     };
     srv_log_user(&lg, key.user_id);
     var plan: ChatPlan = ChatPlan{};
-    chat_prepare_span_session(runtime_db(), &c.body[0], c.body_len, tok[0: tn],
+    defer { chat_plan_free(&plan); }
+    chat_prepare_span_session(runtime_db(), srv_body_ptr(c), c.body_len, tok[0: tn],
         store_now(), &plan) catch {
         lg.status = 400;
         srv_static(c, 400, SRV_JSON_400, keep);
@@ -2803,13 +2822,13 @@ fn srv_chat_block(c: &SrvConn, stats: &ServeStats) void {
         if plan.stdio {
             // D5：插件供应商（stdio JSONL）——不建 TLS、不走上游配置
             plug_chat(&plan.upstream_model[0], plan.upstream_len,
-                plan.payload[0: plan.payload_len], plan.timeout_ms, nowu as i64,
+                chat_payload(&plan), plan.timeout_ms, nowu as i64,
                 &resp[0], 8192, &st, &rn) catch {
                 failed = true;
             };
         } else {
             upstream_post(&g_up_ctx, &cfg, plan.path[0: plan.path_len],
-                plan.payload[0: plan.payload_len], nowu, nowu +% 60000,
+                chat_payload(&plan), nowu, nowu +% 60000,
                 &resp[0], 8192, &st, &rn, &retry_after) catch {
                 failed = true;
             };
@@ -2824,7 +2843,7 @@ fn srv_chat_block(c: &SrvConn, stats: &ServeStats) void {
                 srv_static(c, 502, SRV_JSON_502, keep);
                 return;
             }
-            chat_prepare_span_session(runtime_db(), &c.body[0], c.body_len, tok[0: tn],
+            chat_prepare_span_session(runtime_db(), srv_body_ptr(c), c.body_len, tok[0: tn],
                 store_now(), &plan) catch {
                 lg.status = 502;
                 srv_static(c, 502, SRV_JSON_502, keep);
@@ -3128,24 +3147,161 @@ fn srv_begin_response(c: &SrvConn, stats: &ServeStats) void {
 // 状态机
 // ---------------------------------------------------------------
 
-/// 排空包体：1=排完，0=还要更多数据，-1=协议错误。
-/// chat 路由：把包体字节采集到连接缓冲（其他路由只排空，不占内存时间）。
-fn srv_capture(c: &SrvConn, start: usize, take: usize) void {
+/// 请求体错误状态：0=正常，413=确实超上限，503=大包在途槽打满（负载保护）。
+fn srv_body_err(c: &const SrvConn) i32 {
     if c.body_overflow {
+        return 413;
+    }
+    if c.body_busy {
+        return 503;
+    }
+    return 0;
+}
+
+fn srv_body_err_json(status: i32) &[byte] {
+    if status == 503 {
+        return SRV_JSON_503;
+    }
+    return SRV_JSON_413;
+}
+
+/// 请求体基址：内联或堆缓冲（handler 只认 `srv_body_ptr`/`srv_body_slice`）。
+fn srv_body_ptr(c: &SrvConn) &const byte {
+    if buf_valid(&c.body_big) {
+        return c.body_big.ptr;
+    }
+    return &c.body[0];
+}
+
+/// 请求体切片（长度 = `body_len`）。
+fn srv_body_slice(c: &SrvConn) &[byte] {
+    return srv_body_ptr(c)[0: c.body_len];
+}
+
+/// 归还请求体缓冲（新请求开始/连接关闭时调用；可重复）。
+fn srv_body_reset(c: &SrvConn) void {
+    if buf_valid(&c.body_big) {
+        buf_free(&c.body_big);
+        g_big_active = g_big_active -% 1;
+    }
+    c.body_len = 0;
+    c.body_hint = 0;
+    c.body_overflow = false;
+    c.body_busy = false;
+}
+
+/// 内联 → 堆缓冲：非 chunked 按 Content-Length 一次分配到位，chunked 给 4×内联起跳。
+fn srv_body_upgrade(c: &SrvConn) bool {
+    if g_big_active >= SRV_BIG_MAX {
+        c.body_busy = true;
+        return false;
+    }
+    var cap: usize = SRV_BODY_INLINE * 4;
+    if c.body_hint > cap {
+        cap = c.body_hint;
+    }
+    if cap > g_body_max {
+        cap = g_body_max;
+    }
+    if cap < c.body_len {
+        cap = c.body_len;
+    }
+    var b: Buf = buf_new(cap);
+    if !buf_valid(&b) {
+        c.body_busy = true;
+        return false;
+    }
+    var i: usize = 0;
+    while i < c.body_len {
+        b.ptr[i] = c.body[i];
+        i = i + 1;
+    }
+    b.len = c.body_len;
+    c.body_big.ptr = b.ptr;
+    c.body_big.len = b.len;
+    c.body_big.cap = b.cap;
+    g_big_active = g_big_active +% 1;
+    return true;
+}
+
+/// 收一个请求体字节；false 表示已标记 overflow/busy，调用方停止采集。
+fn srv_body_put(c: &SrvConn, v: byte) bool {
+    if c.body_len >= g_body_max {
+        c.body_overflow = true;
+        return false;
+    }
+    if !buf_valid(&c.body_big) {
+        if c.body_len < SRV_BODY_INLINE {
+            c.body[c.body_len] = v;
+            c.body_len = c.body_len + 1;
+            return true;
+        }
+        if !srv_body_upgrade(c) {
+            return false;
+        }
+    }
+    if c.body_big.cap <= c.body_len {
+        if !buf_reserve(&c.body_big, 1) {
+            c.body_busy = true;
+            return false;
+        }
+    }
+    c.body_big.ptr[c.body_len] = v;
+    c.body_len = c.body_len + 1;
+    c.body_big.len = c.body_len;
+    return true;
+}
+
+/// 排空包体：1=排完，0=还要更多数据，-1=协议错误。
+/// 请求体统一采集（≤ 内联长度用连接内数组，更大走堆缓冲），超上限/槽满只排空。
+fn srv_capture(c: &SrvConn, start: usize, take: usize) void {
+    if c.body_overflow || c.body_busy {
         return;
     }
     var i: usize = 0;
     while i < take {
         const src: usize = start + i;
         if src < SRV_IO_CAP {
-            if c.body_len < SRV_BODY_CAP {
-                c.body[c.body_len] = c.in[src];
-                c.body_len = c.body_len + 1;
-            } else {
-                c.body_overflow = true;
+            if !srv_body_put(c, c.in[src]) {
+                return;
             }
         }
         i = i + 1;
+    }
+}
+
+/// `--max-body` 的 cstr 值：十进制字节数（上限 1 GiB），并同步 chat 模块。
+export fn srv_body_max_set_arg(p: &const byte) void {
+    g_body_max_cli = true;
+    var n: usize = 0;
+    var i: usize = 0;
+    while i < 16 {
+        const ch: byte = p[i];
+        if ch < (48 as byte) || ch > (57 as byte) {
+            break;
+        }
+        n = n *% 10;
+        n = n +% (ch -% (48 as byte)) as usize;
+        if n > 1073741824 {
+            n = 1073741824;
+        }
+        i = i + 1;
+    }
+    if n < 1024 {
+        n = 1024;
+    }
+    g_body_max = n;
+    chat_set_body_max(n);
+}
+
+/// 环境变量兜底：`AIGW_MAX_BODY=<bytes>`（命令行优先）。
+fn srv_body_max_init() void {
+    if g_body_max_cli {
+        return;
+    }
+    const ev: &byte = getenv(&"AIGW_MAX_BODY"[0] as &const byte);
+    if (ev as usize) != 0 {
+        srv_body_max_set_arg(ev);
     }
 }
 
@@ -3311,8 +3467,7 @@ fn srv_drive(c: &SrvConn, stats: &ServeStats) void {
                 pi = pi + 1;
             }
             c.path_len = pi;
-            c.body_len = 0;
-            c.body_overflow = false;
+            srv_body_reset(c);
             c.in_pos = req.head_len;
             c.chunked = req.chunked;
             c.chunk_left = 0;
@@ -3320,6 +3475,12 @@ fn srv_drive(c: &SrvConn, stats: &ServeStats) void {
             c.body_left = 0;
             if !req.chunked && req.content_length > 0 {
                 c.body_left = req.content_length as u64;
+                if req.content_length > (g_body_max as i64) {
+                    // 超上限：不采集、不分配，排空后由 handler 回 413
+                    c.body_overflow = true;
+                } else {
+                    c.body_hint = req.content_length as usize;
+                }
             }
             if req.expect_continue && (req.chunked || req.content_length > 0) {
                 // 尽力而为：25 字节几乎不会半发；半发也只能等客户端自己超时重发
@@ -3559,6 +3720,8 @@ fn srv_shutdown_sweep() void {
 /// 单线程事件循环。`lfd` 由 `serve_listen` 建好（非阻塞）。
 /// 收到 SIGTERM/SIGINT 后：停止 accept → 等空闲连接关闭/在途请求收尾（最多 2 s）→ 返回 0。
 export fn serve_run(lfd: i32, stats: &ServeStats) !i32 {
+    srv_body_max_init();
+    g_big_active = 0;
     _ = signal(SIGTERM, &srv_on_signal as &void);
     _ = signal(SIGINT, &srv_on_signal as &void);
     _ = signal(SIGPIPE, SIG_IGN as &void);
@@ -3743,7 +3906,7 @@ fn srv_json_body_str(c: &SrvConn, key: &[byte], out: &byte, cap: usize) usize {
         return 0;
     }
     var d: JsonDoc = JsonDoc{};
-    json_parse(&d, c.body[0: c.body_len]) catch {
+    json_parse(&d, srv_body_slice(c)) catch {
         return 0;
     };
     const v: i32 = json_get(&d, json_root(&d), key);
@@ -3781,8 +3944,9 @@ fn srv_otp(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 503, SRV_JSON_503, keep);
         return;
     }
-    if c.body_overflow {
-        srv_static(c, 413, SRV_JSON_413, keep);
+    const berr: i32 = srv_body_err(c);
+    if berr != 0 {
+        srv_static(c, berr, srv_body_err_json(berr), keep);
         return;
     }
     var email: [byte: 128] = [0: 128];
@@ -3840,8 +4004,9 @@ fn srv_login(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 503, SRV_JSON_503, keep);
         return;
     }
-    if c.body_overflow {
-        srv_static(c, 413, SRV_JSON_413, keep);
+    const berr: i32 = srv_body_err(c);
+    if berr != 0 {
+        srv_static(c, berr, srv_body_err_json(berr), keep);
         return;
     }
     var email: [byte: 128] = [0: 128];
@@ -3893,8 +4058,9 @@ fn srv_key_revoke(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 503, SRV_JSON_503, keep);
         return;
     }
-    if c.body_overflow {
-        srv_static(c, 413, SRV_JSON_413, keep);
+    const berr: i32 = srv_body_err(c);
+    if berr != 0 {
+        srv_static(c, berr, srv_body_err_json(berr), keep);
         return;
     }
     var uid: i64 = 0;
@@ -3903,7 +4069,7 @@ fn srv_key_revoke(c: &SrvConn, stats: &ServeStats) void {
         return;
     }
     var d: JsonDoc = JsonDoc{};
-    json_parse(&d, c.body[0: c.body_len]) catch {
+    json_parse(&d, srv_body_slice(c)) catch {
         srv_static(c, 400, SRV_JSON_400, keep);
         return;
     };
@@ -3942,8 +4108,9 @@ fn srv_keys(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 503, SRV_JSON_503, keep);
         return;
     }
-    if c.body_overflow {
-        srv_static(c, 413, SRV_JSON_413, keep);
+    const berr: i32 = srv_body_err(c);
+    if berr != 0 {
+        srv_static(c, berr, srv_body_err_json(berr), keep);
         return;
     }
     var uid: i64 = 0;
@@ -4204,12 +4371,13 @@ fn srv_admin_pricing_post(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 401, SRV_JSON_401, keep);
         return;
     }
-    if c.body_overflow {
-        srv_static(c, 413, SRV_JSON_413, keep);
+    const berr: i32 = srv_body_err(c);
+    if berr != 0 {
+        srv_static(c, berr, srv_body_err_json(berr), keep);
         return;
     }
     var d: JsonDoc = JsonDoc{};
-    json_parse(&d, c.body[0: c.body_len]) catch {
+    json_parse(&d, srv_body_slice(c)) catch {
         srv_static(c, 400, SRV_JSON_400, keep);
         return;
     };
@@ -4365,8 +4533,9 @@ fn srv_responses_async_try(c: &SrvConn, stats: &ServeStats) bool {
         srv_up_respond(j, 503, SRV_JSON_503, stats, false);
         return true;
     }
-    if c.body_overflow {
-        srv_up_respond(j, 413, SRV_JSON_413, stats, false);
+    const berr: i32 = srv_body_err(c);
+    if berr != 0 {
+        srv_up_respond(j, berr, srv_body_err_json(berr), stats, false);
         return true;
     }
     var tok: [byte: 256] = [0: 256];
@@ -4383,7 +4552,7 @@ fn srv_responses_async_try(c: &SrvConn, stats: &ServeStats) bool {
     srv_log_user(&job.lg, key.user_id);
     job.uid = key.user_id;
     var d: JsonDoc = JsonDoc{};
-    json_parse(&d, c.body[0: c.body_len]) catch {
+    json_parse(&d, srv_body_slice(c)) catch {
         srv_up_respond(j, 400, SRV_JSON_400, stats, false);
         return true;
     };
@@ -4423,7 +4592,7 @@ fn srv_responses_async_try(c: &SrvConn, stats: &ServeStats) bool {
         return true;
     }
     var aug: [byte: 32768] = [0: 32768];
-    const augn: usize = resp_augment_payload(payload[0: pln], c.body[0: c.body_len],
+    const augn: usize = resp_augment_payload(payload[0: pln], srv_body_slice(c),
         &aug[0], 32768);
     var use_payload: &[byte] = payload[0: pln];
     if augn > 0 {
@@ -4472,9 +4641,10 @@ fn srv_responses_block(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 503, SRV_JSON_503, keep);
         return;
     }
-    if c.body_overflow {
-        lg.status = 413;
-        srv_static(c, 413, SRV_JSON_413, keep);
+    const berr: i32 = srv_body_err(c);
+    if berr != 0 {
+        lg.status = berr;
+        srv_static(c, berr, srv_body_err_json(berr), keep);
         return;
     }
     var tok: [byte: 256] = [0: 256];
@@ -4493,7 +4663,7 @@ fn srv_responses_block(c: &SrvConn, stats: &ServeStats) void {
     };
     srv_log_user(&lg, key.user_id);
     var d: JsonDoc = JsonDoc{};
-    json_parse(&d, c.body[0: c.body_len]) catch {
+    json_parse(&d, srv_body_slice(c)) catch {
         lg.status = 400;
         srv_static(c, 400, SRV_JSON_400, keep);
         return;
@@ -4537,8 +4707,9 @@ fn srv_responses_block(c: &SrvConn, stats: &ServeStats) void {
     }
     // A5：tools/tool_choice/reasoning 透传给上游（chat 路径原样转发，responses 需拼回）。
     var aug: [byte: 32768] = [0: 32768];
-    const augn: usize = resp_augment_payload(payload[0: pln], c.body[0: c.body_len], &aug[0], 32768);
+    const augn: usize = resp_augment_payload(payload[0: pln], srv_body_slice(c), &aug[0], 32768);
     var plan: ChatPlan = ChatPlan{};
+    defer { chat_plan_free(&plan); }
     var use_payload: &[byte] = payload[0: pln];
     if augn > 0 {
         use_payload = aug[0: augn];
@@ -4582,13 +4753,13 @@ fn srv_responses_block(c: &SrvConn, stats: &ServeStats) void {
         failed = false;
         if plan.stdio {
             plug_chat(&plan.upstream_model[0], plan.upstream_len,
-                plan.payload[0: plan.payload_len], plan.timeout_ms, nowu as i64,
+                chat_payload(&plan), plan.timeout_ms, nowu as i64,
                 &resp[0], 8192, &st, &rn) catch {
                 failed = true;
             };
         } else {
             upstream_post(&g_up_ctx, &cfg, plan.path[0: plan.path_len],
-                plan.payload[0: plan.payload_len], nowu, nowu +% 60000,
+                chat_payload(&plan), nowu, nowu +% 60000,
                 &resp[0], 8192, &st, &rn, &retry_after) catch {
                 failed = true;
             };
@@ -4767,12 +4938,13 @@ fn srv_mcp(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 401, SRV_JSON_401, keep);
         return;
     }
-    if c.body_overflow {
-        srv_static(c, 413, SRV_JSON_413, keep);
+    const berr: i32 = srv_body_err(c);
+    if berr != 0 {
+        srv_static(c, berr, srv_body_err_json(berr), keep);
         return;
     }
     var d: JsonDoc = JsonDoc{};
-    json_parse(&d, c.body[0: c.body_len]) catch {
+    json_parse(&d, srv_body_slice(c)) catch {
         srv_static(c, 400, SRV_JSON_400, keep);
         return;
     };
@@ -5143,7 +5315,7 @@ fn srv_responses_stream(c: &SrvConn, uid: i64, plan: &ChatPlan, cfg: &const Http
         return;
     };
     const o: !i32 = wait_i32(htc_open_async(cfg, &g_up_ctx, &"POST"[0: 4],
-        plan.path[0: plan.path_len], plan.payload[0: plan.payload_len], true,
+        plan.path[0: plan.path_len], chat_payload(plan), true,
         nowu, nowu +% 10000, &call));
     const orc: i32 = o catch |_| {
         lb_report(plan.provider_id, false, store_now());
@@ -5380,8 +5552,9 @@ fn srv_ctl_register(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 503, SRV_JSON_503, keep);
         return;
     }
-    if c.body_overflow {
-        srv_static(c, 413, SRV_JSON_413, keep);
+    const berr: i32 = srv_body_err(c);
+    if berr != 0 {
+        srv_static(c, berr, srv_body_err_json(berr), keep);
         return;
     }
     var id: [byte: 64] = [0: 64];
@@ -5426,12 +5599,13 @@ fn srv_ctl_heartbeat(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 503, SRV_JSON_503, keep);
         return;
     }
-    if c.body_overflow {
-        srv_static(c, 413, SRV_JSON_413, keep);
+    const berr: i32 = srv_body_err(c);
+    if berr != 0 {
+        srv_static(c, berr, srv_body_err_json(berr), keep);
         return;
     }
     var d: JsonDoc = JsonDoc{};
-    json_parse(&d, c.body[0: c.body_len]) catch {
+    json_parse(&d, srv_body_slice(c)) catch {
         srv_static(c, 400, SRV_JSON_400, keep);
         return;
     };
@@ -5474,8 +5648,9 @@ fn srv_ctl_config(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 503, SRV_JSON_503, keep);
         return;
     }
-    if c.body_len > 0 && c.body_overflow {
-        srv_static(c, 413, SRV_JSON_413, keep);
+    const berr: i32 = srv_body_err(c);
+    if c.body_len > 0 && berr != 0 {
+        srv_static(c, berr, srv_body_err_json(berr), keep);
         return;
     }
     // POST（admin）写一版配置；GET 读当前版本
@@ -5485,7 +5660,7 @@ fn srv_ctl_config(c: &SrvConn, stats: &ServeStats) void {
             return;
         }
         var d: JsonDoc = JsonDoc{};
-        json_parse(&d, c.body[0: c.body_len]) catch {
+        json_parse(&d, srv_body_slice(c)) catch {
             srv_static(c, 400, SRV_JSON_400, keep);
             return;
         };
@@ -5641,7 +5816,7 @@ fn srv_ctl_epoch(c: &SrvConn, stats: &ServeStats) void {
         return;
     }
     var d: JsonDoc = JsonDoc{};
-    json_parse(&d, c.body[0: c.body_len]) catch {
+    json_parse(&d, srv_body_slice(c)) catch {
         srv_static(c, 400, SRV_JSON_400, keep);
         return;
     };
@@ -5709,7 +5884,7 @@ fn srv_ctl_assign(c: &SrvConn, stats: &ServeStats) void {
         return;
     }
     var d: JsonDoc = JsonDoc{};
-    json_parse(&d, c.body[0: c.body_len]) catch {
+    json_parse(&d, srv_body_slice(c)) catch {
         srv_static(c, 400, SRV_JSON_400, keep);
         return;
     };
@@ -5748,7 +5923,7 @@ fn srv_ctl_drain(c: &SrvConn, stats: &ServeStats) void {
         return;
     }
     var d: JsonDoc = JsonDoc{};
-    json_parse(&d, c.body[0: c.body_len]) catch {
+    json_parse(&d, srv_body_slice(c)) catch {
         srv_static(c, 400, SRV_JSON_400, keep);
         return;
     };
@@ -5871,13 +6046,14 @@ fn srv_ctl_ingest(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 401, SRV_JSON_401, keep);
         return;
     }
-    if c.body_overflow {
-        srv_static(c, 413, SRV_JSON_413, keep);
+    const berr: i32 = srv_body_err(c);
+    if berr != 0 {
+        srv_static(c, berr, srv_body_err_json(berr), keep);
         return;
     }
     const now: i64 = store_now();
     var st: IngestStats = IngestStats{ applied: 0, duplicate: 0, bad: 0 };
-    st = ingest_apply_routed(runtime_db(), c.body[0: c.body_len], now) catch {
+    st = ingest_apply_routed(runtime_db(), srv_body_slice(c), now) catch {
         srv_static(c, 400, SRV_JSON_400, keep);
         return;
     };
@@ -6028,12 +6204,13 @@ fn srv_estimate(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 401, SRV_JSON_401, keep);
         return;
     };
-    if c.body_overflow {
-        srv_static(c, 413, SRV_JSON_413, keep);
+    const berr: i32 = srv_body_err(c);
+    if berr != 0 {
+        srv_static(c, berr, srv_body_err_json(berr), keep);
         return;
     }
     var d: JsonDoc = JsonDoc{};
-    json_parse(&d, c.body[0: c.body_len]) catch {
+    json_parse(&d, srv_body_slice(c)) catch {
         srv_static(c, 400, SRV_JSON_400, keep);
         return;
     };
@@ -6128,12 +6305,13 @@ fn srv_budget(c: &SrvConn, stats: &ServeStats) void {
     }
     const now: i64 = store_now();
     if !c.is_get {
-        if c.body_overflow {
-            srv_static(c, 413, SRV_JSON_413, keep);
+        const berr: i32 = srv_body_err(c);
+        if berr != 0 {
+            srv_static(c, berr, srv_body_err_json(berr), keep);
             return;
         }
         var d: JsonDoc = JsonDoc{};
-        json_parse(&d, c.body[0: c.body_len]) catch {
+        json_parse(&d, srv_body_slice(c)) catch {
             srv_static(c, 400, SRV_JSON_400, keep);
             return;
         };
@@ -6561,7 +6739,7 @@ fn srv_node_spool(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 502, SRV_JSON_502, keep);
         return;
     }
-    if !spool_try_append(path[0: pn], c.body[0: c.body_len]) {
+    if !spool_try_append(path[0: pn], srv_body_slice(c)) {
         srv_static(c, 502, SRV_JSON_502, keep);
         return;
     }
@@ -6802,7 +6980,7 @@ fn srv_admin_prices(c: &SrvConn, stats: &ServeStats) void {
             return;
         }
         var d: JsonDoc = JsonDoc{};
-        json_parse(&d, c.body[0: c.body_len]) catch {
+        json_parse(&d, srv_body_slice(c)) catch {
             srv_static(c, 400, SRV_JSON_400, keep);
             return;
         };
@@ -6932,7 +7110,7 @@ fn srv_admin_bind(c: &SrvConn, stats: &ServeStats) void {
         return;
     }
     var d: JsonDoc = JsonDoc{};
-    json_parse(&d, c.body[0: c.body_len]) catch {
+    json_parse(&d, srv_body_slice(c)) catch {
         srv_static(c, 400, SRV_JSON_400, keep);
         return;
     };

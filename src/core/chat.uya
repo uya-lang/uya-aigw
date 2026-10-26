@@ -3,7 +3,9 @@
 // 传输层（TLS 上游）不在这里：serve/A8 拿到 ChatPlan 后交给 htc_* 执行，
 // 再把响应体交给 chat_settle。这样路由/重写/金额都能脱离网络做单测。
 //
-// ChatPlan 全部用固定缓冲（无分配）：provider 字段 + 上游 path + 重写后的请求体。
+// ChatPlan 的 provider 字段 + 上游 path 用固定缓冲（无分配）；重写后的请求体
+// ≤ CHAT_PAYLOAD_MAX（32 KiB）走内联，更大时换成堆缓冲（`payload_big`）。
+// 请求体上限默认 8 MiB，可由 serve 的 `--max-body`/`AIGW_MAX_BODY` 调整。
 
 export const CHAT_MODEL_MAX: usize = 128;
 export const CHAT_HOST_MAX: usize = 256;
@@ -11,6 +13,23 @@ export const CHAT_PATH_MAX: usize = 256;
 export const CHAT_AUTH_NAME_MAX: usize = 64;
 export const CHAT_SECRET_MAX: usize = 256;
 export const CHAT_PAYLOAD_MAX: usize = 32768;
+/// 请求体上限默认值（8 MiB）。serve 启动时通过 `chat_set_body_max` 同步同一个值，
+/// 这样抓包上限与上游重写缓冲上限不会各说各话。
+export const CHAT_BODY_MAX_DEFAULT: usize = 8388608;
+
+var g_chat_body_max: usize = CHAT_BODY_MAX_DEFAULT;
+
+/// 当前请求体上限（字节）。
+export fn chat_body_max() usize {
+    return g_chat_body_max;
+}
+
+/// serve 配置变更时同步；小于 1 KiB 的值忽略（防止误配把服务打瘸）。
+export fn chat_set_body_max(n: usize) void {
+    if n >= 1024 {
+        g_chat_body_max = n;
+    }
+}
 
 export error ChatBadRequest;
 export error ChatNoRoute;
@@ -42,9 +61,65 @@ export struct ChatPlan {
     stream: bool,
     payload: [byte: CHAT_PAYLOAD_MAX],
     payload_len: usize,
+    /// 重写后的请求体超过内联缓冲时才有值（len 与 `payload_len` 同步）。
+    payload_big: Buf,
     kind: [byte: 16],
     kind_len: usize,
     stdio: bool,
+}
+
+/// 上游请求体指针：≤ CHAT_PAYLOAD_MAX 用内联缓冲，更大用堆缓冲。
+export fn chat_payload_ptr(p: &const ChatPlan) &const byte {
+    if p.payload_len > CHAT_PAYLOAD_MAX && buf_valid(&p.payload_big) {
+        return p.payload_big.ptr;
+    }
+    return &p.payload[0];
+}
+
+/// 上游请求体切片（transport / 插件池用）。
+export fn chat_payload(p: &const ChatPlan) &[byte] {
+    return chat_payload_ptr(p)[0: p.payload_len];
+}
+
+/// 释放大包 payload；可重复调用（内联 payload 不占堆）。
+export fn chat_plan_free(p: &ChatPlan) void {
+    buf_free(&p.payload_big);
+    p.payload_len = 0;
+}
+
+/// 为重写结果准备输出缓冲：小包用内联、大包用堆缓冲（保留上次容量）。
+fn chat_payload_ready(out: &ChatPlan, need: usize) bool {
+    out.payload_len = 0;
+    if need <= CHAT_PAYLOAD_MAX {
+        // 上一次可能是大包：释放掉，避免大缓冲长期挂在 plan 上。
+        if buf_valid(&out.payload_big) {
+            buf_free(&out.payload_big);
+        }
+        return true;
+    }
+    buf_reset(&out.payload_big);
+    return buf_reserve(&out.payload_big, need);
+}
+
+fn chat_payload_buf(out: &ChatPlan) &byte {
+    if buf_valid(&out.payload_big) {
+        return out.payload_big.ptr;
+    }
+    return &out.payload[0];
+}
+
+fn chat_payload_cap(out: &ChatPlan) usize {
+    if buf_valid(&out.payload_big) {
+        return out.payload_big.cap;
+    }
+    return CHAT_PAYLOAD_MAX;
+}
+
+fn chat_payload_set(out: &ChatPlan, n: usize) void {
+    out.payload_len = n;
+    if buf_valid(&out.payload_big) {
+        out.payload_big.len = n;
+    }
 }
 
 fn chat_copy(dst: &byte, cap: usize, src: &[byte]) usize {
@@ -366,7 +441,7 @@ fn chat_route(d: &Db, model: &[byte], session: &[byte], now: i64, out: &ChatPlan
 /// A4 快路径入口：返回 false 表示「形态不支持，调用方走完整解析」。
 export fn chat_prepare_fast(d: &Db, body: &[byte], session: &[byte], now: i64,
     out: &ChatPlan) !bool {
-    if body.len == 0 || body.len > CHAT_PAYLOAD_MAX {
+    if body.len == 0 || body.len > g_chat_body_max {
         return error.ChatTooLarge;
     }
     var sc: ChatScan = ChatScan{ model_found: false, model_vs: 0, model_ve: 0,
@@ -382,42 +457,43 @@ export fn chat_prepare_fast(d: &Db, body: &[byte], session: &[byte], now: i64,
     out.model_len = chat_copy(&out.model[0], CHAT_MODEL_MAX, body[sc.model_vs: mn]);
     out.stream = sc.stream_val;
     try chat_route(d, out.model[0: out.model_len], session, now, out);
+    if !chat_payload_ready(out, body.len + CHAT_MODEL_MAX) {
+        return error.ChatTooLarge;
+    }
     const pn: usize = chat_rewrite_model_span(body, sc.model_vs, sc.model_ve,
-        out.upstream_model[0: out.upstream_len], &out.payload[0], CHAT_PAYLOAD_MAX);
+        out.upstream_model[0: out.upstream_len], chat_payload_buf(out), chat_payload_cap(out));
     if pn == 0 {
         return error.ChatTooLarge;
     }
-    out.payload_len = pn;
+    chat_payload_set(out, pn);
     return true;
 }
 
 /// 无亲和的入口（单测/兼容）。
 export fn chat_prepare(d: &Db, body: &[byte], now: i64, out: &ChatPlan) !void {
-    return chat_prepare_session(d, body, &""[0: 0], now, out);
+    return chat_prepare_span_session(d, body.ptr, body.len, &""[0: 0], now, out);
 }
 
 /// serve 用：请求体以「指针 + 长度」给出时的入口。
 export fn chat_prepare_span(d: &Db, body: &const byte, n: usize, now: i64,
     out: &ChatPlan) !void {
-    if n > CHAT_PAYLOAD_MAX {
-        return error.ChatTooLarge;
-    }
-    const fast: bool = try chat_prepare_fast(d, body[0: n], &""[0: 0], now, out);
-    if !fast {
-        return chat_prepare(d, body[0: n], now, out);
-    }
-    return;
+    return chat_prepare_span_session(d, body, n, &""[0: 0], now, out);
 }
 
 /// serve 用：带会话亲和的版本。
 export fn chat_prepare_span_session(d: &Db, body: &const byte, n: usize,
     session: &[byte], now: i64, out: &ChatPlan) !void {
-    if n > CHAT_PAYLOAD_MAX {
+    if n > g_chat_body_max {
         return error.ChatTooLarge;
     }
     // A4 热路径：先无 DOM 扫描；形态不支持才回退完整解析。
     const fast: bool = try chat_prepare_fast(d, body[0: n], session, now, out);
     if !fast {
+        // 完整解析的 JsonDoc 源码缓冲只有 JSON_MAX_SRC（64 KiB）；大包只有
+        // 快路径能吃下，超了按「请求体过大」回 413，而不是含糊的 400。
+        if n > JSON_MAX_SRC {
+            return error.ChatTooLarge;
+        }
         return chat_prepare_session(d, body[0: n], session, now, out);
     }
     return;
@@ -464,7 +540,7 @@ export fn chat_bearer(auth: &[byte], out: &byte, cap: usize) usize {
 /// `session` 用于 A8 会话亲和（空串表示无亲和，按权重哈希 0 选）。
 export fn chat_prepare_session(d: &Db, body: &[byte], session: &[byte], now: i64,
     out: &ChatPlan) !void {
-    if body.len == 0 || body.len > CHAT_PAYLOAD_MAX {
+    if body.len == 0 || body.len > g_chat_body_max {
         return error.ChatTooLarge;
     }
     var doc: JsonDoc = JsonDoc{};
@@ -488,12 +564,15 @@ export fn chat_prepare_session(d: &Db, body: &[byte], session: &[byte], now: i64
     out.stream = json_bool(&doc, json_get(&doc, root, &"stream"[0: 6]));
 
     try chat_route(d, mbuf[0: mn], session, now, out);
+    if !chat_payload_ready(out, body.len + CHAT_MODEL_MAX) {
+        return error.ChatTooLarge;
+    }
     const pn: usize = chat_rewrite_model(body, out.upstream_model[0: out.upstream_len],
-        &out.payload[0], CHAT_PAYLOAD_MAX);
+        chat_payload_buf(out), chat_payload_cap(out));
     if pn == 0 {
         return error.ChatTooLarge;
     }
-    out.payload_len = pn;
+    chat_payload_set(out, pn);
     _ = now;
     return;
 }

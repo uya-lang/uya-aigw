@@ -2,6 +2,7 @@
 //
 // 用法：
 //   aigw serve [--host 0.0.0.0] [--port 8080] [--db data/aigw.db] [--data-dir data]
+//              [--max-body <bytes>] [--ca <pem>] [--admin-key <key>] ...
 //   aigw tls probe <host> [--port N] [--ca <pem>]
 //   aigw tls pin   <host> <sha256hex> [--file <tsv>]
 
@@ -108,7 +109,7 @@ fn mail_args_scan(argc: i32) void {
 }
 
 fn usage() i32 {
-    printf("usage:\n  aigw serve [--host 0.0.0.0] [--port 8080] [--db data/aigw.db] [--data-dir data] [--ca <pem>] [--proxy http://host:port] [--no-proxy a,b] [--plugin-cmd \"cmd args\"]\n             [--smtp smtp://host[:port]|smtps://host] [--smtp-user u] [--smtp-pass p] [--mail-from a@b] [--mail-ca <pem>]\n  aigw tls probe <host> [--port N] [--ca <pem>]\n  aigw tls pin <host> <sha256hex> [--file <tsv>]\n  aigw smtp-relay          # 内部用法（mailer 子进程：stdin 读作业 JSON）\n" as *byte);
+    printf("usage:\n  aigw serve [--host 0.0.0.0] [--port 8080] [--db data/aigw.db] [--data-dir data] [--ca <pem>] [--proxy http://host:port] [--no-proxy a,b] [--max-body <bytes>] [--plugin-cmd \"cmd args\"]\n             [--smtp smtp://host[:port]|smtps://host] [--smtp-user u] [--smtp-pass p] [--mail-from a@b] [--mail-ca <pem>]\n  aigw tls probe <host> [--port N] [--ca <pem>]\n  aigw tls pin <host> <sha256hex> [--file <tsv>]\n  aigw smtp-relay          # 内部用法（mailer 子进程：stdin 读作业 JSON）\n" as *byte);
     return 2;
 }
 
@@ -350,6 +351,9 @@ export fn main() i32 {
                     m = m + 1;
                 }
                 npxlen = m;
+            } else if arg_eq(f, "--max-body" as &const byte) {
+                // 请求体上限（字节），同时同步 serve 抓包上限与 chat 重写上限。
+                srv_body_max_set_arg(v);
             }
             k = k + 2;
         }

@@ -159,7 +159,7 @@ insert into price_entries(card_id,provider,model,user_id,
 aigw serve [--host 0.0.0.0] [--port 8080] [--db data/aigw.db] [--data-dir data]
            [--ca <pem>] [--dev-otp] [--admin-key <key>]
            [--meta <db>] [--node-id <id>] [--uplink host:port]
-           [--proxy http://host:port] [--no-proxy a,b]
+           [--proxy http://host:port] [--no-proxy a,b] [--max-body <bytes>]
            [--plugin-cmd "cmd args"]
 aigw tls probe <host> [--port N] [--ca <pem>]
 aigw tls pin   <host> <sha256hex> [--file <tsv>]
@@ -182,6 +182,7 @@ aigw tls pin   <host> <sha256hex> [--file <tsv>]
 | `--proxy` | 空 | 出站 HTTP 代理 `http://host:port`（覆盖 `HTTPS_PROXY`） |
 | `--no-proxy` | 空 | 代理白名单（逗号分隔，支持 `*` 与后缀匹配）；显式给空串 = 全部走代理 |
 | `--plugin-cmd` | 空 | stdio 插件启动命令（`/bin/sh -c` 执行），覆盖 `AIGW_PLUGIN_CMD` |
+| `--max-body` | `8388608` | 请求体上限（字节，下限 1024）。抓包与上游转发共用这个值；超出回 413，大包在途超过 32 个回 503。也可用 `AIGW_MAX_BODY`（命令行优先） |
 | `--smtp` | 空 | SMTP 地址：`smtp://host[:port]`（STARTTLS，默认 587）、`smtps://host[:port]`（隐式 TLS，默认 465）、`host:port`（明文 25，内网 relay/测试）。**空 = 不发邮件**（OTP 只能靠 `--dev-otp`） |
 | `--smtp-user` / `--smtp-pass` | 空 | 登录凭据，覆盖 URL 里的 `user:pass` |
 | `--mail-from` | 空 | 发信人地址；默认取 `--smtp-user`（多数服务商要求 From 与登录账号同域） |
@@ -460,8 +461,14 @@ drain 迁移、ingest 幂等 + 区间重算、本地 spool 重放。拓扑、启
 
 ## 7. HTTP API 参考
 
-除标注外都需要 `Authorization: Bearer <api key>`。请求体上限 **32 KB**（超出 413），
-请求头上限 64 KB；响应不压缩。
+除标注外都需要 `Authorization: Bearer <api key>`。请求体上限默认 **8 MiB**（超出 413；
+`--max-body <bytes>` / `AIGW_MAX_BODY` 可调，下限 1 KB），请求头上限 64 KB；响应不压缩。
+
+请求体不落盘也不按连接常驻：≤ 32 KiB 用连接内联缓冲（BSS，不分配），更大的按
+`Content-Length` 一次分配到位的堆缓冲，请求结束立即归还；同时在途的大包最多 32 个，
+超了回 **503**（负载保护）而不是把内存吃光。`chat`/`responses` 的 OpenAI 兼容路径
+**不建 JSON DOM**，所以几 MiB 的长上下文也能原样转发给上游；上游请求体上限与这里是同一个值。
+`/v1/responses` 的 `input` 文本另有 4 KB 的结构化存储上限（`previous_response_id` 续轮用）。
 
 ### 业务接口
 

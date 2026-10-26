@@ -559,6 +559,51 @@ AVG=$(awk '{s+=$1} END{printf "%.4f", s/NR}' "$LAT")
 awk -v p="$P99" 'BEGIN{exit !(p>0 && p<1.0)}' || fail "chat p99=$P99"
 echo "CHAT-LAT n=20 avg=${AVG}s p99=${P99}s"
 
+# 4z) 大请求体：>32 KiB 不再 413（默认上限 8 MiB），上游收到完整 body
+python3 - "$TMP/big.json" <<'PY'
+import sys
+blob = (b'{"model":"mock-model","messages":[{"role":"user","content":"'
+        + b'a' * 300000 + b'"}]}')
+with open(sys.argv[1], 'wb') as f:
+    f.write(blob)
+PY
+BIGSZ=$(wc -c < "$TMP/big.json" | tr -d ' ')
+BCODE=$(curl -s --max-time 30 -o "$TMP/big_resp.json" -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  --data-binary "@$TMP/big.json" "$BASE/v1/chat/completions")
+[ "$BCODE" = "200" ] || { cat "$TMP/big_resp.json" >&2; fail "big body status=$BCODE size=$BIGSZ"; }
+grep -q '"usage"' "$TMP/big_resp.json" || { cat "$TMP/big_resp.json" >&2; fail "big body usage"; }
+REQSZ=$(wc -c < "$TMP/req.json" | tr -d ' ')
+[ "$REQSZ" -ge "$BIGSZ" ] || fail "big body truncated upstream: $REQSZ < $BIGSZ"
+grep -q '"upstream-model"' "$TMP/req.json" || fail "big body model not rewritten"
+grep -q '"content":"aaa' "$TMP/req.json" || fail "big body content lost"
+echo "CHAT-BIG size=$BIGSZ upstream=$REQSZ"
+
+# 4z2) 超过 --max-body（默认 8 MiB）→ 413，且服务不受影响
+python3 - "$TMP/huge.json" <<'PY'
+import sys
+chunk = b'a' * 65536
+with open(sys.argv[1], 'wb') as f:
+    f.write(b'{"model":"mock-model","messages":[{"role":"user","content":"')
+    left = 9 * 1024 * 1024
+    while left > 0:
+        w = chunk[:min(left, len(chunk))]
+        f.write(w)
+        left -= len(w)
+    f.write(b'"}]}')
+PY
+HCODE=$(curl -s --max-time 60 -o "$TMP/huge_resp.json" -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  --data-binary "@$TMP/huge.json" "$BASE/v1/chat/completions")
+[ "$HCODE" = "413" ] || { head -c 200 "$TMP/huge_resp.json" >&2; fail "oversize expected 413 got $HCODE"; }
+grep -q 'payload too large' "$TMP/huge_resp.json" || { cat "$TMP/huge_resp.json" >&2; fail "413 body"; }
+AFTER=$(curl -s --max-time 15 -o /dev/null -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  --data '{"model":"mock-model","messages":[{"role":"user","content":"after"}]}' \
+  "$BASE/v1/chat/completions")
+[ "$AFTER" = "200" ] || fail "after oversize status=$AFTER"
+echo "CHAT-413 oversize=$HCODE after=$AFTER"
+
 # 5) 停机后查账本
 kill "$SRV_PID" 2>/dev/null || true
 wait "$SRV_PID" 2>/dev/null || true
@@ -586,5 +631,6 @@ for db in "$SEED_DB" "$TMP/data"/usage-*.db; do
 done
 # D3 的 retry-model 请求也会落一条（32 + 1）
 # D5 的两次 plug-model 调用也落账（33 + 2）
-[ "$COUNT" = "36" ] || fail "usage_ledger count=$COUNT"
+# 4z 的大包请求与超限后的恢复请求各落一条（36 + 2）
+[ "$COUNT" = "38" ] || fail "usage_ledger count=$COUNT"
 echo "CHAT-ALL-OK status=$CODE count=$COUNT"
