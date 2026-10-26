@@ -7,6 +7,9 @@ const LEAF_DER: &[const byte] = @embed("fixtures/chain/leaf.der");
 const INTER_DER: &[const byte] = @embed("fixtures/chain/inter.der");
 const ROOT_PEM: &[const byte] = @embed("fixtures/chain/root.pem");
 const LEAF_PEM: &[const byte] = @embed("fixtures/chain/leaf.pem");
+// 11 个 dNSName 的自签证书：回归「SAN 超过槽位上限就把整条作废」那个 bug
+// （腾讯企业邮 smtp.exmail.qq.com 的叶子就有 11 个名字）。
+const MULTISAN_DER: &[const byte] = @embed("fixtures/chain/multisan.der");
 
 fn put_u24(out: &byte, off: usize, v: usize) void {
     out[off] = ((v / (65536 as usize)) % (256 as usize)) as byte;
@@ -120,3 +123,20 @@ test "missing_intermediate" { run_test("missing_intermediate", test_missing_inte
 test "untrusted_bundle" { run_test("untrusted_bundle", test_untrusted_bundle); }
 test "tampered_leaf" { run_test("tampered_leaf", test_tampered_leaf); }
 test "empty_bundle" { run_test("empty_bundle", test_empty_bundle); }
+
+fn test_multisan() !void {
+    var c: XmCert = xm_empty();
+    try assert_eq_bool(xm_parse(&c, MULTISAN_DER.ptr, MULTISAN_DER.len), true);
+    try assert_eq_i32(c.san_seen as i32, 1);
+    try assert_eq_i32(c.san_n as i32, 11);
+    // 通配名
+    try assert_eq_bool(xm_host_match(&c, &"host.example.test"[0: 17], 17), true);
+    // 第 11 个名字（超过旧上限 8 才出现的那条）
+    try assert_eq_bool(xm_host_match(&c, &"last.example.test"[0: 17], 17), true);
+    // 通配只吃一级标签
+    try assert_eq_bool(xm_host_match(&c, &"a.b.example.test"[0: 16], 16), false);
+    // 不相关的域
+    try assert_eq_bool(xm_host_match(&c, &"example.org"[0: 11], 11), false);
+}
+
+test "multisan" { run_test("multisan", test_multisan); }

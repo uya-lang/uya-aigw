@@ -36,7 +36,7 @@ export const XM_KEY_RSA: u8 = 1;
 export const XM_KEY_EC_P256: u8 = 2;
 export const XM_KEY_EC_P384: u8 = 3;
 
-export const XM_MAX_SAN: usize = 8;
+export const XM_MAX_SAN: usize = 24;
 export const XM_SAN_MAX: usize = 128;
 export const XM_EC_PUB_MAX: usize = 97;
 
@@ -505,8 +505,11 @@ fn xm_parse_key_usage(c: &XmCert, der: &const byte, n: usize, off: usize,
 }
 
 // SAN：只保留 dNSName，其余类型（iPAddress / URI / email）跳过且不参与匹配。
-// 畸形一律**整条作废**（san_seen = false），不做「保留前面几条」—— 部分保留会让一张
-// 畸形证书按剩下的名字匹配成功，那正是 fail-open。
+// **结构性**畸形（SEQUENCE 头不对、元素越界）整条作废（san_seen = false），不做
+// 「保留前面几条」—— 部分保留会让一张畸形证书按剩下的名字匹配成功，那正是 fail-open。
+// 但「单个名字太长 / 槽位用完 / 名字含非 ASCII」只丢那一个名字：我们从不存截断的名字，
+// 丢掉整条只会让匹配更严，不会 fail-open（真实证书很容易超 8 个 SAN，早期版本就因为
+// 这条把腾讯企业邮 `*.exmail.qq.com` 那类多名字证书整条作废，握手报 host mismatch）。
 fn xm_parse_san(c: &XmCert, der: &const byte, n: usize, off: usize,
     len: usize) void {
     c.san_seen = false; c.san_n = 0;
@@ -519,17 +522,19 @@ fn xm_parse_san(c: &XmCert, der: &const byte, n: usize, off: usize,
         var nt: u8 = 0; var ns: usize = 0; var nl: usize = 0;
         if !xm_hdr(der,n,p,&nt,&ns,&nl) || ns + nl > end { return; }
         if nt == (0x82 as u8) {
-            if nl == 0 || nl > XM_SAN_MAX || c.san_n >= XM_MAX_SAN {
-                return;
+            if nl > 0 && nl <= XM_SAN_MAX && c.san_n < XM_MAX_SAN {
+                var k: usize = 0;
+                var good: bool = true;
+                while k < nl {
+                    const ch: byte = xm_get(der,n,ns+k);
+                    if ch == 0 || ch > 127 { good = false; break; }
+                    xm_put(&c.san[0],@len(c.san),c.san_n*XM_SAN_MAX+k,ch);
+                    k = k + 1;
+                }
+                if good {
+                    c.san_len[c.san_n] = nl; c.san_n = c.san_n + 1;
+                }
             }
-            var k: usize = 0;
-            while k < nl {
-                const ch: byte = xm_get(der,n,ns+k);
-                if ch == 0 || ch > 127 { return; }
-                xm_put(&c.san[0],@len(c.san),c.san_n*XM_SAN_MAX+k,ch);
-                k = k + 1;
-            }
-            c.san_len[c.san_n] = nl; c.san_n = c.san_n + 1;
         }
         p = ns + nl;
     }

@@ -636,7 +636,6 @@ docs/                     # overview、tls-provider、spike findings、deploy、
 | `POST /admin/pricing` 恒返回 `400 bad request`，卡与价目都没写进库 | 见 §2.3 原 curl 示例 | 用 SQL 引导价目（§2.3 已验证可行）；价目写入路径待修 |
 | `POST /v1/budget` 金额 ≥ 2147483648 被截断成 32 位 | `{"monthly_nano":10000000000}` → 读回 `1410065408`；`4294967295` 直接 400 | 预算上限暂用 ≤ `2147483647`（≈ $2.14） |
 | 只写 SQL 价目时，`/v1/models`、`/v1/me` 的价格段、`/v1/estimate` 仍空/502，`GET /admin/pricing?model=…` 返回 404 | 见上 | 完整可用配置参考 `tests/seed_main.uya`（`make e2e` 走通的就是这套）；模型/价目解析的引导路径待查 |
-| TLS 客户端不支持 **RSA-PSS** 签名（`rsa_pss_rsae_sha256`，0x0804），与只发 PSS 的服务器握手失败 | `./build/aigw tls probe smtp.exmail.qq.com --port 465` → `status=handshake_failed`（`tls probe example.com` 正常；OpenSSL 同参数可通，ServerKeyExchange 用 RSA-PSS 签） | 受影响的是「服务端用 RSA-PSS 签握手/证书链」的场景（如腾讯企业邮 `smtp.exmail.qq.com`）。变通：本机跑一个明文→SMTPS 的桥接让它代做 TLS（`--smtp 127.0.0.1:2525`）；根治要在 `src/net/x509min.uya` 补 PSS 验签（`EMSA-PSS` + MGF1） |
 
 > 这三项不影响已通过 e2e 的能力（chat/responses/流式/重试/代理/插件/集群），但会影响
 > “从零手工配置一个模型”的体验；修复后应同步更新本节与 §2.3。
