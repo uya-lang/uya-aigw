@@ -1590,6 +1590,7 @@ const SRV_UP_FDS: i32 = 4;
 const SRV_UP_TICK_MS: i32 = 20;
 const SRV_UP_PHASE_OPEN: i32 = 0;
 const SRV_UP_PHASE_BODY: i32 = 1;
+const SRV_UP_PHASE_EVENT: i32 = 2;
 
 struct SrvUpJob {
     used: bool,
@@ -1613,6 +1614,21 @@ struct SrvUpJob {
     st: i32,
     retry_after: u32,
     nowu: u64,
+    // E4：responses 的请求上下文（kind=1 时用）
+    kind: i32,
+    rmodel: [byte: 128],
+    rmodel_len: usize,
+    rinput: [byte: RESP_INPUT_MAX],
+    rinput_len: usize,
+    rprev: [byte: 64],
+    rprev_len: usize,
+    // E4b：流式状态
+    stream_started: bool,
+    sse_done: bool,
+    sse_events: i32,
+    has_ev: bool,
+    usage_found: bool,
+    usage: PriceUsage,
 }
 
 var g_jobs: [SrvUpJob: 32] = [];
@@ -1732,6 +1748,16 @@ fn srv_up_alloc(ci: i32) i32 {
             job.retry_after = 0;
             job.nowu = 0;
             job.uid = 0;
+            job.kind = 0;
+            job.stream_started = false;
+            job.sse_done = false;
+            job.sse_events = 0;
+            job.has_ev = false;
+            job.usage_found = false;
+            job.usage = PriceUsage{ input_tokens: 0, output_tokens: 0, cache_read_tokens: 0 };
+            job.rmodel_len = 0;
+            job.rinput_len = 0;
+            job.rprev_len = 0;
             job.tok_len = 0;
             htc_call_init(&job.call);
             return j;
@@ -1842,12 +1868,159 @@ fn srv_up_respond(j: i32, status: i32, body: &[byte], stats: &ServeStats, drive:
     }
 }
 
+/// E4：responses 非流式的后处理（与阻塞实现等价，只是状态从栈搬到在途槽）。
+fn srv_up_after_resp(j: i32, stats: &ServeStats, drive: bool) void {
+    if j < 0 || (j as usize) >= (SRV_UP_MAX as usize) {
+        return;
+    }
+    const job: &SrvUpJob = &g_jobs[j as usize];
+    if job.ci < 0 || (job.ci as usize) >= SRV_MAX_CONNS {
+        srv_up_release(j);
+        return;
+    }
+    const c: &SrvConn = &g_conns[job.ci as usize];
+    lb_report(job.plan.provider_id, true, store_now());
+    if job.st != 200 {
+        srv_up_respond(j, job.st, job.resp[0: job.rn], stats, drive);
+        return;
+    }
+    var st: i32 = job.st;
+    var rn: usize = job.rn;
+    var d: JsonDoc = JsonDoc{};
+    var out_text: [byte: RESP_OUTPUT_MAX] = [0: RESP_OUTPUT_MAX];
+    var usage: PriceUsage = PriceUsage{ input_tokens: 0, output_tokens: 0, cache_read_tokens: 0 };
+    json_parse(&d, job.resp[0: job.rn]) catch {
+        job.lg.status = 502;
+        srv_up_respond(j, 502, SRV_JSON_502, stats, drive);
+        return;
+    };
+    const out_len: usize = resp_parse_output(&d, json_root(&d), &out_text[0], RESP_OUTPUT_MAX);
+    const has_usage: bool = billing_usage_parse(&d, json_root(&d), &usage);
+    if has_usage {
+        srv_log_usage(&job.lg, &usage, 0);
+    }
+    var tcs: i32 = 0 - 1;
+    var msg: i32 = 0 - 1;
+    const ch0: i32 = json_arr_at(&d, json_get(&d, json_root(&d), &"choices"[0: 7]), 0);
+    if ch0 >= 0 {
+        msg = json_get(&d, ch0, &"message"[0: 7]);
+    }
+    if msg >= 0 {
+        tcs = json_get(&d, msg, &"tool_calls"[0: 10]);
+    }
+    var tcn: usize = 0;
+    if tcs >= 0 {
+        tcn = json_arr_len(&d, tcs);
+    }
+    if (out_len == 0 && tcn == 0) || !has_usage {
+        job.lg.status = 502;
+        srv_up_respond(j, 502, SRV_JSON_502, stats, drive);
+        return;
+    }
+    var settle: BillingResult = BillingResult{ cost_nano: 0, price_nano: 0, rate_version: 0, duplicate: false, found: false };
+    billing_settle_deferred(job.lg.rid[0: job.lg.rid_len], job.uid, store_now(), 0,
+        job.plan.model[0: job.plan.model_len], job.plan.provider_name[0: job.plan.provider_name_len],
+        &usage, &settle) catch {
+        job.lg.status = 502;
+        srv_up_respond(j, 502, SRV_JSON_502, stats, drive);
+        return;
+    };
+    srv_log_usage(&job.lg, &usage, settle.cost_nano);
+    job.lg.ttft_ms = srv_now_ms() -| job.lg.start_ms;
+    resp_store(runtime_db(), job.lg.rid[0: job.lg.rid_len], job.uid, store_now(), job.plan.model[0: job.plan.model_len],
+        job.rprev[0: job.rprev_len], job.rinput[0: job.rinput_len], out_text[0: out_len], &"{}"[0: 2]) catch {
+        job.lg.status = 502;
+        srv_up_respond(j, 502, SRV_JSON_502, stats, drive);
+        return;
+    };
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"id"[0: 2]);
+    jsonw_str(&w, job.lg.rid[0: job.lg.rid_len]);
+    jsonw_key(&w, &"object"[0: 6]);
+    jsonw_str(&w, &"response"[0: 8]);
+    jsonw_key(&w, &"created_at"[0: 10]);
+    jsonw_i64(&w, store_now());
+    jsonw_key(&w, &"model"[0: 5]);
+    jsonw_str(&w, job.plan.model[0: job.plan.model_len]);
+    jsonw_key(&w, &"previous_response_id"[0: 20]);
+    jsonw_str(&w, job.rprev[0: job.rprev_len]);
+    jsonw_key(&w, &"status"[0: 6]);
+    jsonw_str(&w, &"completed"[0: 9]);
+    jsonw_key(&w, &"output"[0: 6]);
+    jsonw_arr(&w);
+    if out_len > 0 || tcn == 0 {
+        jsonw_obj(&w);
+        jsonw_key(&w, &"type"[0: 4]);
+        jsonw_str(&w, &"message"[0: 7]);
+        jsonw_key(&w, &"role"[0: 4]);
+        jsonw_str(&w, &"assistant"[0: 9]);
+        jsonw_key(&w, &"content"[0: 7]);
+        jsonw_arr(&w);
+        jsonw_obj(&w);
+        jsonw_key(&w, &"type"[0: 4]);
+        jsonw_str(&w, &"output_text"[0: 11]);
+        jsonw_key(&w, &"text"[0: 4]);
+        jsonw_str(&w, out_text[0: out_len]);
+        jsonw_end_obj(&w);
+        jsonw_end_arr(&w);
+        jsonw_end_obj(&w);
+    }
+    var ti: usize = 0;
+    while ti < tcn {
+        const tc: i32 = json_arr_at(&d, tcs, ti);
+        var cid: [byte: 128] = [0: 128];
+        const cn: usize = json_str(&d, json_get(&d, tc, &"id"[0: 2]), &cid[0], 128);
+        var fname: [byte: 128] = [0: 128];
+        var fargs: [byte: 2048] = [0: 2048];
+        var fn_n: usize = 0;
+        var fa_n: usize = 0;
+        const fobj: i32 = json_get(&d, tc, &"function"[0: 8]);
+        if fobj >= 0 {
+            fn_n = json_str(&d, json_get(&d, fobj, &"name"[0: 4]), &fname[0], 128);
+            fa_n = json_str(&d, json_get(&d, fobj, &"arguments"[0: 9]), &fargs[0], 2048);
+        }
+        jsonw_obj(&w);
+        jsonw_key(&w, &"type"[0: 4]);
+        jsonw_str(&w, &"function_call"[0: 13]);
+        jsonw_key(&w, &"id"[0: 2]);
+        jsonw_str(&w, cid[0: cn]);
+        jsonw_key(&w, &"call_id"[0: 7]);
+        jsonw_str(&w, cid[0: cn]);
+        jsonw_key(&w, &"name"[0: 4]);
+        jsonw_str(&w, fname[0: fn_n]);
+        jsonw_key(&w, &"arguments"[0: 9]);
+        jsonw_str(&w, fargs[0: fa_n]);
+        jsonw_end_obj(&w);
+        ti = ti + 1;
+    }
+    jsonw_end_arr(&w);
+    jsonw_key(&w, &"usage"[0: 5]);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"input_tokens"[0: 12]);
+    jsonw_i64(&w, usage.input_tokens);
+    jsonw_key(&w, &"output_tokens"[0: 13]);
+    jsonw_i64(&w, usage.output_tokens);
+    jsonw_key(&w, &"cost_nano"[0: 9]);
+    jsonw_i64(&w, settle.cost_nano);
+    jsonw_key(&w, &"price_nano"[0: 10]);
+    jsonw_i64(&w, settle.price_nano);
+    jsonw_end_obj(&w);
+    jsonw_end_obj(&w);
+    srv_up_respond(j, 200, jsonw_span(&w), stats, drive);
+}
+
 /// 上游 200 之后：结算 + 日志字段 + 回包。
 fn srv_up_after(j: i32, stats: &ServeStats, drive: bool) void {
     if j < 0 || (j as usize) >= (SRV_UP_MAX as usize) {
         return;
     }
     const job: &SrvUpJob = &g_jobs[j as usize];
+    if job.kind == 1 {
+        srv_up_after_resp(j, stats, drive);
+        return;
+    }
     lb_report(job.plan.provider_id, true, store_now());
     if job.st != 200 {
         // D3：429/5xx 按 Retry-After 或指数退避重试同一家。
@@ -1899,6 +2072,10 @@ fn srv_up_fail(j: i32, stats: &ServeStats, drive: bool) void {
     }
     const c: &SrvConn = &g_conns[job.ci as usize];
     lb_report(job.plan.provider_id, false, store_now());
+    if job.kind == 1 {
+        srv_up_respond(j, 502, SRV_JSON_502, stats, drive);
+        return;
+    }
     lb_block_for(job.plan.provider_id, store_now(), 30);
     job.attempts = job.attempts +% 1;
     if job.attempts >= 3 {
@@ -1969,7 +2146,7 @@ fn srv_up_spawn(j: i32, stats: &ServeStats, drive: bool) void {
         return;
     };
     job.nowu = nowu;
-    if job.plan.stream {
+    if job.plan.stream && job.kind != 2 {
         // 流式在 E4 之前仍是阻塞实现（已 rare：仅失败转移换到流式上游时）。
         srv_chat_stream(c, &job.plan, &job.cfg, nowu, job.uid, &job.lg);
         srv_log_emit(&job.lg);
@@ -1981,10 +2158,156 @@ fn srv_up_spawn(j: i32, stats: &ServeStats, drive: bool) void {
     }
     job.has_fut = true;
     job.phase = SRV_UP_PHASE_OPEN;
+    const as_stream: bool = job.kind == 2;
+    var dl: u64 = nowu +% 60000;
+    if as_stream {
+        dl = nowu +% 10000;
+    }
     job.fut = htc_open_async(&job.cfg, &g_up_ctx, &"POST"[0: 4],
         job.plan.path[0: job.plan.path_len],
         job.plan.payload[0: job.plan.payload_len],
-        false, nowu, nowu +% 60000, &job.call);
+        as_stream, nowu, dl, &job.call);
+}
+
+/// E4b：流式打开成功 → 发 SSE 头 + 进入逐事件等待。
+fn srv_up_stream_opened(j: i32, stats: &ServeStats) void {
+    if j < 0 || (j as usize) >= (SRV_UP_MAX as usize) {
+        return;
+    }
+    const job: &SrvUpJob = &g_jobs[j as usize];
+    if job.ci < 0 || (job.ci as usize) >= SRV_MAX_CONNS {
+        srv_up_release(j);
+        return;
+    }
+    const c: &SrvConn = &g_conns[job.ci as usize];
+    lb_report(job.plan.provider_id, true, store_now());
+    job.lg.stream = true;
+    // 沿用原实现：SSE 期间把连接切成阻塞发送，不参与写事件
+    const fl: !i32 = sys_fcntl(c.fd, 3, 0);
+    const flags: i32 = fl catch {
+        0;
+    };
+    if flags != 0 {
+        _ = sys_fcntl(c.fd, 4, flags & (0 -% 2049)) catch {};
+    }
+    var head: [byte: 256] = [0: 256];
+    const hn: usize = hsrv_resp_head(&head[0], 256, 200, &SRV_CTYPE_SSE[0: 17], 17,
+        0 as i64, true, false);
+    if !srv_send_all(c.fd, head[0: hn]) {
+        srv_up_stream_end(j, stats);
+        return;
+    }
+    job.stream_started = true;
+    srv_up_stream_next(j, stats);
+}
+
+/// 发起下一次「读一个 SSE 事件」的等待。
+fn srv_up_stream_next(j: i32, stats: &ServeStats) void {
+    if j < 0 || (j as usize) >= (SRV_UP_MAX as usize) {
+        return;
+    }
+    const job: &SrvUpJob = &g_jobs[j as usize];
+    job.phase = SRV_UP_PHASE_EVENT;
+    job.has_ev = false;
+    job.has_fut = true;
+    job.fut = htc_next_event_async(&job.call, &job.has_ev, 5000 as u64);
+    // 不在这里递归 poll：主循环会自旋（armed==0）立刻推进，避免按事件数叠栈。
+    _ = stats;
+}
+
+/// 事件就绪：拼 data: 行 → chunk → 发给客户端，再等下一个。
+fn srv_up_stream_event(j: i32, is_err: bool, rc: i32, stats: &ServeStats) void {
+    if j < 0 || (j as usize) >= (SRV_UP_MAX as usize) {
+        return;
+    }
+    const job: &SrvUpJob = &g_jobs[j as usize];
+    if job.ci < 0 || (job.ci as usize) >= SRV_MAX_CONNS {
+        srv_up_release(j);
+        return;
+    }
+    const c: &SrvConn = &g_conns[job.ci as usize];
+    if is_err || rc == 0 || !job.has_ev {
+        srv_up_stream_end(j, stats);
+        return;
+    }
+    if job.lg.ttft_ms == 0 {
+        job.lg.ttft_ms = srv_now_ms() -| job.lg.start_ms;
+    }
+    if sse_is_done(&job.call.sse) {
+        job.sse_done = true;
+    } else {
+        const dl0: usize = job.call.sse.ev.data_len;
+        if dl0 > 0 && job.call.sse.ev.data[0] == (123 as byte) {
+            var jd: JsonDoc = JsonDoc{};
+            json_parse(&jd, job.call.sse.ev.data[0: dl0]) catch {};
+            if billing_usage_parse(&jd, json_root(&jd), &job.usage) {
+                job.usage_found = true;
+            }
+        }
+    }
+    var eb: [byte: 16384] = [0: 16384];
+    var el: usize = 0;
+    var i: usize = 0;
+    while i < 6 {
+        eb[el] = "data: "[i];
+        el = el + 1;
+        i = i + 1;
+    }
+    const dl: usize = job.call.sse.ev.data_len;
+    i = 0;
+    while i < dl && el < 16380 {
+        eb[el] = job.call.sse.ev.data[i];
+        el = el + 1;
+        i = i + 1;
+    }
+    if el == 0 || eb[el - 1] != (10 as byte) {
+        eb[el] = 10 as byte;
+        el = el + 1;
+    }
+    eb[el] = 10 as byte;
+    el = el + 1;
+    var ob: [byte: 16400] = [0: 16400];
+    const on: usize = hsrv_chunk(&ob[0], 16400, eb[0: el], el);
+    if on == 0 || !srv_send_all(c.fd, ob[0: on]) {
+        srv_up_stream_end(j, stats);
+        return;
+    }
+    sse_consume(&job.call.sse);
+    job.sse_events = job.sse_events +% 1;
+    if job.sse_done || job.sse_events >= 4096 {
+        srv_up_stream_end(j, stats);
+        return;
+    }
+    srv_up_stream_next(j, stats);
+}
+
+/// 流式收尾：补最后一块 → 结算用量 → 关连接 → 释放槽。
+fn srv_up_stream_end(j: i32, stats: &ServeStats) void {
+    if j < 0 || (j as usize) >= (SRV_UP_MAX as usize) {
+        return;
+    }
+    const job: &SrvUpJob = &g_jobs[j as usize];
+    if job.ci < 0 || (job.ci as usize) >= SRV_MAX_CONNS {
+        srv_up_release(j);
+        return;
+    }
+    const c: &SrvConn = &g_conns[job.ci as usize];
+    if job.stream_started {
+        _ = srv_send_all(c.fd, &"0\r\n\r\n"[0: 5]);
+    }
+    if job.usage_found && job.lg.rid_len > 0 {
+        var settle: BillingResult = BillingResult{ cost_nano: 0, price_nano: 0, rate_version: 0, duplicate: false, found: false };
+        billing_settle_deferred(job.lg.rid[0: job.lg.rid_len], job.uid, store_now(), 0,
+            job.plan.model[0: job.plan.model_len],
+            job.plan.provider_name[0: job.plan.provider_name_len], &job.usage, &settle) catch {};
+        srv_log_usage(&job.lg, &job.usage, settle.cost_nano);
+    }
+    if job.lg.status == 0 {
+        job.lg.status = 200;
+    }
+    srv_log_emit(&job.lg);
+    srv_chat_close(c);
+    srv_up_release(j);
 }
 
 fn srv_up_ready(j: i32, is_err: bool, rc: i32, stats: &ServeStats) void {
@@ -1992,9 +2315,22 @@ fn srv_up_ready(j: i32, is_err: bool, rc: i32, stats: &ServeStats) void {
         return;
     }
     const job: &SrvUpJob = &g_jobs[j as usize];
+    if job.phase == SRV_UP_PHASE_EVENT {
+        srv_up_stream_event(j, is_err, rc, stats);
+        return;
+    }
     if job.phase == SRV_UP_PHASE_OPEN {
         if is_err || rc != 0 {
+            if job.kind == 2 {
+                // 还没发 SSE 头，按普通 JSON 502 回（与原实现一致）
+                srv_up_respond(j, 502, SRV_JSON_502, stats, true);
+                return;
+            }
             srv_up_fail(j, stats, true);
+            return;
+        }
+        if job.kind == 2 {
+            srv_up_stream_opened(j, stats);
             return;
         }
         job.phase = SRV_UP_PHASE_BODY;
@@ -2066,6 +2402,9 @@ fn srv_chat_async_try(c: &SrvConn, stats: &ServeStats) bool {
         job.plan.stream = false;
     }
     srv_log_plan(&job.lg, &job.plan);
+    if job.plan.stream {
+        job.kind = 2;
+    }
     c.state = ST_WAIT;
     srv_up_spawn(j, stats, false);
     if job.has_fut {
@@ -3664,12 +4003,139 @@ fn srv_admin_backup(c: &SrvConn, stats: &ServeStats) void {
 // A5：/v1/responses（previous_response_id + 非流式）
 // ---------------------------------------------------------------
 
+/// E4：responses 的协程入口（非流式）。成功挂起返回 true。
+fn srv_responses_async_try(c: &SrvConn, stats: &ServeStats) bool {
+    const ci: i32 = srv_slot_of(c.fd);
+    if ci < 0 {
+        return false;
+    }
+    const j: i32 = srv_up_alloc(ci);
+    if j < 0 || (j as usize) >= (SRV_UP_MAX as usize) {
+        return false;
+    }
+    const job: &SrvUpJob = &g_jobs[j as usize];
+    job.kind = 1;
+    srv_log_init(&job.lg, c, &"responses"[0: 9]);
+    if !runtime_ready() {
+        srv_up_respond(j, 503, SRV_JSON_503, stats, false);
+        return true;
+    }
+    if c.body_overflow {
+        srv_up_respond(j, 413, SRV_JSON_413, stats, false);
+        return true;
+    }
+    var tok: [byte: 256] = [0: 256];
+    const tn: usize = chat_bearer_span(&c.auth[0], c.auth_len, &tok[0], 256);
+    if tn == 0 {
+        srv_up_respond(j, 401, SRV_JSON_401, stats, false);
+        return true;
+    }
+    var key: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
+    store_verify_key_fast(runtime_db(), tok[0: tn], store_now(), &key) catch {
+        srv_up_respond(j, 401, SRV_JSON_401, stats, false);
+        return true;
+    };
+    srv_log_user(&job.lg, key.user_id);
+    job.uid = key.user_id;
+    var d: JsonDoc = JsonDoc{};
+    json_parse(&d, c.body[0: c.body_len]) catch {
+        srv_up_respond(j, 400, SRV_JSON_400, stats, false);
+        return true;
+    };
+    const root: i32 = json_root(&d);
+    job.rmodel_len = json_str(&d, json_get(&d, root, &"model"[0: 5]), &job.rmodel[0], 128);
+    job.rinput_len = json_str(&d, json_get(&d, root, &"input"[0: 5]), &job.rinput[0],
+        RESP_INPUT_MAX);
+    job.rprev_len = json_str(&d, json_get(&d, root, &"previous_response_id"[0: 20]),
+        &job.rprev[0], 64);
+    const want_stream: bool = json_bool(&d, json_get(&d, root, &"stream"[0: 6]));
+    if job.rmodel_len == 0 || job.rinput_len == 0 {
+        srv_up_respond(j, 400, SRV_JSON_400, stats, false);
+        return true;
+    }
+    // 上一轮的输出作为上下文（A5 续轮）
+    var prev_out: [byte: RESP_OUTPUT_MAX] = [0: RESP_OUTPUT_MAX];
+    var prev_out_len: usize = 0;
+    if job.rprev_len > 0 {
+        var r: RespRow = RespRow{};
+        resp_get(runtime_db(), job.rprev[0: job.rprev_len], &r) catch {
+            srv_up_respond(j, 404, SRV_JSON_404, stats, false);
+            return true;
+        };
+        var pi: usize = 0;
+        while pi < r.output_len && pi < RESP_OUTPUT_MAX {
+            prev_out[pi] = r.output_text[pi];
+            pi = pi + 1;
+        }
+        prev_out_len = pi;
+    }
+    var payload: [byte: 32768] = [0: 32768];
+    const pln: usize = resp_build_chat(job.rmodel[0: job.rmodel_len],
+        prev_out[0: prev_out_len], job.rinput[0: job.rinput_len], want_stream,
+        &payload[0], 32768);
+    if pln == 0 {
+        srv_up_respond(j, 502, SRV_JSON_502, stats, false);
+        return true;
+    }
+    var aug: [byte: 32768] = [0: 32768];
+    const augn: usize = resp_augment_payload(payload[0: pln], c.body[0: c.body_len],
+        &aug[0], 32768);
+    var use_payload: &[byte] = payload[0: pln];
+    if augn > 0 {
+        use_payload = aug[0: augn];
+    }
+    chat_prepare_session(runtime_db(), use_payload, tok[0: tn], store_now(), &job.plan) catch {
+        srv_up_respond(j, 400, SRV_JSON_400, stats, false);
+        return true;
+    };
+    if job.plan.stdio {
+        job.plan.stream = false;
+    }
+    srv_log_plan(&job.lg, &job.plan);
+    if job.lg.rid_len == 0 {
+        srv_up_respond(j, 502, SRV_JSON_502, stats, false);
+        return true;
+    }
+    c.state = ST_WAIT;
+    if job.plan.stream {
+        // 流式仍是阻塞实现（E4b 再协程化）
+        var cfg: HttppConfig = httpp_empty();
+        if !upstream_config(&job.plan.host[0], job.plan.host_len, job.plan.port,
+            job.plan.auth_type, &job.plan.secret[0], job.plan.secret_len, &cfg) {
+            srv_up_respond(j, 400, SRV_JSON_400, stats, false);
+            return true;
+        }
+        const nowu: u64 = now_ms() catch {
+            srv_up_respond(j, 502, SRV_JSON_502, stats, false);
+            return true;
+        };
+        srv_responses_stream(c, key.user_id, &job.plan, &cfg, job.lg.rid[0: job.lg.rid_len],
+            job.rinput[0: job.rinput_len], job.rprev[0: job.rprev_len], &job.lg);
+        srv_log_emit(&job.lg);
+        srv_up_release(j);
+        return true;
+    }
+    srv_up_spawn(j, stats, false);
+    if job.has_fut {
+        srv_up_poll_one(j, stats);
+    }
+    return true;
+}
+
+/// E4：responses 非流式走协程路径；槽满时退回阻塞实现。
 fn srv_responses(c: &SrvConn, stats: &ServeStats) void {
+    stats.requests = stats.requests +% 1;
+    if srv_responses_async_try(c, stats) {
+        return;
+    }
+    srv_responses_block(c, stats);
+}
+
+fn srv_responses_block(c: &SrvConn, stats: &ServeStats) void {
     const keep: bool = c.keep;
     var lg: SrvReqLog = SrvReqLog{};
     srv_log_init(&lg, c, &"responses"[0: 9]);
     defer { srv_log_emit(&lg); }
-    stats.requests = stats.requests +% 1;
     if !runtime_ready() {
         lg.status = 503;
         srv_static(c, 503, SRV_JSON_503, keep);

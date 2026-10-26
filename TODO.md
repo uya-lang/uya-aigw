@@ -65,7 +65,7 @@ ingest 幂等 + usage 分片 `hash(user_id)%4`、spool、journal 重放、集群
 - ~~E1 `upstream_post` 的 future 化~~（done：直接 `htc_open_async` / `htc_body_async`）
 - ~~E2 `SrvConn` 在途状态 + 槽表~~（done：`ST_WAIT` + `SrvUpJob`，上限 32）
 - ~~E3 主循环 epoll 接管 future 的 waker fd~~（done：`srv_up_arm` / `srv_up_tick` / `srv_up_need_spin`）
-- E4 把 responses / 流式 SSE 也搬到同一套在途机制（现在这两条路径仍会阻塞事件循环）。
+- E4 responses 非流式、chat 流式已搬进在途槽；**responses 流式**（`srv_responses_stream`）仍是阻塞实现。
 - E5 验收：`make test` 全绿 + 并发基准（8/32 并发吞吐随并发上升、延迟不线性膨胀）。
 
 ## 当前建议顺序
