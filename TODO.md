@@ -52,6 +52,21 @@ ingest 幂等 + usage 分片 `hash(user_id)%4`、spool、journal 重放、集群
 > 已全部补完（D1 每请求日志、D2 连接池、D3 重试退避、D4 代理 CONNECT、
 > D5 `kind=stdio` 插件供应商），每项一次提交，明细见 `TODO_DONE.md`。
 
+## Phase E：handler 协程化（并发吞吐）
+
+> 压测结论（2026-10-26，本机 ab + opencode 上游）：单进程吞吐 ≈ 1/上游延迟（约 0.8 rps），
+> 8 并发时客户端延迟线性涨到 8×，CPU 0.2%；而纯本地端点 `/healthz` 无 keep-alive
+> 17k rps、`/v1/usage` 5k rps、`-k` 时 98k/5.8k rps。根因：请求处理在事件循环里同步
+> `wait_i32` 等上游，等待期间无法处理其它连接。
+
+- E1 新增 `upstream_post_async`（直接 `@await htc_open_async` / `htc_body_async`，不套 `wait_i32`）。
+- E2 `SrvConn` 增加“在途请求”状态：保存 plan/cfg/响应缓冲/request_id/计时，读到请求后
+  进入 `SRV_ST_UPSTREAM` 并立即返回主循环，不再阻塞。
+- E3 主循环把「连接 fd + 在途 future 的 waker fd」一起注册 epoll；future Ready 后
+  继续结算 + 写响应（状态机拆成 `srv_chat_begin` / `srv_chat_finish`）。
+- E4 先做 chat 非流式，再流式 SSE（逐事件 await），最后 responses 与插件路径。
+- E5 验收：`make e2e` 全绿 + 新并发基准（8/32 并发下吞吐应随并发上升，延迟不线性膨胀）。
+
 ## 当前建议顺序
 
 全部阶段（T / A / B / C / D1）已完成；D2→D5 按上面顺序补接线。
