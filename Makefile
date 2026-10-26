@@ -5,7 +5,7 @@ UYA_ROOT ?= /home/winger/uya/uya/lib
 SRC := $(shell find src -name '*.uya' | sort)
 export UYA_ROOT
 
-.PHONY: check test spike clean selftest e2e db_bench ui-e2e cluster-e2e load-sse
+.PHONY: check test spike clean selftest e2e db_bench ui-e2e cluster-e2e mail-e2e load-sse
 
 # 类型检查全部源文件（合并命名空间）
 check:
@@ -37,6 +37,10 @@ load-sse: check
 cluster-e2e:
 	rm -rf .uyacache
 	./tests/cluster_e2e.sh
+
+# OTP 邮件投递：真 SMTP 对话（mock 服务器）+ 慢服务器不阻塞事件循环
+mail-e2e: check
+	./tests/mail_e2e.sh
 
 # 网关端到端：TLS 上游、CLI、事件循环、chat/responses/admin
 e2e:

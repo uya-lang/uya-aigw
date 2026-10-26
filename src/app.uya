@@ -27,8 +27,88 @@ fn arg_u16(p: &byte) u16 {
     return v as u16;
 }
 
+// ---- D7：邮件（OTP 投递）开关的暂存区 ----
+// 放全局 + 独立解析函数：`main()` 里多塞 7 个定长缓冲会让类型检查踩到编译器的一条
+// 调试分支（DEBUG_BYTE_PTR_SUBSCRIPT_ERROR，和栈帧布局有关），挪出来最省事。
+var g_ma: MailArgs = MailArgs{};
+
+/// 把 argv[k] 的值拷进对应的暂存区（which 见调用点）。
+fn mail_arg_set(which: i32, k: i32) void {
+    const v: &byte = get_argv(k);
+    const vn: usize = arg_len(v);
+    var c: usize = 0;
+    if which == 0 {
+        while c < vn && c < MAIL_URL_MAX {
+            g_ma.url[c] = v[c];
+            c = c + 1;
+        }
+        g_ma.url_len = c;
+    } else if which == 1 {
+        while c < vn && c < SMTP_USER_MAX {
+            g_ma.user[c] = v[c];
+            c = c + 1;
+        }
+        g_ma.user_len = c;
+    } else if which == 2 {
+        while c < vn && c < SMTP_PASS_MAX {
+            g_ma.pass[c] = v[c];
+            c = c + 1;
+        }
+        g_ma.pass_len = c;
+    } else if which == 3 {
+        while c < vn && c < MAIL_FROM_MAX {
+            g_ma.from[c] = v[c];
+            c = c + 1;
+        }
+        g_ma.from_len = c;
+    } else if which == 4 {
+        while c < vn && c < SMTP_EHLO_MAX {
+            g_ma.hostname[c] = v[c];
+            c = c + 1;
+        }
+        g_ma.hostname_len = c;
+    } else if which == 5 {
+        while c < vn && c < MAIL_CA_MAX {
+            g_ma.ca[c] = v[c];
+            c = c + 1;
+        }
+        g_ma.ca_len = c;
+    } else if which == 6 {
+        while c < vn && c < MAIL_CMD_MAX {
+            g_ma.cmd[c] = v[c];
+            c = c + 1;
+        }
+        g_ma.cmd_len = c;
+    }
+}
+
+/// 单独扫一遍 argv 取邮件开关（值缺失的交给 mailer_init 读环境变量）。
+fn mail_args_scan(argc: i32) void {
+    var k: i32 = 2;
+    while k + 1 < argc {
+        const f: &byte = get_argv(k);
+        if arg_eq(f, "--smtp" as &const byte) {
+            mail_arg_set(0, k + 1);
+        } else if arg_eq(f, "--smtp-user" as &const byte) {
+            mail_arg_set(1, k + 1);
+        } else if arg_eq(f, "--smtp-pass" as &const byte) {
+            mail_arg_set(2, k + 1);
+        } else if arg_eq(f, "--mail-from" as &const byte) {
+            mail_arg_set(3, k + 1);
+        } else if arg_eq(f, "--mail-hostname" as &const byte) {
+            mail_arg_set(4, k + 1);
+        } else if arg_eq(f, "--mail-ca" as &const byte) {
+            mail_arg_set(5, k + 1);
+        } else if arg_eq(f, "--mail-relay-cmd" as &const byte) {
+            mail_arg_set(6, k + 1);
+        }
+        // 逐个 token 扫（不是两两配对）：`--dev-otp` 这类无值开关会把配对错位。
+        k = k + 1;
+    }
+}
+
 fn usage() i32 {
-    printf("usage:\n  aigw serve [--host 0.0.0.0] [--port 8080] [--db data/aigw.db] [--data-dir data] [--ca <pem>] [--proxy http://host:port] [--no-proxy a,b] [--plugin-cmd \"cmd args\"]\n  aigw tls probe <host> [--port N] [--ca <pem>]\n  aigw tls pin <host> <sha256hex> [--file <tsv>]\n" as *byte);
+    printf("usage:\n  aigw serve [--host 0.0.0.0] [--port 8080] [--db data/aigw.db] [--data-dir data] [--ca <pem>] [--proxy http://host:port] [--no-proxy a,b] [--plugin-cmd \"cmd args\"]\n             [--smtp smtp://host[:port]|smtps://host] [--smtp-user u] [--smtp-pass p] [--mail-from a@b] [--mail-ca <pem>]\n  aigw tls probe <host> [--port N] [--ca <pem>]\n  aigw tls pin <host> <sha256hex> [--file <tsv>]\n  aigw smtp-relay          # 内部用法（mailer 子进程：stdin 读作业 JSON）\n" as *byte);
     return 2;
 }
 
@@ -285,9 +365,21 @@ export fn main() i32 {
                 plglen = m;
             }
         }
+        // D7：邮件（OTP 投递）开关单独扫一遍；URL/发信人非法就让启动失败，
+        // 别带着坏配置跑起来再在登录时莫名其妙失败。
+        mail_args_scan(argc);
+        mailer_init(g_ma) catch {
+            printf("invalid smtp config (--smtp expects smtp://host[:port] or smtps://host; --mail-from needs an address)\n" as *byte);
+            return 1;
+        };
         return serve_main(host[0: host_len], port, dbf[0: dblen], dat[0: datlen],
             ca[0: calen], dev_otp, adm[0: admlen], meta[0: metalen], nid[0: nidlen],
             upl[0: upllen], prx[0: prxlen], npx[0: npxlen], plg[0: plglen]);
+    }
+
+    // ---- smtp-relay：mailer fork 出来的子进程，从 stdin 读一条作业 JSON，阻塞发信 ----
+    if arg_eq(a1, "smtp-relay" as &const byte) {
+        return mailer_relay_main();
     }
 
     if argc < 4 {

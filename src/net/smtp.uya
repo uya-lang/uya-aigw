@@ -1,0 +1,503 @@
+// src/net/smtp.uya — SMTP 传输与对话（在**子进程**里跑，见 src/core/mailer.uya）
+//
+// 为什么是子进程：SMTP 是「多轮往返 + 可能慢到几十秒」的协议（目标服务器限速、
+// 拒信、DNS 慢、TLS 握手慢），放进网关的单线程 epoll 里同步做会把所有在途请求
+// 一起卡住 —— 这正是 Phase E 刚拆掉的那种结构。父进程只 fork + 写一行作业就返回。
+//
+// 为什么这里用**阻塞** I/O：子进程没有事件循环，也不需要照顾其它连接；阻塞读写 +
+// `poll` 超时是这里最简单、最不容易出错的形状。整个对话是同步的
+// （`smtp_deliver` 普通函数），只有 DNS 与 TLS 借用 std 的 async 原语 ——
+// 每次都是**单独一层** `block_on`，不把多层 async 组合塞进一个大函数。
+//
+// 这一层只做「一次投递」：连（DNS → TCP → 可选 TLS）→ EHLO → 可选 STARTTLS →
+// 可选 AUTH → MAIL FROM → RCPT TO → DATA → QUIT。协议细节（解析/组包）在
+// src/net/smtp_msg.uya，那里有单测。
+
+use libc.syscall;
+use std.async;
+use std.encoding.base64.encode_base64;
+
+export const SMTP_NET_RESOLV_MAX: usize = 512;
+export const SMTP_NET_BUNDLE_MAX: usize = 16384;
+export const SMTP_NET_PINS_MAX: usize = 2048;
+/// 整封邮件（头 + base64 正文）的上限。
+export const SMTP_MSG_MAX: usize = 8192;
+
+/// TLS 用的最小上下文（比 HtcCtx 精简：不建连接池、不走代理）。
+/// `bundle_len == 0` 时 `TLSX_MODE_CHAIN` 会退到系统信任库。
+export struct SmtpNet {
+    cache: DnsxCache,
+    resolv: [byte: SMTP_NET_RESOLV_MAX],
+    resolv_len: usize,
+    bundle: [byte: SMTP_NET_BUNDLE_MAX],
+    bundle_len: usize,
+    pins: [byte: SMTP_NET_PINS_MAX],
+    pin_count: usize,
+    tofu: TlsxPins,
+}
+
+export fn smtp_net_init(n: &SmtpNet) void {
+    dnsx_cache_init(&n.cache);
+    dnsx_load_resolv(&n.resolv[0], SMTP_NET_RESOLV_MAX, &n.resolv_len);
+    n.bundle_len = 0;
+    n.pin_count = 0;
+    tlsx_pins_init(&n.tofu);
+}
+
+/// 读一个 PEM 文卷进 trust bundle（`--ca` / job 里的 `ca` 字段）。失败返回 false。
+export fn smtp_net_load_ca(n: &SmtpNet, path: &[byte]) bool {
+    if path.len == 0 || path.len >= 512 {
+        return false;
+    }
+    var p: [byte: 512] = [0: 512];
+    var i: usize = 0;
+    while i < path.len {
+        p[i] = path[i];
+        i = i + 1;
+    }
+    p[i] = 0 as byte;
+    const fd: i32 = sys_open(&p[0] as *const byte, 0 as i32, 0) catch {
+        return false;
+    };
+    defer { _ = sys_close(fd) catch {}; }
+    var off: usize = 0;
+    while off < SMTP_NET_BUNDLE_MAX {
+        const r: !isize = sys_read(fd, &n.bundle[off], SMTP_NET_BUNDLE_MAX - off);
+        const got: isize = r catch {
+            return false;
+        };
+        if got <= 0 {
+            break;
+        }
+        off = off +% (got as usize);
+    }
+    n.bundle_len = off;
+    return off > 0;
+}
+
+/// 现在（**墙上时钟**毫秒）。必须用墙上时钟：std 的 async 截止时间是拿
+/// gettimeofday 比大小的，喂它单调时钟会让每个 `block_on` 立刻判超时。
+export fn smtp_now_ms() u64 {
+    var tv: TimeVal = TimeVal{ tv_sec: 0, tv_usec: 0 };
+    const r: !i32 = sys_gettimeofday(&tv, null as &void);
+    _ = r catch {
+        return 0;
+    };
+    const secs: u64 = (tv.tv_sec as u64) *% (1000 as u64);
+    const us: u64 = (tv.tv_usec as u64) / (1000 as u64);
+    return secs +% us;
+}
+
+/// 现在（墙上时钟秒，给 Date 头用）。
+export fn smtp_now_sec() i64 {
+    var tv: TimeVal = TimeVal{ tv_sec: 0, tv_usec: 0 };
+    const r: !i32 = sys_gettimeofday(&tv, null as &void);
+    _ = r catch {
+        return 0;
+    };
+    return tv.tv_sec;
+}
+
+/// `smtp_deliver` 的临时缓冲（放在结构体里是为了避开编译器对裸数组切片的毛病）。
+struct SmtpScratch {
+    ehlo: [byte: 128],
+    b64: [byte: 512],
+    plain: [byte: 384],
+    aline: [byte: 640],
+    line: [byte: 640],
+}
+
+struct SmtpSession {
+    fd: i32,
+    tls: bool,
+    conn: TlsxConn,
+}
+
+fn smtp_b64(dst: &byte, cap: usize, src: &[byte]) !usize {
+    return encode_base64(src, dst[0: cap]);
+}
+
+/// 把 fd 切回阻塞模式（`tcpx_connect_v4` 交出来的是非阻塞的）。
+fn smtp_set_blocking(fd: i32) !void {
+    const flags: i32 = try sys_fcntl(fd, F_GETFL, 0);
+    _ = try sys_fcntl(fd, F_SETFL, flags & (~O_NONBLOCK));
+    return;
+}
+
+/// 等 fd 可读/可写，直到 deadline（0 = 不设超时）。超时返回 SmtpTimeout。
+fn smtp_wait_fd(fd: i32, events: i16, deadline: u64) !void {
+    var pfd: PollFd = PollFd{ fd: fd, events: events, revents: 0 as i16 };
+    var budget: i32 = 0 - 1;
+    if deadline != 0 {
+        const now: u64 = smtp_now_ms();
+        if now >= deadline {
+            return error.SmtpTimeout;
+        }
+        const left: u64 = deadline - now;
+        if left > 600000 {
+            budget = 600000;
+        } else {
+            budget = left as i32;
+        }
+    }
+    const n: i32 = sys_poll(&pfd, 1, budget) catch {
+        return error.SmtpClosed;
+    };
+    if n == 0 {
+        return error.SmtpTimeout;
+    }
+    const rev: i16 = pfd.revents;
+    if (rev & POLLERR) != 0 || (rev & POLLNVAL) != 0 {
+        return error.SmtpClosed;
+    }
+    if (rev & events) == 0 && (rev & POLLHUP) == 0 {
+        return error.SmtpClosed;
+    }
+    return;
+}
+
+/// 整块写出去（阻塞 + deadline）。
+fn smtp_write_all(sess: &SmtpSession, src: &byte, n: usize, deadline: u64) !void {
+    if n == 0 {
+        return;
+    }
+    var off: usize = 0;
+    while off < n {
+        var w: usize = 0;
+        if sess.tls {
+            // `tlsx_write_async` 没有超时参数：真挂住的话由父进程 30s SIGKILL 兜底
+            // （见 MAIL_KILL_MS），这里只把错误翻成 SmtpClosed。
+            const r: !usize = block_on<usize>(tlsx_write_async(&sess.conn,
+                &src[off] as &const byte, n - off));
+            w = r catch {
+                return error.SmtpClosed;
+            };
+        } else {
+            try smtp_wait_fd(sess.fd, POLLOUT, deadline);
+            const r: !isize = sys_write(sess.fd, &src[off] as *const byte, n - off);
+            const got: isize = r catch {
+                return error.SmtpClosed;
+            };
+            if got <= 0 {
+                return error.SmtpClosed;
+            }
+            w = got as usize;
+        }
+        if w == 0 {
+            return error.SmtpClosed;
+        }
+        off = off +% w;
+    }
+    return;
+}
+
+/// 读一批（阻塞 + deadline）。
+fn smtp_read_some(sess: &SmtpSession, out: &byte, max: usize, deadline: u64) !usize {
+    if max == 0 {
+        return 0 as usize;
+    }
+    if sess.tls {
+        // `tlsx_read_deadline_async` 收的是**相对**空闲预算，这里换算成剩余时间。
+        var idle: u64 = 1;
+        if deadline != 0 {
+            const now: u64 = smtp_now_ms();
+            if now >= deadline {
+                return error.SmtpTimeout;
+            }
+            idle = deadline - now;
+        }
+        const r: !usize = block_on<usize>(tlsx_read_deadline_async(&sess.conn, out, max, idle));
+        return r catch {
+            return error.SmtpClosed;
+        };
+    }
+    try smtp_wait_fd(sess.fd, POLLIN, deadline);
+    const r: !isize = sys_read(sess.fd, out, max);
+    const got: isize = r catch {
+        return error.SmtpClosed;
+    };
+    if got < 0 {
+        return error.SmtpClosed;
+    }
+    return got as usize;
+}
+
+/// 读一条应答（多行也算一条），成功写 `code`。
+fn smtp_read_reply(sess: &SmtpSession, deadline: u64, code: &i32) !void {
+    var buf: [byte: SMTP_REPLY_MAX] = [0: SMTP_REPLY_MAX];
+    var have: usize = 0;
+    while true {
+        var used: usize = 0;
+        var cd: i32 = 0;
+        const p: i32 = smtp_parse_reply(&buf[0] as &const byte, have, &cd, &used);
+        if p == 1 {
+            code[0] = cd;
+            return;
+        }
+        if p < 0 {
+            return error.SmtpBadReply;
+        }
+        if have >= SMTP_REPLY_MAX {
+            return error.SmtpBadReply;
+        }
+        const n: usize = try smtp_read_some(sess, &buf[have], SMTP_REPLY_MAX - have, deadline);
+        if n == 0 {
+            return error.SmtpClosed;
+        }
+        have = have +% n;
+    }
+    return;
+}
+
+/// 发一行（自动补 CRLF）+ 读一条应答。应答语义由调用方判。
+fn smtp_cmd(sess: &SmtpSession, line: &[byte], deadline: u64, code: &i32) !void {
+    var buf: [byte: 1024] = [0: 1024];
+    var n: usize = 0;
+    if !smtp_append(&buf[0], 1024, &n, line) {
+        return error.SmtpBadReply;
+    }
+    if !smtp_append(&buf[0], 1024, &n, &"\r\n"[0: 2]) {
+        return error.SmtpBadReply;
+    }
+    try smtp_write_all(sess, &buf[0] as &const byte, n, deadline);
+    try smtp_read_reply(sess, deadline, code);
+    return;
+}
+
+/// 在已连通的 fd 上做 TLS（STARTTLS 与隐式 TLS 共用）。
+fn smtp_tls_open(sess: &SmtpSession, n: &SmtpNet, c: &const SmtpCfg, now: u64) !void {
+    const r: !i32 = block_on<i32>(tlsx_conn_open_async(sess.fd, &c.host[0: c.host_len],
+        TLSX_MODE_CHAIN, &n.pins[0], n.pin_count, &n.bundle[0], n.bundle_len,
+        &n.tofu, false, now, &sess.conn));
+    _ = r catch {
+        return error.SmtpTlsFailed;
+    };
+    sess.tls = true;
+    return;
+}
+
+/// 解析主机名（DNS 用 std 的 async 客户端，这里只包一层 block_on）。
+fn smtp_resolve(n: &SmtpNet, host: &[byte], addrs: &DnsxAddrs) !void {
+    const fut: Future<!i32> = dnsx_resolve_async(host, &n.cache,
+        n.resolv[0: n.resolv_len], smtp_now_ms(), addrs);
+    const r: !i32 = block_on<i32>(fut);
+    const rr: i32 = r catch {
+        return error.SmtpNoAddress;
+    };
+    if rr != 1 || addrs.v4_n == 0 {
+        return error.SmtpNoAddress;
+    }
+    return;
+}
+
+/// 一次完整投递。成功返回 0；失败见上面各 error 名
+/// （SmtpClosed/SmtpTimeout/SmtpBadReply/SmtpTlsFailed/SmtpAuthFailed/
+/// SmtpRejected/SmtpNoAddress/SmtpConnectFailed）。
+export fn smtp_deliver(n: &SmtpNet, c: &const SmtpCfg, from: &[byte], to: &[byte],
+    subject: &[byte], body: &[byte], budget_ms: u64) !i32 {
+    if c.host_len == 0 || c.port == 0 {
+        return error.SmtpBadUrl;
+    }
+    if !smtp_addr_ok(from) || !smtp_addr_ok(to) {
+        return error.SmtpBadAddress;
+    }
+    if !smtp_subject_ok(subject) {
+        return error.SmtpBadSubject;
+    }
+    var budget: u64 = budget_ms;
+    if budget == 0 || budget > 600000 {
+        budget = 20000;
+    }
+    const t0: u64 = smtp_now_ms();
+    var deadline: u64 = 0;
+    if t0 != 0 {
+        deadline = t0 +% budget;
+    }
+
+    var addrs: DnsxAddrs = DnsxAddrs{};
+    try smtp_resolve(n, c.host[0: c.host_len], &addrs);
+
+    var sc: SmtpScratch = SmtpScratch{};
+    var sess: SmtpSession = SmtpSession{ fd: 0 - 1, tls: false, conn: tlsx_conn_empty() };
+    defer {
+        if sess.tls {
+            tlsx_conn_free(&sess.conn);
+        }
+        if sess.fd >= 0 {
+            _ = sys_close(sess.fd) catch {};
+        }
+    }
+
+    var timeout_ms: u32 = 20000;
+    if deadline != 0 {
+        const now: u64 = smtp_now_ms();
+        if now >= deadline {
+            return error.SmtpTimeout;
+        }
+        const left: u64 = deadline - now;
+        if left < 600000 {
+            timeout_ms = left as u32;
+        }
+    }
+    const fd: i32 = tcpx_connect_v4(&addrs.v4[0], c.port, timeout_ms) catch {
+        return error.SmtpConnectFailed;
+    };
+    sess.fd = fd;
+    try smtp_set_blocking(fd);
+
+    // 隐式 TLS（smtps://，通常 465）：连上就握手。
+    if c.mode == SMTP_MODE_TLS {
+        try smtp_tls_open(&sess, n, c, t0);
+    }
+
+    var code: i32 = 0;
+    try smtp_read_reply(&sess, deadline, &code);
+    if code != 220 {
+        return error.SmtpRejected;
+    }
+
+    var eh: usize = 0;
+    if !smtp_append(&sc.ehlo[0], 128, &eh, &"EHLO "[0: 5]) {
+        return error.SmtpRejected;
+    }
+    if !smtp_append(&sc.ehlo[0], 128, &eh, c.hostname[0: c.hostname_len]) {
+        return error.SmtpRejected;
+    }
+    try smtp_cmd(&sess, sc.ehlo[0: eh], deadline, &code);
+    if code != 250 {
+        return error.SmtpRejected;
+    }
+
+    if c.mode == SMTP_MODE_STARTTLS {
+        try smtp_cmd(&sess, &"STARTTLS"[0: 8], deadline, &code);
+        if code != 220 {
+            return error.SmtpRejected;
+        }
+        try smtp_tls_open(&sess, n, c, t0);
+        // 升级后必须重新 EHLO（RFC 3207）
+        try smtp_cmd(&sess, sc.ehlo[0: eh], deadline, &code);
+        if code != 250 {
+            return error.SmtpRejected;
+        }
+    }
+
+    if c.user_len > 0 {
+        try smtp_cmd(&sess, &"AUTH LOGIN"[0: 10], deadline, &code);
+        var auth_ok: bool = false;
+        if code == 334 {
+            const un: usize = smtp_b64(&sc.b64[0], 512, c.user[0: c.user_len]) catch {
+                return error.SmtpAuthFailed;
+            };
+            try smtp_cmd(&sess, sc.b64[0: un], deadline, &code);
+            if code == 334 {
+                const pn: usize = smtp_b64(&sc.b64[0], 512, c.pass[0: c.pass_len]) catch {
+                    return error.SmtpAuthFailed;
+                };
+                try smtp_cmd(&sess, sc.b64[0: pn], deadline, &code);
+            }
+            if code == 235 || code == 503 {
+                auth_ok = true;
+            } else if code == 535 || code == 534 {
+                return error.SmtpAuthFailed;
+            }
+        } else if code == 500 || code == 504 {
+            // 服务器不认 AUTH LOGIN：退回 AUTH PLAIN（一次发完 \0user\0pass）
+            sc.plain[0] = 0 as byte;
+            var k: usize = 1;
+            var u: usize = 0;
+            while u < c.user_len && k < 384 {
+                sc.plain[k] = c.user[u];
+                k = k + 1;
+                u = u + 1;
+            }
+            if k < 384 {
+                sc.plain[k] = 0 as byte;
+                k = k + 1;
+            }
+            var pw: usize = 0;
+            while pw < c.pass_len && k < 384 {
+                sc.plain[k] = c.pass[pw];
+                k = k + 1;
+                pw = pw + 1;
+            }
+            const pbn: usize = smtp_b64(&sc.b64[0], 512, sc.plain[0: k]) catch {
+                return error.SmtpAuthFailed;
+            };
+            var ap: usize = 0;
+            if !smtp_append(&sc.aline[0], 640, &ap, &"AUTH PLAIN "[0: 11]) {
+                return error.SmtpAuthFailed;
+            }
+            if !smtp_append(&sc.aline[0], 640, &ap, sc.b64[0: pbn]) {
+                return error.SmtpAuthFailed;
+            }
+            try smtp_cmd(&sess, sc.aline[0: ap], deadline, &code);
+            if code == 235 || code == 503 {
+                auth_ok = true;
+            } else if code == 535 || code == 534 {
+                return error.SmtpAuthFailed;
+            }
+        } else if code == 235 || code == 503 {
+            auth_ok = true;
+        }
+        if !auth_ok {
+            return error.SmtpAuthFailed;
+        }
+    }
+
+    var lp: usize = 0;
+    if !smtp_append(&sc.line[0], 640, &lp, &"MAIL FROM:<"[0: 11]) {
+        return error.SmtpBadAddress;
+    }
+    if !smtp_append(&sc.line[0], 640, &lp, from) {
+        return error.SmtpBadAddress;
+    }
+    if !smtp_append(&sc.line[0], 640, &lp, &">"[0: 1]) {
+        return error.SmtpBadAddress;
+    }
+    try smtp_cmd(&sess, sc.line[0: lp], deadline, &code);
+    if code != 250 {
+        return error.SmtpRejected;
+    }
+
+    lp = 0;
+    if !smtp_append(&sc.line[0], 640, &lp, &"RCPT TO:<"[0: 9]) {
+        return error.SmtpBadAddress;
+    }
+    if !smtp_append(&sc.line[0], 640, &lp, to) {
+        return error.SmtpBadAddress;
+    }
+    if !smtp_append(&sc.line[0], 640, &lp, &">"[0: 1]) {
+        return error.SmtpBadAddress;
+    }
+    try smtp_cmd(&sess, sc.line[0: lp], deadline, &code);
+    if code != 250 && code != 251 {
+        return error.SmtpRejected;
+    }
+
+    try smtp_cmd(&sess, &"DATA"[0: 4], deadline, &code);
+    if code != 354 {
+        return error.SmtpRejected;
+    }
+
+    // 正文：整封组好后一次写出（几 KB，够小），末尾 `.` + CRLF 结束 DATA。
+    var msg: [byte: SMTP_MSG_MAX] = [0: SMTP_MSG_MAX];
+    const now_sec: i64 = smtp_now_sec();
+    const built: usize = smtp_build_message(c, from, to, subject, body, now_sec,
+        now_sec, &msg[0], SMTP_MSG_MAX);
+    if built == 0 {
+        return error.SmtpBadMessage;
+    }
+    var mn: usize = built;
+    if !smtp_append(&msg[0], SMTP_MSG_MAX, &mn, &".\r\n"[0: 3]) {
+        return error.SmtpBadMessage;
+    }
+    try smtp_write_all(&sess, &msg[0] as &const byte, mn, deadline);
+    try smtp_read_reply(&sess, deadline, &code);
+    if code != 250 {
+        return error.SmtpRejected;
+    }
+
+    // QUIT 的应答不可靠（很多服务器直接断），失败不算投递失败。
+    smtp_cmd(&sess, &"QUIT"[0: 4], deadline, &code) catch {};
+    return 0;
+}

@@ -28,6 +28,7 @@ extern fn aigw_pool_wait_nohang(pid: i32, status: &i32) i32;
 extern fn aigw_pool_wait(pid: i32, status: &i32) i32;
 extern fn aigw_pool_kill(pid: i32, sig: i32) i32;
 extern fn aigw_pool_poll(fd: i32, events: i32, timeout_ms: i32) i32;
+extern fn aigw_pool_read(fd: i32, buf: *byte, cap: i32) i32;
 extern fn aigw_pool_ignore_sigpipe() void;
 
 /// 池容量上限（编译期固定，槽表放 .bss）。

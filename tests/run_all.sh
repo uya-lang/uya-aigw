@@ -54,6 +54,7 @@ run src/core/json.uya tests/test_json.uya
 run src/core/dbx.uya src/core/schema.uya src/core/money.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/backup.uya src/core/journal.uya src/core/billing.uya src/cluster/shard.uya tests/test_billing.uya
 run src/core/dbx.uya src/core/schema.uya src/core/store.uya src/core/money.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/backup.uya src/core/journal.uya src/core/billing.uya src/core/batch.uya src/cluster/shard.uya tests/test_batch.uya
 run src/core/notify.uya src/cluster/spool.uya src/core/json.uya tests/test_notify.uya
+run src/net/smtp_msg.uya tests/test_smtp.uya
 run src/core/dbx.uya src/core/schema.uya src/core/store.uya src/core/money.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/backup.uya src/core/journal.uya src/core/billing.uya src/core/batch.uya src/core/lb.uya src/core/responses.uya src/core/chat.uya src/cluster/shard.uya tests/test_chat.uya
 run src/foundation/buf.uya src/net/httpsrv.uya tests/test_httpsrv.uya
 run src/foundation/buf.uya src/core/money.uya src/core/reqlog.uya tests/test_reqlog.uya
@@ -67,5 +68,7 @@ echo "== http server (A1)"
 echo "== chat e2e (auth/route/upstream/ledger)"
 ./tests/chat_e2e.sh 2>&1 | grep -a "CHAT-ALL-OK"
 ./tests/cluster_e2e.sh 2>&1 | grep -a "CLUSTER-ALL-OK"
+echo "== mail (SMTP 投递)"
+./tests/mail_e2e.sh 2>&1 | grep -a "MAIL-OK"
 ./tests/sse_load.sh 1000 20 2>&1 | grep -a "LOAD-OK"
 echo "ALL GREEN"

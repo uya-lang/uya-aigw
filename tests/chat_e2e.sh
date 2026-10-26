@@ -149,7 +149,7 @@ UYA_ROOT="$UYA_ROOT" "$UYA" build \
   src/net/x509min.uya src/net/chainx.uya src/net/urlx.uya src/net/dnsx.uya \
   src/net/tlsx.uya src/net/tlsx_conn.uya src/net/httpc.uya src/net/ssex.uya \
   src/net/httpc_pool.uya src/net/proxyx.uya src/providers/http.uya \
-  src/providers/httpcall.uya src/plugins/pool.uya src/providers/plug.uya src/cli/tls_cmd.uya src/app.uya \
+  src/providers/httpcall.uya src/plugins/pool.uya src/providers/plug.uya src/cli/tls_cmd.uya src/net/smtp_msg.uya src/net/smtp.uya src/core/mailer.uya src/app.uya \
   -o build/aigw >"$TMP/build.log" 2>&1 || { cat "$TMP/build.log" >&2; fail "aigw build"; }
 
 ./build/aigw serve --host 127.0.0.1 --port 0 --db "$SEED_DB" --data-dir "$TMP/data" \

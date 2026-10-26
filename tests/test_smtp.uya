@@ -1,0 +1,242 @@
+// tests/test_smtp.uya — SMTP 纯逻辑单测（URL 解析 / 应答解析 / RFC 5322 组包）
+//
+// 网络部分（src/net/smtp.uya）由 tests/mail_e2e.sh 用 mock SMTP 服务器覆盖。
+use std.testing.assert_eq_i32;
+use std.testing.assert_eq_bool;
+use std.testing.run_test;
+use std.encoding.base64.decode_base64;
+
+fn eq_str(actual: &[byte], expected: &[byte]) bool {
+    if actual.len != expected.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < actual.len {
+        if actual[i] != expected[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// 在 buf 里找 needle，返回起始下标；找不到返回 buf 长度。
+fn find_in(buf: &[byte], needle: &[byte]) usize {
+    if needle.len == 0 || buf.len < needle.len {
+        return buf.len;
+    }
+    var i: usize = 0;
+    while i + needle.len <= buf.len {
+        var j: usize = 0;
+        var ok: bool = true;
+        while j < needle.len {
+            if buf[i + j] != needle[j] {
+                ok = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if ok {
+            return i;
+        }
+        i = i + 1;
+    }
+    return buf.len;
+}
+
+fn test_url_basic() !void {
+    var c: SmtpCfg = smtp_cfg_empty();
+    // smtp:// → 587 + STARTTLS
+    try smtp_parse_url(&"smtp://mail.example.com"[0: 23], &c);
+    try assert_eq_bool(eq_str(c.host[0: c.host_len], &"mail.example.com"[0: 16]), true);
+    try assert_eq_i32(c.port as i32, 587);
+    try assert_eq_i32(c.mode as i32, SMTP_MODE_STARTTLS as i32);
+    try assert_eq_i32(c.user_len as i32, 0);
+    // smtps:// → 465 + 隐式 TLS
+    var c2: SmtpCfg = smtp_cfg_empty();
+    try smtp_parse_url(&"smtps://mail.example.com"[0: 24], &c2);
+    try assert_eq_i32(c2.port as i32, 465);
+    try assert_eq_i32(c2.mode as i32, SMTP_MODE_TLS as i32);
+    // 无 scheme → 明文 25
+    var c3: SmtpCfg = smtp_cfg_empty();
+    try smtp_parse_url(&"relay.local:25"[0: 14], &c3);
+    try assert_eq_bool(eq_str(c3.host[0: c3.host_len], &"relay.local"[0: 11]), true);
+    try assert_eq_i32(c3.port as i32, 25);
+    try assert_eq_i32(c3.mode as i32, SMTP_MODE_PLAIN as i32);
+    // EHLO 名默认 localhost
+    try assert_eq_bool(eq_str(c3.hostname[0: c3.hostname_len], &"localhost"[0: 9]), true);
+}
+
+fn test_url_userinfo() !void {
+    var c: SmtpCfg = smtp_cfg_empty();
+    try smtp_parse_url(&"smtp://bot:p%40ss%3Aword@mail.example.com:2525"[0: 46], &c);
+    try assert_eq_i32(c.port as i32, 2525);
+    try assert_eq_bool(eq_str(c.user[0: c.user_len], &"bot"[0: 3]), true);
+    // %40 → @、%3A → :
+    try assert_eq_bool(eq_str(c.pass[0: c.pass_len], &"p@ss:word"[0: 9]), true);
+    // 只有用户名（密码留空）
+    var c2: SmtpCfg = smtp_cfg_empty();
+    try smtp_parse_url(&"smtps://bot@mail.example.com"[0: 28], &c2);
+    try assert_eq_bool(eq_str(c2.user[0: c2.user_len], &"bot"[0: 3]), true);
+    try assert_eq_i32(c2.pass_len as i32, 0);
+    try assert_eq_i32(c2.mode as i32, SMTP_MODE_TLS as i32);
+}
+
+fn test_url_bad() !void {
+    var c: SmtpCfg = smtp_cfg_empty();
+    var bad: bool = false;
+    _ = smtp_parse_url(&"smtp://"[0: 7], &c) catch |_| {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+
+    bad = false;
+    _ = smtp_parse_url(&"smtp://host:0"[0: 13], &c) catch |_| {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+
+    bad = false;
+    _ = smtp_parse_url(&"smtp://host:abc"[0: 15], &c) catch |_| {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+
+    // 不接受路径与 IPv6 字面量
+    bad = false;
+    _ = smtp_parse_url(&"smtp://host/path"[0: 16], &c) catch |_| {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+
+    bad = false;
+    _ = smtp_parse_url(&"smtp://[::1]:587"[0: 16], &c) catch |_| {
+        bad = true;
+    };
+    try assert_eq_bool(bad, true);
+}
+
+fn test_addr() !void {
+    try assert_eq_bool(smtp_addr_ok(&"ops@example.com"[0: 15]), true);
+    try assert_eq_bool(smtp_addr_ok(&"a@b"[0: 3]), true);
+    try assert_eq_bool(smtp_addr_ok(&"no-at-sign"[0: 10]), false);
+    try assert_eq_bool(smtp_addr_ok(&"a@@b"[0: 4]), false);
+    try assert_eq_bool(smtp_addr_ok(&"@b"[0: 2]), false);
+    try assert_eq_bool(smtp_addr_ok(&"a b@c"[0: 5]), false);
+    try assert_eq_bool(smtp_addr_ok(&"<a@b>"[0: 5]), false);
+    // 头注入：主题里带 CRLF 必须拒绝
+    try assert_eq_bool(smtp_subject_ok(&"hi\r\nBcc: evil@x"[0: 15]), false);
+    try assert_eq_bool(smtp_subject_ok(&"aigw login code"[0: 15]), true);
+}
+
+fn test_reply() !void {
+    var code: i32 = 0;
+    var used: usize = 0;
+    // 单行
+    var p: i32 = smtp_parse_reply(&"250 OK\r\n"[0: 8], 8, &code, &used);
+    try assert_eq_i32(p, 1);
+    try assert_eq_i32(code, 250);
+    try assert_eq_i32(used as i32, 8);
+    // 多行（能力列表）
+    var multi: [byte: 64] = [0: 64];
+    const ml: &[byte] = &"250-PIPELINING\r\n250-AUTH LOGIN\r\n250 8BITMIME\r\n"[0: 46];
+    var k: usize = 0;
+    while k < ml.len {
+        multi[k] = ml[k];
+        k = k + 1;
+    }
+    p = smtp_parse_reply(&multi[0], ml.len, &code, &used);
+    try assert_eq_i32(p, 1);
+    try assert_eq_i32(code, 250);
+    try assert_eq_i32(used as i32, 46);
+    // 半条：继续读
+    p = smtp_parse_reply(&"250-PIPE"[0: 8], 8, &code, &used);
+    try assert_eq_i32(p, 0);
+    p = smtp_parse_reply(&"25"[0: 2], 2, &code, &used);
+    try assert_eq_i32(p, 0);
+    // 非数字 / 编号不一致 / 裸 LF
+    p = smtp_parse_reply(&"2x0 OK\r\n"[0: 8], 8, &code, &used);
+    try assert_eq_i32(p, 0 - 1);
+    p = smtp_parse_reply(&"250-A\r\n550 B\r\n"[0: 14], 14, &code, &used);
+    try assert_eq_i32(p, 0 - 1);
+    p = smtp_parse_reply(&"250 OK\n"[0: 7], 7, &code, &used);
+    try assert_eq_i32(p, 0 - 1);
+    // 认证失败码
+    p = smtp_parse_reply(&"535 auth failed\r\n"[0: 17], 17, &code, &used);
+    try assert_eq_i32(p, 1);
+    try assert_eq_i32(code, 535);
+}
+
+fn test_date() !void {
+    var b: [byte: 40] = [0: 40];
+    var n: usize = smtp_rfc822_date(0, &b[0], 40);
+    try assert_eq_i32(n as i32, 31);
+    try assert_eq_bool(eq_str(b[0: n], &"Thu, 01 Jan 1970 00:00:00 +0000"[0: 31]), true);
+
+    n = smtp_rfc822_date(1793005705, &b[0], 40);
+    try assert_eq_bool(eq_str(b[0: n], &"Mon, 26 Oct 2026 09:08:25 +0000"[0: 31]), true);
+
+    // 闰日：2024-02-29
+    n = smtp_rfc822_date(1709210096, &b[0], 40);
+    try assert_eq_bool(eq_str(b[0: n], &"Thu, 29 Feb 2024 12:34:56 +0000"[0: 31]), true);
+
+    // 1970 之前不可表示
+    try assert_eq_i32(smtp_rfc822_date(0 - 1, &b[0], 40) as i32, 0);
+}
+
+fn test_message() !void {
+    var c: SmtpCfg = smtp_cfg_empty();
+    try smtp_parse_url(&"smtp://mail.example.com"[0: 23], &c);
+    const body: &[byte] = &"aigw login code: 123456\n\nValid for 10 minutes."[0: 46];
+    var msg: [byte: 4096] = [0: 4096];
+    const n: usize = smtp_build_message(&c, &"ops@example.com"[0: 15], &"u@example.com"[0: 13],
+        &"aigw login code"[0: 15], body, 1793005705, 42, &msg[0], 4096);
+    try assert_eq_bool(n > 0, true);
+    const m: &[byte] = msg[0: n];
+    // 关键头都在，且行尾是 CRLF
+    try assert_eq_bool(find_in(m, &"Date: Mon, 26 Oct 2026 09:08:25 +0000\r\n"[0: 39]) < m.len, true);
+    try assert_eq_bool(find_in(m, &"From: ops@example.com\r\n"[0: 23]) < m.len, true);
+    try assert_eq_bool(find_in(m, &"To: u@example.com\r\n"[0: 19]) < m.len, true);
+    try assert_eq_bool(find_in(m, &"Subject: aigw login code\r\n"[0: 26]) < m.len, true);
+    try assert_eq_bool(find_in(m, &"Message-ID: <42.1793005705@localhost>\r\n"[0: 39]) < m.len, true);
+    try assert_eq_bool(find_in(m, &"MIME-Version: 1.0\r\n"[0: 19]) < m.len, true);
+    try assert_eq_bool(find_in(m,
+        &"Content-Type: text/plain; charset=utf-8\r\n"[0: 41]) < m.len, true);
+    try assert_eq_bool(find_in(m,
+        &"Content-Transfer-Encoding: base64\r\n"[0: 35]) < m.len, true);
+    // 正文经 base64 传，解码回来应与原文一致
+    const body_at: usize = find_in(m, &"\r\n\r\n"[0: 4]);
+    try assert_eq_bool(body_at < m.len, true);
+    var b64: [byte: 2048] = [0: 2048];
+    var bn: usize = 0;
+    var i: usize = body_at + 4;
+    while i < n {
+        const ch: byte = m[i];
+        if ch != ('\r' as byte) && ch != ('\n' as byte) {
+            b64[bn] = ch;
+            bn = bn + 1;
+        }
+        i = i + 1;
+    }
+    var plain: [byte: 2048] = [0: 2048];
+    const pn: usize = decode_base64(b64[0: bn], plain[0: 2048]) catch {
+        0 as usize;
+    };
+    try assert_eq_bool(pn > 0, true);
+    try assert_eq_bool(eq_str(plain[0: pn], body), true);
+    // 头注入 / 非法地址：整封不生成
+    try assert_eq_i32(smtp_build_message(&c, &"ops@example.com"[0: 15],
+        &"u@example.com"[0: 13], &"x\r\nBcc: e@x"[0: 11], body, 1793005705, 1,
+        &msg[0], 4096) as i32, 0);
+    try assert_eq_i32(smtp_build_message(&c, &"not-an-addr"[0: 11],
+        &"u@example.com"[0: 13], &"s"[0: 1], body, 1793005705, 1,
+        &msg[0], 4096) as i32, 0);
+}
+
+test "url_basic" { run_test("url_basic", test_url_basic); }
+test "url_userinfo" { run_test("url_userinfo", test_url_userinfo); }
+test "url_bad" { run_test("url_bad", test_url_bad); }
+test "addr" { run_test("addr", test_addr); }
+test "reply" { run_test("reply", test_reply); }
+test "date" { run_test("date", test_date); }
+test "message" { run_test("message", test_message); }

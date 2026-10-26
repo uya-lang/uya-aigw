@@ -52,7 +52,7 @@ UYA_ROOT="$UYA_ROOT" "$UYA" build \
   src/core/runtime.uya src/core/schedule.uya src/core/price.uya src/core/json.uya src/core/rollup.uya \
   src/core/billing.uya src/core/batch.uya src/core/notify.uya src/core/upwait.uya src/core/lb.uya src/core/responses.uya src/core/chat.uya src/providers/upstream.uya \
   src/providers/upstream_cfg.uya \
-  src/net/httpsrv.uya src/net/serve.uya src/app.uya \
+  src/net/httpsrv.uya src/net/serve.uya src/net/smtp_msg.uya src/net/smtp.uya src/core/mailer.uya src/app.uya \
   -o build/aigw
 
 OUT=$(./build/aigw tls probe localhost --port "$PORT" --ca "$TMP/root.pem")

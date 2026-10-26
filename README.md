@@ -30,6 +30,7 @@
    - [6.6 插件供应商（kind=stdio）](#66-插件供应商kindstdio)
    - [6.7 TLS / CA / 指纹固定](#67-tls--ca--指纹固定)
    - [6.8 集群模式](#68-集群模式)
+   - [6.9 OTP 邮件投递（内置 SMTP 客户端）](#69-otp-邮件投递内置-smtp-客户端)
 7. [HTTP API 参考](#7-http-api-参考)
 8. [运维](#8-运维)
 9. [开发与测试](#9-开发与测试)
@@ -181,6 +182,12 @@ aigw tls pin   <host> <sha256hex> [--file <tsv>]
 | `--proxy` | 空 | 出站 HTTP 代理 `http://host:port`（覆盖 `HTTPS_PROXY`） |
 | `--no-proxy` | 空 | 代理白名单（逗号分隔，支持 `*` 与后缀匹配）；显式给空串 = 全部走代理 |
 | `--plugin-cmd` | 空 | stdio 插件启动命令（`/bin/sh -c` 执行），覆盖 `AIGW_PLUGIN_CMD` |
+| `--smtp` | 空 | SMTP 地址：`smtp://host[:port]`（STARTTLS，默认 587）、`smtps://host[:port]`（隐式 TLS，默认 465）、`host:port`（明文 25，内网 relay/测试）。**空 = 不发邮件**（OTP 只能靠 `--dev-otp`） |
+| `--smtp-user` / `--smtp-pass` | 空 | 登录凭据，覆盖 URL 里的 `user:pass` |
+| `--mail-from` | 空 | 发信人地址；默认取 `--smtp-user`（多数服务商要求 From 与登录账号同域） |
+| `--mail-hostname` | `localhost` | EHLO 里报的名字 |
+| `--mail-ca` | 空 | 额外的 PEM 信任根（内网自签中继用） |
+| `--mail-relay-cmd` | `<argv0> smtp-relay` | 投递子进程的命令；一般不用改 |
 
 ### `aigw tls probe` / `aigw tls pin`
 
@@ -203,6 +210,8 @@ aigw tls pin   <host> <sha256hex> [--file <tsv>]
 | `HTTPS_PROXY` / `https_proxy` / `NO_PROXY` | 空 | 出站代理（D4）。**注意**：环境里有代理而代理不可用，上游会 `ECONNREFUSED(111)` 并秒回 502 —— 本机实例请 `unset` 或配 `NO_PROXY` |
 | `AIGW_ASYNC_DEBUG` | 空 | `1` = 打印在途请求的 spawn/fail 细节（含错误 id） |
 | `AIGW_UPSTREAM_HEADER` | 给所有上游请求追加一条头，格式 `Name: Value`（如 opencode 的 `x-opencode-session`） | 上游请求构造 |
+| `AIGW_SMTP_URL` / `AIGW_SMTP_USER` / `AIGW_SMTP_PASS` | 同上（`--smtp*` 优先） | serve 启动 |
+| `AIGW_MAIL_FROM` / `AIGW_MAIL_HOSTNAME` / `AIGW_MAIL_CA` / `AIGW_MAIL_RELAY_CMD` | 同上（对应 `--mail-*`） | serve 启动 |
 | `UYA` / `UYA_ROOT` | 编译期工具链与标准库路径 | Makefile / e2e 脚本 |
 
 测试脚本另用私有变量（不参与生产）：`AIGW_MODE`、`AIGW_DB`、`AIGW_UPSTREAM_PORT`、
@@ -247,8 +256,8 @@ toks_x100 email user session ua loc headers
 
 - 用户不存在时 `POST /v1/auth/login` 会自动建用户（`users.status` 0=正常）。
 - OTP 有效期 600s，一次性。
-- **验证码投递目前没有内置渠道**：只有 `--dev-otp` 会在响应里回显 `code`；生产请把
-  `/v1/auth/otp` 接进你自己的短信/邮件网关（或先用会话/管理面预置用户与 Key）。
+- 验证码投递：配了 `--smtp` 就**内置 SMTP 直投**（见 §6.8），没配则只有 `--dev-otp`
+  会在响应里回显 `code`（先用会话/管理面预置用户与 Key 也可以）。
 - API Key 只在创建响应里出现一次明文，库里只存 sha256；`POST /v1/keys/revoke {"key_id":N}`
   之后**最迟 2s 生效**（校验走单槽缓存，TTL = 2s）。
 
@@ -413,6 +422,41 @@ drain 迁移、ingest 幂等 + 区间重算、本地 spool 重放。拓扑、启
 
 ---
 
+### 6.9 OTP 邮件投递（内置 SMTP 客户端）
+
+`/v1/auth/otp` 的验证码可以直接由网关发出去，不需要外部脚本：
+
+```bash
+# 1) 明文内网中继（测试用；生产一般用 587 + STARTTLS）
+./build/aigw serve --smtp smtp://127.0.0.1:25 --mail-from ops@example.com
+
+# 2) 主流服务商：587 + STARTTLS + 登录
+./build/aigw serve --smtp smtp://smtp.example.com --smtp-user bot@example.com \
+  --smtp-pass '********' --mail-from bot@example.com
+
+# 3) 465 隐式 TLS（也可以把凭据写在 URL 里：smtps://bot:pass@host）
+./build/aigw serve --smtp smtps://smtp.example.com --smtp-user bot@example.com \
+  --smtp-pass '********'
+```
+
+- 环境变量等价物：`AIGW_SMTP_URL`、`AIGW_SMTP_USER`、`AIGW_SMTP_PASS`、`AIGW_MAIL_FROM`、
+  `AIGW_MAIL_HOSTNAME`、`AIGW_MAIL_CA`、`AIGW_MAIL_RELAY_CMD`（命令行优先）。
+- **投递在子进程里做**：父进程 `fork` 出 `aigw smtp-relay`，把作业 JSON 从 stdin 灌进去
+  就返回，所以慢 SMTP（限速、握手慢、干脆连不通）都不会拖住事件循环 ——
+  `tests/mail_e2e.sh` 里第三条用例就是拿 3 秒延迟的假服务器压着跑 `/healthz` 验证的。
+- 在途作业上限 **4**；超过时 `/v1/auth/otp` 直接 503。单个作业 30s 没结束会被 SIGKILL。
+- 结果只进日志：`smtp-relay: sent to=<addr>` / `smtp-relay: send failed err=<id>`；
+  失败不自动重试（用户重新点一次即可）。
+- 协议范围：单收件人、纯文本、UTF-8、正文 base64（RFC 2045 折行）、`Date`/`Message-ID`
+  自带；不做 DKIM/管道化/SMTPUTF8/多收件人/IPv6 字面量。
+- **安全闸**：收件人与主题里出现 CR/LF 一律拒绝（头注入），地址先做语法校验；
+  密码也可以放在 URL 里（`%40`、`%3A` 需要转义）。
+- 自签/内网 CA 用 `--mail-ca <pem>`（有就用它，没有走系统信任库）。
+- 验证：`tests/test_smtp.uya`（URL/应答/日期/组包单测）+ `tests/mail_e2e.sh`
+  （真投递、头注入、慢服务器不阻塞、不可达降级）。
+
+---
+
 ## 7. HTTP API 参考
 
 除标注外都需要 `Authorization: Bearer <api key>`。请求体上限 **32 KB**（超出 413），
@@ -521,6 +565,7 @@ make selftest     # check + run_all
 make e2e          # provider spike → TLS CLI → serve 冒烟 → chat/responses/admin 全链路
 make ui-e2e       # 后台 UI/安全头/越权 + 代理 CONNECT e2e
 make cluster-e2e  # controller + 3 node：注册/epoch/assign/edge/drain/ingest/spool
+make mail-e2e     # OTP 邮件投递：mock SMTP 真对话 + 慢服务器不阻塞 /healthz
 make load-sse     # 网关侧 1000 并发 SSE × 20 事件（尾延迟基线）
 make db_bench     # SQLite 写入 + rollup 基准
 make spike        # TLS 栈与本机 openssl s_server 的互操作
@@ -541,12 +586,13 @@ src/
   app.uya                 # 入口：serve / tls probe / tls pin
   foundation/buf.uya      # 字节缓冲
   net/                    # httpsrv、serve（路由/计费/管理面）、tls*、dnsx、tcpx、httpc、
-                          #   httpc_pool（策略）、proxyx（代理）、ssex（SSE）、ui
+                          #   httpc_pool（策略）、proxyx（代理）、ssex（SSE）、ui、
+                          #   smtp/smtp_msg（OTP 邮件直投）
   providers/              # httpcall（内置 HTTPS 传输 + 连接池 + 代理）、upstream（一次 POST）、
                           #   plug（stdio 插件供应商）、http/upstream_cfg（配置与出站头）
   core/                   # store/dbx/schema（存储）、chat/responses（编排）、billing/budget/
                           #   price/schedule/money（计费）、lb（路由）、batch/journal/runtime
-                          #   （落库与恢复）、reqlog、json、notify、rollup、backup
+                          #   （落库与恢复）、reqlog、json、notify、rollup、backup、mailer
   cluster/                # meta、elect、uplink、edge、assign(shard)、ingest、spool
   plugins/                # pool（stdio 子进程池）+ pool_shim.c
 tests/                    # test_*.uya（单测）、*_e2e.sh（端到端）、fixtures
@@ -557,7 +603,11 @@ docs/                     # overview、tls-provider、spike findings、deploy、
 
 ## 10. 已知限制
 
-- **OTP 没有内置投递渠道**：只有 `--dev-otp` 回显；生产需自行接短信/邮件网关。
+- **OTP 只内置了邮件投递**：配了 `--smtp` 就走内置 SMTP 客户端（单收件人、纯文本、
+  正文 base64），没配则只有 `--dev-otp` 回显。短信需要自己接。
+- **邮件是「尽力投递」**：`/v1/auth/otp` 把作业塞给子进程就返回 200，投递结果只进日志
+  （`smtp-relay: sent to=...` / `send failed err=...`）；在途上限 4，超了 OTP 直接 503。
+  失败不会重试，重试由用户重新点「发送验证码」触发。
 - **供应商 / 用户没有写接口**：`/admin/providers`、`/admin/users` 只读；引导走 SQL
   （见 §2.3），模型绑定、价目、预算、Key 都有 HTTP 写接口。
 - **插件路径**：一行 ≤ 8 KB、不支持流式（回落非流式）、全局只有一个 `--plugin-cmd`

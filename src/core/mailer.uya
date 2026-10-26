@@ -1,0 +1,633 @@
+// src/core/mailer.uya — OTP 邮件的投递队列
+//
+// 设计要点（为什么不在这里直接发 SMTP）：
+//   * SMTP 是「多轮往返 + 可能慢到几十秒」的协议，网关是单线程 epoll；
+//     在事件循环里同步发信会把所有在途请求一起卡住（Phase E 的教训）。
+//   * 所以投递 = fork 一个 `aigw smtp-relay` 子进程，把作业（JSON）从 stdin 灌进去
+//     就立刻返回。子进程自己 block_on 跑完整个 SMTP 对话（src/net/smtp.uya）。
+//   * 父进程只维护一个 4 槽的在途表：每轮事件循环 `mailer_tick` 收尸，
+//     超过 MAIL_KILL_MS 直接 SIGKILL（防止子进程挂死占槽）。
+//
+// 配置（CLI 优先，其次环境变量）：
+//   --smtp <url>        AIGW_SMTP_URL      smtp://host | smtps://host | smtp://user:pass@host:25
+//   --smtp-user <u>     AIGW_SMTP_USER     URL 里没写用户名/密码时用
+//   --smtp-pass <p>     AIGW_SMTP_PASS
+//   --mail-from <addr>  AIGW_MAIL_FROM     默认取 --smtp-user（多数服务器要求 From 与登录用户同域）
+//   --mail-ca <pem>     AIGW_MAIL_CA       自签/内网中继用；不配走系统信任库
+//   --mail-relay-cmd    AIGW_MAIL_RELAY_CMD 默认 "<argv0> smtp-relay"
+
+use libc.syscall;
+use libc.stdlib;
+
+export const MAIL_MAX_INFLIGHT: usize = 4;
+export const MAIL_SEND_BUDGET_MS: u64 = 20000;
+export const MAIL_KILL_MS: u64 = 30000;
+export const MAIL_FROM_MAX: usize = 192;
+export const MAIL_CMD_MAX: usize = 640;
+export const MAIL_CA_MAX: usize = 512;
+
+export const MAIL_URL_MAX: usize = 1024;
+
+/// 邮件参数：`app.uya` 解析命令行后填好，整包交给 `mailer_init`。
+/// 用结构体传参是因为「对全局定长数组切片」会拿到错元素类型的切片（编译器 bug），
+/// 传进函数变成局部数组后 `[0: len]` 才是 `&[byte]`。
+export struct MailArgs {
+    url: [byte: MAIL_URL_MAX],
+    url_len: usize,
+    user: [byte: SMTP_USER_MAX],
+    user_len: usize,
+    pass: [byte: SMTP_PASS_MAX],
+    pass_len: usize,
+    from: [byte: MAIL_FROM_MAX],
+    from_len: usize,
+    hostname: [byte: SMTP_EHLO_MAX],
+    hostname_len: usize,
+    ca: [byte: MAIL_CA_MAX],
+    ca_len: usize,
+    cmd: [byte: MAIL_CMD_MAX],
+    cmd_len: usize,
+}
+
+struct MailAux {
+    from: [byte: MAIL_FROM_MAX],
+    from_len: usize,
+    ca: [byte: MAIL_CA_MAX],
+    ca_len: usize,
+    cmd: [byte: MAIL_CMD_MAX],
+    cmd_len: usize,
+}
+
+struct MailJob {
+    pid: i32,
+    start_ms: u64,
+    /// 子进程 stdout：不读的话子进程最后一次 write 会拿到 EPIPE，
+    /// 而父进程也会丢掉 `smtp-relay:` 日志。收尸时一起关。
+    outfd: i32,
+}
+
+var g_ml_on: bool = false;
+var g_ml_cfg: SmtpCfg = SmtpCfg{};
+/// from/ca 放在结构体里：对「裸的全局定长数组」切片会拿到错元素类型的切片
+/// （编译器把 `g_arr[0: n]` 当成 slice_int32），套一层结构体的字段就正常。
+var g_ml_aux: MailAux = MailAux{};
+
+
+var g_ml_jobs: [MailJob: MAIL_MAX_INFLIGHT] = [];
+var g_ml_sent: i64 = 0;
+var g_ml_failed: i64 = 0;
+var g_ml_busy: i64 = 0;
+
+/// 覆盖式写入（`out_len` 从 0 开始）——追加请用 smtp_append。
+fn mail_set(dst: &byte, cap: usize, out_len: &usize, src: &[byte]) bool {
+    out_len[0] = 0;
+    if src.len > cap {
+        return false;
+    }
+    var i: usize = 0;
+    while i < src.len {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+    out_len[0] = src.len;
+    return true;
+}
+
+/// `lit` 必须是字符串字面量的切片（末尾带 NUL），否则 getenv 会读越界。
+fn mail_env(lit: &[byte], out: &byte, cap: usize, out_len: &usize) bool {
+    out_len[0] = 0;
+    const ev: &byte = getenv(&lit[0] as &const byte);
+    if (ev as usize) == 0 {
+        return false;
+    }
+    var n: usize = 0;
+    while ev[n] != (0 as byte) && n < cap {
+        out[n] = ev[n];
+        n = n + 1;
+    }
+    out_len[0] = n;
+    return n > 0;
+}
+
+/// CLI 值优先，没有就用环境变量 `lit`。返回最终长度（0 = 两边都没配）。
+fn mail_pick(cli: &[byte], lit: &[byte], out: &byte, cap: usize) usize {
+    var n: usize = 0;
+    if cli.len > 0 {
+        if !mail_set(out, cap, &n, cli) {
+            return 0;
+        }
+        return n;
+    }
+    if mail_env(lit, out, cap, &n) {
+        return n;
+    }
+    return 0;
+}
+
+export fn mailer_enabled() bool {
+    return g_ml_on;
+}
+
+export fn mailer_sent() i64 {
+    return g_ml_sent;
+}
+
+export fn mailer_failed() i64 {
+    return g_ml_failed;
+}
+
+export fn mailer_busy() i64 {
+    return g_ml_busy;
+}
+
+export fn mailer_inflight() i32 {
+    var n: i32 = 0;
+    var i: usize = 0;
+    while i < MAIL_MAX_INFLIGHT {
+        if g_ml_jobs[i].pid != 0 {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// 默认 relay 命令：`<argv0> smtp-relay`（argv0 带空格就单引号包起来）。
+fn mailer_default_cmd(out: &byte, cap: usize, out_len: &usize) bool {
+    out_len[0] = 0;
+    const a0: &byte = get_argv(0);
+    if (a0 as usize) == 0 {
+        return false;
+    }
+    var n: usize = 0;
+    var has_space: bool = false;
+    var i: usize = 0;
+    while a0[i] != (0 as byte) && i < 512 {
+        if a0[i] == (' ' as byte) {
+            has_space = true;
+        }
+        i = i + 1;
+    }
+    if has_space {
+        if !smtp_append(out, cap, &n, &"'"[0: 1]) {
+            return false;
+        }
+    }
+    i = 0;
+    while a0[i] != (0 as byte) && i < 512 {
+        if n >= cap {
+            return false;
+        }
+        out[n] = a0[i];
+        n = n + 1;
+        i = i + 1;
+    }
+    if has_space {
+        if !smtp_append(out, cap, &n, &"'"[0: 1]) {
+            return false;
+        }
+    }
+    // 注意：`mail_copy` 是「覆盖式」写入（会把 out_len 归零），追加必须用 smtp_append。
+    if !smtp_append(out, cap, &n, &" smtp-relay"[0: 11]) {
+        return false;
+    }
+    out_len[0] = n;
+    return true;
+}
+
+/// 解析配置。`url` 为空且环境里也没有 → 保持关闭（返回成功，`mailer_enabled()` 仍 false）。
+/// URL 非法、`from` 非法 → 返回 error，由启动流程直接失败（别让服务带着坏配置跑）。
+export fn mailer_init(a: MailArgs) !void {
+    g_ml_on = false;
+    var surl: [byte: 1024] = [0: 1024];
+    const surl_n: usize = mail_pick(a.url[0: a.url_len], &"AIGW_SMTP_URL"[0: 13],
+        &surl[0], MAIL_URL_MAX);
+    if surl_n == 0 {
+        return;                 // 没配置邮件：正常返回，OTP 只走 --dev-otp
+    }
+    var c: SmtpCfg = smtp_cfg_empty();
+    try smtp_parse_url(surl[0: surl_n], &c);
+
+    var u: [byte: SMTP_USER_MAX] = [0: SMTP_USER_MAX];
+    const un: usize = mail_pick(a.user[0: a.user_len], &"AIGW_SMTP_USER"[0: 14],
+        &u[0], SMTP_USER_MAX);
+    if un > 0 {
+        if !mail_set(&c.user[0], SMTP_USER_MAX, &c.user_len, u[0: un]) {
+            return error.MailBadConfig;
+        }
+    }
+    var pw: [byte: SMTP_PASS_MAX] = [0: SMTP_PASS_MAX];
+    const pn: usize = mail_pick(a.pass[0: a.pass_len], &"AIGW_SMTP_PASS"[0: 14],
+        &pw[0], SMTP_PASS_MAX);
+    if pn > 0 {
+        if !mail_set(&c.pass[0], SMTP_PASS_MAX, &c.pass_len, pw[0: pn]) {
+            return error.MailBadConfig;
+        }
+    }
+    var hn: usize = mail_pick(a.hostname[0: a.hostname_len], &"AIGW_MAIL_HOSTNAME"[0: 18],
+        &c.hostname[0], SMTP_EHLO_MAX);
+    if hn == 0 {
+        if !mail_set(&c.hostname[0], SMTP_EHLO_MAX, &c.hostname_len, &"localhost"[0: 9]) {
+            return error.MailBadConfig;
+        }
+    } else {
+        c.hostname_len = hn;
+    }
+
+    var f: [byte: MAIL_FROM_MAX] = [0: MAIL_FROM_MAX];
+    var fn_: usize = mail_pick(a.from[0: a.from_len], &"AIGW_MAIL_FROM"[0: 14],
+        &f[0], MAIL_FROM_MAX);
+    if fn_ == 0 && c.user_len > 0 {
+        // 没给 --mail-from：默认用登录用户名（多数服务商要求 From 与登录账号一致）
+        if !mail_set(&f[0], MAIL_FROM_MAX, &fn_, c.user[0: c.user_len]) {
+            return error.MailBadConfig;
+        }
+    }
+    if fn_ == 0 || !smtp_addr_ok(f[0: fn_]) {
+        return error.MailBadFrom;
+    }
+    if !mail_set(&g_ml_aux.from[0], MAIL_FROM_MAX, &g_ml_aux.from_len, f[0: fn_]) {
+        return error.MailBadFrom;
+    }
+
+    g_ml_aux.ca_len = mail_pick(a.ca[0: a.ca_len], &"AIGW_MAIL_CA"[0: 12], &g_ml_aux.ca[0], MAIL_CA_MAX);
+    g_ml_aux.cmd_len = mail_pick(a.cmd[0: a.cmd_len], &"AIGW_MAIL_RELAY_CMD"[0: 19], &g_ml_aux.cmd[0],
+        MAIL_CMD_MAX);
+    if g_ml_aux.cmd_len == 0 {
+        if !mailer_default_cmd(&g_ml_aux.cmd[0], MAIL_CMD_MAX, &g_ml_aux.cmd_len) {
+            return error.MailBadConfig;
+        }
+    }
+    // 子进程只会往管道里写；两边都不能被 SIGPIPE 带走。
+    aigw_pool_ignore_sigpipe();
+    var z: usize = 0;
+    while z < MAIL_MAX_INFLIGHT {
+        g_ml_jobs[z].pid = 0;
+        g_ml_jobs[z].start_ms = 0;
+        g_ml_jobs[z].outfd = 0 - 1;
+        z = z + 1;
+    }
+    g_ml_cfg = c;
+    g_ml_on = true;
+    printf("[mail] enabled host=%.*s port=%d mode=%d auth=%d from=%.*s cmd=%.*s\n" as *byte,
+        g_ml_cfg.host_len as i32, &g_ml_cfg.host[0], g_ml_cfg.port as i32, g_ml_cfg.mode as i32,
+        g_ml_cfg.user_len as i32, g_ml_aux.from_len as i32, &g_ml_aux.from[0],
+        g_ml_aux.cmd_len as i32, &g_ml_aux.cmd[0]);
+    return;
+}
+
+fn mail_write_job(fd: i32, data: &[byte]) bool {
+    var off: usize = 0;
+    var spins: i32 = 0;
+    while off < data.len && spins < 256 {
+        const r: !isize = sys_write(fd, &data[off] as *const byte, data.len - off);
+        var failed: bool = false;
+        var w: isize = 0;
+        w = r catch |_| {
+            failed = true;
+            0 as isize;
+        };
+        _ = failed;
+        if w > 0 {
+            off = off +% (w as usize);
+            continue;
+        }
+        // 非阻塞管道的 EAGAIN：等可写再重试。真错误会在 spins 用尽后失败。
+        const pr: i32 = aigw_pool_poll(fd, 4, 1000);
+        if pr <= 0 {
+            return false;
+        }
+        spins = spins + 1;
+    }
+    return off == data.len;
+}
+
+/// 投一条邮件作业（异步：只 fork + 写 stdin）。失败原因：队列满、fork/写管道失败。
+export fn mailer_enqueue(to: &[byte], subject: &[byte], body: &[byte]) !void {
+    if !g_ml_on {
+        return error.MailDisabled;
+    }
+    if !smtp_addr_ok(to) {
+        return error.MailBadAddress;
+    }
+    const now: u64 = smtp_now_ms();
+    mailer_tick(now);
+    var slot: usize = MAIL_MAX_INFLIGHT;
+    var i: usize = 0;
+    while i < MAIL_MAX_INFLIGHT {
+        if g_ml_jobs[i].pid == 0 {
+            slot = i;
+            break;
+        }
+        i = i + 1;
+    }
+    if slot >= MAIL_MAX_INFLIGHT {
+        g_ml_busy = g_ml_busy +% 1;
+        return error.MailBusy;
+    }
+
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    jsonw_key(&w, &"host"[0: 4]);
+    jsonw_str(&w, g_ml_cfg.host[0: g_ml_cfg.host_len]);
+    jsonw_key(&w, &"port"[0: 4]);
+    jsonw_i64(&w, g_ml_cfg.port as i64);
+    jsonw_key(&w, &"mode"[0: 4]);
+    jsonw_i64(&w, g_ml_cfg.mode as i64);
+    jsonw_key(&w, &"user"[0: 4]);
+    jsonw_str(&w, g_ml_cfg.user[0: g_ml_cfg.user_len]);
+    jsonw_key(&w, &"pass"[0: 4]);
+    jsonw_str(&w, g_ml_cfg.pass[0: g_ml_cfg.pass_len]);
+    jsonw_key(&w, &"from"[0: 4]);
+    jsonw_str(&w, g_ml_aux.from[0: g_ml_aux.from_len]);
+    jsonw_key(&w, &"to"[0: 2]);
+    jsonw_str(&w, to);
+    jsonw_key(&w, &"subject"[0: 7]);
+    jsonw_str(&w, subject);
+    jsonw_key(&w, &"body"[0: 4]);
+    jsonw_str(&w, body);
+    jsonw_key(&w, &"hostname"[0: 8]);
+    jsonw_str(&w, g_ml_cfg.hostname[0: g_ml_cfg.hostname_len]);
+    jsonw_key(&w, &"ca"[0: 2]);
+    jsonw_str(&w, g_ml_aux.ca[0: g_ml_aux.ca_len]);
+    jsonw_key(&w, &"budget_ms"[0: 9]);
+    jsonw_i64(&w, MAIL_SEND_BUDGET_MS as i64);
+    jsonw_end_obj(&w);
+    if !jsonw_ok(&w) {
+        return error.MailBadConfig;
+    }
+    const span: &[byte] = jsonw_span(&w);
+
+    var pid: i32 = 0;
+    var infd: i32 = 0 - 1;
+    var outfd: i32 = 0 - 1;
+    const rc: i32 = aigw_pool_spawn(&g_ml_aux.cmd[0] as *const byte, &pid, &infd, &outfd);
+    if rc != 0 {
+        g_ml_failed = g_ml_failed +% 1;
+        return error.MailSpawnFailed;
+    }
+    const wrote: bool = mail_write_job(infd, span);
+    _ = sys_close(infd) catch {};
+    if !wrote {
+        _ = sys_close(outfd) catch {};
+        _ = aigw_pool_kill(pid, 9);
+        var st: i32 = 0;
+        _ = aigw_pool_wait(pid, &st);
+        g_ml_failed = g_ml_failed +% 1;
+        return error.MailWriteFailed;
+    }
+    g_ml_jobs[slot].pid = pid;
+    g_ml_jobs[slot].start_ms = now;
+    g_ml_jobs[slot].outfd = outfd;
+    return;
+}
+
+/// 事件循环每轮调：非阻塞收尸 + 超时 SIGKILL。`now_ms` 用 smtp_now_ms()（单调）。
+export fn mailer_tick(now_ms: u64) void {
+    var i: usize = 0;
+    while i < MAIL_MAX_INFLIGHT {
+        const pid: i32 = g_ml_jobs[i].pid;
+        if pid != 0 {
+            mail_drain(i);
+            var st: i32 = 0;
+            const r: i32 = aigw_pool_wait_nohang(pid, &st);
+            if r > 0 {
+                mail_drain(i);
+                mail_close_out(i);
+                if st != 0 {
+                    g_ml_failed = g_ml_failed +% 1;
+                    printf("[mail] relay failed pid=%d status=%d\n" as *byte, pid, st);
+                } else {
+                    g_ml_sent = g_ml_sent +% 1;
+                }
+                g_ml_jobs[i].pid = 0;
+                g_ml_jobs[i].start_ms = 0;
+            } else if r == 0 {
+                const started: u64 = g_ml_jobs[i].start_ms;
+                if now_ms != 0 && started != 0 && now_ms > started &&
+                    (now_ms - started) > MAIL_KILL_MS {
+                    _ = aigw_pool_kill(pid, 9);
+                    var st2: i32 = 0;
+                    _ = aigw_pool_wait(pid, &st2);
+                    mail_drain(i);
+                    mail_close_out(i);
+                    g_ml_failed = g_ml_failed +% 1;
+                    printf("[mail] relay timeout pid=%d\n" as *byte, pid);
+                    g_ml_jobs[i].pid = 0;
+                    g_ml_jobs[i].start_ms = 0;
+                }
+            } else {
+                // waitpid 出错（ESRCH 等）：清槽，避免永久占用
+                mail_close_out(i);
+                g_ml_jobs[i].pid = 0;
+                g_ml_jobs[i].start_ms = 0;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+/// 把子进程 stdout 里已有的内容搬到网关日志（子进程只打印一行结果）。
+fn mail_drain(i: usize) void {
+    if i >= MAIL_MAX_INFLIGHT {
+        return;
+    }
+    const fd: i32 = g_ml_jobs[i].outfd;
+    if fd < 0 {
+        return;
+    }
+    var buf: [byte: 256] = [0: 256];
+    var guard: i32 = 0;
+    while guard < 8 {
+        const rdy: i32 = aigw_pool_poll(fd, 1, 0);
+        if rdy <= 0 {
+            return;
+        }
+        const n: i32 = aigw_pool_read(fd, &buf[0], 256);
+        if n <= 0 {
+            return;
+        }
+        printf("%.*s" as *byte, n, &buf[0]);
+        guard = guard + 1;
+    }
+}
+
+fn mail_close_out(i: usize) void {
+    if i >= MAIL_MAX_INFLIGHT {
+        return;
+    }
+    const fd: i32 = g_ml_jobs[i].outfd;
+    if fd >= 0 {
+        _ = sys_close(fd) catch {};
+        g_ml_jobs[i].outfd = 0 - 1;
+    }
+}
+
+/// 停机：杀掉所有在途 relay 子进程并收尸（不等待正常完成，邮件不是关键路径）。
+export fn mailer_shutdown() void {
+    var i: usize = 0;
+    while i < MAIL_MAX_INFLIGHT {
+        const pid: i32 = g_ml_jobs[i].pid;
+        if pid != 0 {
+            _ = aigw_pool_kill(pid, 9);
+            var st: i32 = 0;
+            _ = aigw_pool_wait(pid, &st);
+            mail_drain(i);
+            mail_close_out(i);
+            g_ml_jobs[i].pid = 0;
+            g_ml_jobs[i].start_ms = 0;
+        }
+        i = i + 1;
+    }
+}
+
+/// OTP 邮件正文。纯 ASCII，避免头编码问题（正文用 base64 发，UTF-8 也安全）。
+export fn mailer_otp_body(code: &[byte], ttl_sec: i64, out: &byte, cap: usize) usize {
+    var n: usize = 0;
+    if !smtp_append(out, cap, &n, &"aigw login code: "[0: 17]) {
+        return 0;
+    }
+    if !smtp_append(out, cap, &n, code) {
+        return 0;
+    }
+    if !smtp_append(out, cap, &n, &"\n\nValid for "[0: 12]) {
+        return 0;
+    }
+    var mins: i64 = ttl_sec / 60;
+    if mins < 1 {
+        mins = 1;
+    }
+    var digits: [byte: 20] = [0: 20];
+    var dn: usize = 0;
+    var x: i64 = mins;
+    while x > 0 && dn < 20 {
+        digits[dn] = (48 as byte) + (x % 10) as byte;
+        x = x / 10;
+        dn = dn + 1;
+    }
+    var k: usize = dn;
+    while k > 0 {
+        var one: [byte: 1] = [0: 1];
+        one[0] = digits[k - 1];
+        if !smtp_append(out, cap, &n, one[0: 1]) {
+            return 0;
+        }
+        k = k - 1;
+    }
+    if !smtp_append(out, cap, &n, &" minutes. If you did not request it, ignore this mail."[0: 54]) {
+        return 0;
+    }
+    return n;
+}
+
+/// OTP 邮件主题（固定，便于收件端规则）。
+export fn mailer_otp_subject(out: &byte, cap: usize) usize {
+    var n: usize = 0;
+    if !smtp_append(out, cap, &n, &"aigw login code"[0: 15]) {
+        return 0;
+    }
+    return n;
+}
+
+fn mail_jstr(d: &JsonDoc, obj: i32, key: &[byte], out: &byte, cap: usize) usize {
+    const v: i32 = json_get(d, obj, key);
+    if json_kind(d, v) != JSON_STR {
+        return 0;
+    }
+    return json_str(d, v, out, cap);
+}
+
+fn mail_ji64(d: &JsonDoc, obj: i32, key: &[byte]) i64 {
+    const v: i32 = json_get(d, obj, key);
+    if json_kind(d, v) != JSON_NUM {
+        return 0;
+    }
+    return json_i64(d, v);
+}
+
+/// `aigw smtp-relay` 入口：从 stdin 读一条作业 JSON，阻塞跑完 SMTP，退出码 0/2。
+/// 只在子进程里跑 —— 父进程是单线程 epoll，绝不能在这里等网络。
+export fn mailer_relay_main() i32 {
+    var buf: [byte: 16384] = [0: 16384];
+    var n: usize = 0;
+    var eof: bool = false;
+    while n < 16384 && !eof {
+        const r: !isize = sys_read(0, &buf[n] as *byte, 16384 - n);
+        var got: isize = 0;
+        var bad: bool = false;
+        got = r catch |_| {
+            bad = true;
+            0 as isize;
+        };
+        if bad || got <= 0 {
+            eof = true;
+        } else {
+            n = n +% (got as usize);
+        }
+    }
+    if n == 0 {
+        printf("smtp-relay: empty job\n" as *byte);
+        return 2;
+    }
+    var d: JsonDoc = JsonDoc{};
+    json_parse(&d, buf[0: n]) catch {
+        printf("smtp-relay: bad job json\n" as *byte);
+        return 2;
+    };
+    const root: i32 = json_root(&d);
+    var c: SmtpCfg = smtp_cfg_empty();
+    c.host_len = mail_jstr(&d, root, &"host"[0: 4], &c.host[0], SMTP_HOST_MAX);
+    c.user_len = mail_jstr(&d, root, &"user"[0: 4], &c.user[0], SMTP_USER_MAX);
+    c.pass_len = mail_jstr(&d, root, &"pass"[0: 4], &c.pass[0], SMTP_PASS_MAX);
+    c.hostname_len = mail_jstr(&d, root, &"hostname"[0: 8], &c.hostname[0], SMTP_EHLO_MAX);
+    const mode: i64 = mail_ji64(&d, root, &"mode"[0: 4]);
+    const port: i64 = mail_ji64(&d, root, &"port"[0: 4]);
+    if c.host_len == 0 || port < 1 || port > 65535 || mode < 0 || mode > 2 {
+        printf("smtp-relay: bad config\n" as *byte);
+        return 2;
+    }
+    c.port = port as u16;
+    c.mode = mode as u8;
+    var from: [byte: 256] = [0: 256];
+    var to: [byte: 256] = [0: 256];
+    var subj: [byte: 256] = [0: 256];
+    var body: [byte: 4096] = [0: 4096];
+    var ca: [byte: 512] = [0: 512];
+    const fn_: usize = mail_jstr(&d, root, &"from"[0: 4], &from[0], 256);
+    const tn: usize = mail_jstr(&d, root, &"to"[0: 2], &to[0], 256);
+    const sn: usize = mail_jstr(&d, root, &"subject"[0: 7], &subj[0], 256);
+    const bn: usize = mail_jstr(&d, root, &"body"[0: 4], &body[0], 4096);
+    const can: usize = mail_jstr(&d, root, &"ca"[0: 2], &ca[0], 512);
+    if fn_ == 0 || tn == 0 {
+        printf("smtp-relay: bad addresses\n" as *byte);
+        return 2;
+    }
+    var budget_ms: u64 = MAIL_SEND_BUDGET_MS;
+    const budget: i64 = mail_ji64(&d, root, &"budget_ms"[0: 9]);
+    if budget > 0 && budget < 600000 {
+        budget_ms = budget as u64;
+    }
+    var net: SmtpNet = SmtpNet{};
+    smtp_net_init(&net);
+    if can > 0 {
+        if !smtp_net_load_ca(&net, ca[0: can]) {
+            printf("smtp-relay: ca unreadable\n" as *byte);
+            return 2;
+        }
+    }
+    const r: !i32 = smtp_deliver(&net, &c, from[0: fn_], to[0: tn],
+        subj[0: sn], body[0: bn], budget_ms);
+    var fail: i32 = 0;
+    const okv: i32 = r catch |e| {
+        fail = @error_id(e);
+        0 - 1;
+    };
+    _ = okv;
+    if fail != 0 {
+        printf("smtp-relay: send failed err=%d host=%.*s port=%d\n" as *byte,
+            fail, c.host_len as i32, &c.host[0], c.port as i32);
+        return 2;
+    }
+    printf("smtp-relay: sent to=%.*s\n" as *byte, tn as i32, &to[0]);
+    return 0;
+}

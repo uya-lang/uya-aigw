@@ -92,6 +92,18 @@ int aigw_pool_kill(int pid, int sig) {
     return kill((pid_t)pid, sig);
 }
 
+/* 非阻塞读（子进程的 stdout 是 O_NONBLOCK）：>0 读到的字节数，0 = 对端已关，-1 = 暂无数据/出错。 */
+int aigw_pool_read(int fd, char *buf, int cap) {
+    if (fd < 0 || cap <= 0) {
+        return -1;
+    }
+    ssize_t n = read(fd, buf, (size_t)cap);
+    if (n <= 0) {
+        return (int)n;
+    }
+    return (int)n;
+}
+
 /* 等 fd 可读/可写；events 用 poll 的 POLLIN=1 / POLLOUT=4。返回 1 就绪，0 超时，<0 出错。 */
 int aigw_pool_poll(int fd, int events, int timeout_ms) {
     struct pollfd p;

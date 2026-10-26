@@ -1,0 +1,689 @@
+// src/net/smtp_msg.uya — SMTP 的纯逻辑层：配置/URL 解析、应答解析、RFC 5322 组包
+//
+// 这一层**不碰 socket、不读时钟**（时间从参数传进来），所以可以单测：
+// `tests/test_smtp.uya`。真正的传输与对话在 `src/net/smtp.uya`。
+//
+// 范围（只服务 OTP 投递）：
+//   * 单个收件人、纯文本正文、UTF-8（正文 base64，绕开 8bit 与点填充）；
+//   * 支持三种连接方式：明文（内网 relay/测试）、STARTTLS（587）、隐式 TLS（465）。
+// 不做：管道化、多收件人、DKIM、DSN、SMTPUTF8、IPv6 字面量。
+
+use std.encoding.base64.encode_base64;
+
+export const SMTP_MODE_PLAIN: u8 = 0;
+export const SMTP_MODE_STARTTLS: u8 = 1;
+export const SMTP_MODE_TLS: u8 = 2;
+
+export const SMTP_PORT_PLAIN: u16 = 25;
+export const SMTP_PORT_SUB: u16 = 587;
+export const SMTP_PORT_TLS: u16 = 465;
+
+export const SMTP_HOST_MAX: usize = 192;
+export const SMTP_USER_MAX: usize = 128;
+export const SMTP_PASS_MAX: usize = 128;
+export const SMTP_EHLO_MAX: usize = 64;
+
+/// 一条应答（含多行）的上限：`250-...` 多行能力列表可能上百行，2 KB 够现实服务器用。
+export const SMTP_REPLY_MAX: usize = 2048;
+/// base64 中间缓冲；正文上限 = (SMTP_B64_MAX / 4) * 3 - 2 ≈ 3070 字节。
+export const SMTP_B64_MAX: usize = 4096;
+/// 单行 base64 折行宽度（RFC 2045 要求 ≤ 76）。
+export const SMTP_B64_LINE: usize = 76;
+
+export struct SmtpCfg {
+    host: [byte: SMTP_HOST_MAX],
+    host_len: usize,
+    port: u16,
+    mode: u8,
+    user: [byte: SMTP_USER_MAX],
+    user_len: usize,
+    pass: [byte: SMTP_PASS_MAX],
+    pass_len: usize,
+    /// EHLO 报的名字（不是邮箱域）；空则用 "localhost"
+    hostname: [byte: SMTP_EHLO_MAX],
+    hostname_len: usize,
+}
+
+export fn smtp_cfg_empty() SmtpCfg {
+    var c: SmtpCfg = SmtpCfg{};
+    c.port = SMTP_PORT_PLAIN;
+    c.mode = SMTP_MODE_PLAIN;
+    return c;
+}
+
+fn smtp_put(dst: &byte, cap: usize, pos: &usize, src: &[byte]) bool {
+    const p: usize = pos[0];
+    if src.len > cap {
+        return false;
+    }
+    if p > cap - src.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < src.len {
+        dst[p + i] = src[i];
+        i = i + 1;
+    }
+    pos[0] = p + src.len;
+    return true;
+}
+
+/// 追加 `src[off .. off+n)`。
+/// 注意：不要用 `src[off: off+n]` —— 运行时起点的切片目前编译成 `len = 终点`，
+/// 所以凡是起点非 0 的切片都走这个函数（`tests/test_smtp.uya` 会把这条钉住）。
+fn smtp_put_at(dst: &byte, cap: usize, pos: &usize, src: &byte, off: usize, n: usize) bool {
+    const p: usize = pos[0];
+    if n > cap || p > cap - n {
+        return false;
+    }
+    var i: usize = 0;
+    while i < n {
+        dst[p + i] = src[off + i];
+        i = i + 1;
+    }
+    pos[0] = p + n;
+    return true;
+}
+
+fn smtp_put2(dst: &byte, cap: usize, pos: &usize, v: i64) bool {
+    if v < 0 || v > 99 {
+        return false;
+    }
+    const hi: byte = (48 as byte) + (v / 10) as byte;
+    const lo: byte = (48 as byte) + (v % 10) as byte;
+    var two: [byte: 2] = [0: 2];
+    two[0] = hi;
+    two[1] = lo;
+    return smtp_put(dst, cap, pos, two[0: 2]);
+}
+
+fn smtp_put_i64(dst: &byte, cap: usize, pos: &usize, v: i64) bool {
+    if v < 0 {
+        return false;
+    }
+    var digits: [byte: 20] = [0: 20];
+    var n: usize = 0;
+    var x: i64 = v;
+    if x == 0 {
+        digits[0] = '0' as byte;
+        n = 1;
+    }
+    while x > 0 && n < 20 {
+        digits[n] = (48 as byte) + (x % 10) as byte;
+        x = x / 10;
+        n = n + 1;
+    }
+    // 反向写入
+    var i: usize = n;
+    while i > 0 {
+        var b: [byte: 1] = [0: 1];
+        b[0] = digits[i - 1];
+        if !smtp_put(dst, cap, pos, b[0: 1]) {
+            return false;
+        }
+        i = i - 1;
+    }
+    return true;
+}
+
+fn smtp_lower(b: byte) byte {
+    if b >= ('A' as byte) && b <= ('Z' as byte) {
+        return (b +% 32) as byte;
+    }
+    return b;
+}
+
+fn smtp_starts_with(s: &[byte], lit: &[byte]) bool {
+    if s.len < lit.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < lit.len {
+        if smtp_lower(s[i]) != smtp_lower(lit[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn smtp_hex_val(b: byte) i32 {
+    if b >= ('0' as byte) && b <= ('9' as byte) {
+        return (b - ('0' as byte)) as i32;
+    }
+    if b >= ('a' as byte) && b <= ('f' as byte) {
+        return 10 + (b - ('a' as byte)) as i32;
+    }
+    if b >= ('A' as byte) && b <= ('F' as byte) {
+        return 10 + (b - ('A' as byte)) as i32;
+    }
+    return 0 - 1;
+}
+
+/// 主机名/域名合法性：可见 ASCII（不含空格/控制字符/`@`/`/`），长度 1..cap。
+fn smtp_host_ok(h: &[byte], hs: usize, he: usize) bool {
+    if he <= hs || he > h.len || he - hs > SMTP_HOST_MAX {
+        return false;
+    }
+    var i: usize = hs;
+    while i < he {
+        const b: byte = h[i];
+        if b <= (32 as byte) || b >= (127 as byte) {
+            return false;
+        }
+        if b == ('@' as byte) || b == ('/' as byte) || b == (':' as byte) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// 邮箱地址（MAIL FROM/RCPT TO 用）：必须含一个 `@`，不含空白/控制字符/尖括号。
+export fn smtp_addr_ok(a: &[byte]) bool {
+    if a.len < 3 || a.len > 254 {
+        return false;
+    }
+    var at_n: usize = 0;
+    var i: usize = 0;
+    while i < a.len {
+        const b: byte = a[i];
+        if b <= (32 as byte) || b >= (127 as byte) {
+            return false;
+        }
+        if b == ('<' as byte) || b == ('>' as byte) || b == (',' as byte) || b == (';' as byte) {
+            return false;
+        }
+        if b == ('@' as byte) {
+            at_n = at_n + 1;
+        }
+        i = i + 1;
+    }
+    if at_n != 1 {
+        return false;
+    }
+    if a[0] == ('@' as byte) || a[a.len - 1] == ('@' as byte) {
+        return false;
+    }
+    return true;
+}
+
+/// 主题：单行、可见 ASCII/UTF-8、无 CR/LF（防头注入）。UTF-8 原样发（8bit 头），
+/// 现代 MTA 基本都收；纯 ASCII 场景不受影响。
+export fn smtp_subject_ok(s: &[byte]) bool {
+    if s.len > 200 {
+        return false;
+    }
+    var i: usize = 0;
+    while i < s.len {
+        const b: byte = s[i];
+        if b == ('\r' as byte) || b == ('\n' as byte) || b == (0 as byte) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// 百分号解码（`%40` → `@`），用于 URL 里的 username/password。
+/// 目标缓冲不够或出现控制字符/非法转义 → error。
+fn smtp_pct_into(src: &[byte], ss: usize, se: usize, dst: &byte, cap: usize,
+    out_len: &usize) !void {
+    out_len[0] = 0;
+    if cap == 0 || se < ss || se > src.len {
+        return error.SmtpBadUrl;
+    }
+    var o: usize = 0;
+    var i: usize = ss;
+    while i < se {
+        var b: byte = src[i];
+        if b == ('%' as byte) {
+            if i + 2 >= se {
+                return error.SmtpBadUrl;
+            }
+            const hi: i32 = smtp_hex_val(src[i + 1]);
+            const lo: i32 = smtp_hex_val(src[i + 2]);
+            if hi < 0 || lo < 0 {
+                return error.SmtpBadUrl;
+            }
+            b = ((hi *% 16 +% lo) & 255) as byte;
+            i = i + 3;
+        } else {
+            i = i + 1;
+        }
+        if b < (32 as byte) || b == (127 as byte) {
+            return error.SmtpBadUrl;
+        }
+        if o >= cap {
+            return error.SmtpBadUrl;
+        }
+        dst[o] = b;
+        o = o + 1;
+    }
+    out_len[0] = o;
+    return;
+}
+
+fn smtp_copy_into(src: &[byte], ss: usize, se: usize, dst: &byte, cap: usize,
+    out_len: &usize) bool {
+    out_len[0] = 0;
+    if se < ss || se > src.len {
+        return false;
+    }
+    const n: usize = se - ss;
+    if n > cap {
+        return false;
+    }
+    var i: usize = 0;
+    while i < n {
+        dst[i] = src[ss + i];
+        i = i + 1;
+    }
+    out_len[0] = n;
+    return true;
+}
+
+/// 解析端口（1..65535）。ok 写出是否解析成功。
+fn smtp_parse_port(s: &[byte], ss: usize, se: usize, ok: &bool) u16 {
+    ok[0] = false;
+    if se <= ss || se - ss > 5 || se > s.len {
+        return 0;
+    }
+    var v: i64 = 0;
+    var i: usize = ss;
+    while i < se {
+        const b: byte = s[i];
+        if b < ('0' as byte) || b > ('9' as byte) {
+            return 0;
+        }
+        v = v *% 10 +% (b - ('0' as byte)) as i64;
+        i = i + 1;
+    }
+    if v < 1 || v > 65535 {
+        return 0;
+    }
+    ok[0] = true;
+    return v as u16;
+}
+
+/// 解析 SMTP 连接串。支持：
+///   smtp://host            端口 587 + STARTTLS
+///   smtps://host           端口 465 + 隐式 TLS
+///   smtp://user:pass@host:2525
+///   host:25                无 scheme → 明文
+/// 没写端口时按 scheme 取默认值；用户名/密码支持 `%XX` 转义。
+export fn smtp_parse_url(url: &[byte], c: &SmtpCfg) !void {
+    if url.len == 0 || url.len > 1024 {
+        return error.SmtpBadUrl;
+    }
+    var i: usize = 0;
+    var mode: u8 = SMTP_MODE_PLAIN;
+    var def_port: u16 = SMTP_PORT_PLAIN;
+    if smtp_starts_with(url, &"smtps://"[0: 8]) {
+        mode = SMTP_MODE_TLS;
+        def_port = SMTP_PORT_TLS;
+        i = 8;
+    } else if smtp_starts_with(url, &"smtp://"[0: 7]) {
+        mode = SMTP_MODE_STARTTLS;
+        def_port = SMTP_PORT_SUB;
+        i = 7;
+    }
+    // 不接受路径/查询串（避免把 `?tls=off` 之类的写法误当主机名）
+    var j: usize = i;
+    while j < url.len {
+        const b: byte = url[j];
+        if b == ('/' as byte) || b == ('?' as byte) || b == ('#' as byte) {
+            return error.SmtpBadUrl;
+        }
+        j = j + 1;
+    }
+    // 用户信息按**最后一个** '@' 切（密码里允许 '@'）
+    var at: usize = url.len;
+    var k: usize = i;
+    while k < url.len {
+        if url[k] == ('@' as byte) {
+            at = k;
+        }
+        k = k + 1;
+    }
+    var host_start: usize = i;
+    if at < url.len {
+        // [i, at) 是 user[:pass]
+        var colon: usize = at;
+        var m: usize = i;
+        while m < at {
+            if url[m] == (':' as byte) {
+                colon = m;
+                break;
+            }
+            m = m + 1;
+        }
+        if colon == at {
+            var ul: usize = 0;
+            try smtp_pct_into(url, i, at, &c.user[0], SMTP_USER_MAX, &ul);
+            c.user_len = ul;
+        } else {
+            var ul2: usize = 0;
+            try smtp_pct_into(url, i, colon, &c.user[0], SMTP_USER_MAX, &ul2);
+            c.user_len = ul2;
+            var pl: usize = 0;
+            try smtp_pct_into(url, colon + 1, at, &c.pass[0], SMTP_PASS_MAX, &pl);
+            c.pass_len = pl;
+        }
+        host_start = at + 1;
+    }
+    if host_start >= url.len {
+        return error.SmtpBadUrl;
+    }
+    if url[host_start] == ('[' as byte) {
+        return error.SmtpBadUrl;        // 不支持 IPv6 字面量
+    }
+    // 从右往左找端口分隔的 ':'（主机名里没有 ':'）
+    var host_end: usize = url.len;
+    var port: u16 = def_port;
+    var p: usize = url.len;
+    while p > host_start {
+        p = p - 1;
+        if url[p] == (':') as byte {
+            if p + 1 >= url.len {
+                return error.SmtpBadUrl;
+            }
+            var ok: bool = false;
+            const pv: u16 = smtp_parse_port(url, p + 1, url.len, &ok);
+            if !ok {
+                return error.SmtpBadUrl;
+            }
+            port = pv;
+            host_end = p;
+            break;
+        }
+    }
+    if !smtp_host_ok(url, host_start, host_end) {
+        return error.SmtpBadUrl;
+    }
+    if !smtp_copy_into(url, host_start, host_end, &c.host[0], SMTP_HOST_MAX, &c.host_len) {
+        return error.SmtpBadUrl;
+    }
+    c.port = port;
+    c.mode = mode;
+    if c.hostname_len == 0 {
+        _ = smtp_copy_into(&"localhost"[0: 9], 0, 9, &c.hostname[0], SMTP_EHLO_MAX, &c.hostname_len);
+    }
+    return;
+}
+
+/// 解析一条 SMTP 应答（可能是多行）。
+/// 返回 1 = 完整一条（`used` 为消费的字节数），0 = 数据还不够（继续读），-1 = 格式非法。
+export fn smtp_parse_reply(buf: &const byte, len: usize, code: &i32, used: &usize) i32 {
+    code[0] = 0;
+    used[0] = 0;
+    if len < 4 {
+        return 0;
+    }
+    var pos: usize = 0;
+    var first: i32 = 0;
+    var got_first: bool = false;
+    while pos < len {
+        var e: usize = pos;
+        while e < len {
+            if buf[e] == ('\r' as byte) {
+                break;
+            }
+            if buf[e] == ('\n' as byte) {
+                return -1;          // 只认 CRLF
+            }
+            e = e + 1;
+        }
+        if e >= len {
+            return 0;               // 行还没收全
+        }
+        if e + 1 >= len {
+            return 0;               // 有 CR 没 LF
+        }
+        if buf[e + 1] != ('\n' as byte) {
+            return -1;
+        }
+        const llen: usize = e - pos;
+        if llen < 3 {
+            return -1;
+        }
+        var d: i32 = 0;
+        var t: usize = 0;
+        while t < 3 {
+            const ch: byte = buf[pos + t];
+            if ch < ('0' as byte) || ch > ('9' as byte) {
+                return -1;
+            }
+            d = d * 10 + (ch - ('0' as byte)) as i32;
+            t = t + 1;
+        }
+        var more: bool = false;
+        if llen > 3 {
+            more = buf[pos + 3] == ('-' as byte);
+        }
+        if !got_first {
+            first = d;
+            got_first = true;
+        } else if d != first {
+            return -1;              // 多行应答编号必须一致
+        }
+        pos = e + 2;
+        if !more {
+            code[0] = first;
+            used[0] = pos;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+const SMTP_WEEKDAY: &[byte] = &"SunMonTueWedThuFriSat"[0: 21];
+const SMTP_MONTH: &[byte] = &"JanFebMarAprMayJunJulAugSepOctNovDec"[0: 36];
+
+/// RFC 5322 日期：`Wed, 26 Oct 2026 09:08:25 +0000`（统一 UTC）。
+/// 返回写入长度；0 = 容量不够或时间不可表示（1970 之前）。
+export fn smtp_rfc822_date(sec: i64, out: &byte, cap: usize) usize {
+    if cap < 31 || sec < 0 || sec > 253402300799 {
+        return 0;
+    }
+    var days: i64 = sec / 86400;
+    var rem: i64 = sec -% days *% 86400;
+    if rem < 0 {
+        rem = rem +% 86400;
+        days = days -% 1;
+    }
+    var wd_i: i64 = (days +% 4) % (7 as i64);   // 1970-01-01 = 周四（周日=0）
+    if wd_i < 0 {
+        wd_i = wd_i +% 7;
+    }
+    if wd_i > 6 {
+        wd_i = 6;
+    }
+    // Howard Hinnant, civil_from_days（sec >= 0 → z 恒为正，截断除法等于下取整）
+    const z: i64 = days +% 719468;
+    const era: i64 = z / 146097;
+    const doe: i64 = z -% era *% 146097;
+    const yoe: i64 = (doe -% doe / 1460 +% doe / 36524 -% doe / 146096) / 365;
+    var y: i64 = yoe +% era *% 400;
+    const doy: i64 = doe -% ((365 as i64) *% yoe +% yoe / 4 -% yoe / 100);
+    const mp: i64 = ((5 as i64) *% doy +% 2) / 153;
+    const d: i64 = doy -% ((153 as i64) *% mp +% 2) / 5 +% 1;
+    var mo: i64 = mp +% 3;
+    if mp >= 10 {
+        mo = mp -% 9;
+    }
+    if mo <= 2 {
+        y = y +% 1;
+    }
+    if mo < 1 || mo > 12 || d < 1 || d > 31 || y < 1970 || y > 9999 {
+        return 0;
+    }
+    const hh: i64 = rem / 3600;
+    const mi: i64 = (rem % (3600 as i64)) / 60;
+    const ss: i64 = rem % (60 as i64);
+    var pos: usize = 0;
+    const wd_off: usize = (wd_i as usize) * 3;
+    if !smtp_put_at(out, cap, &pos, &SMTP_WEEKDAY[0], wd_off, 3) {
+        return 0;
+    }
+    if !smtp_put(out, cap, &pos, &", "[0: 2]) {
+        return 0;
+    }
+    if !smtp_put2(out, cap, &pos, d) {
+        return 0;
+    }
+    if !smtp_put(out, cap, &pos, &" "[0: 1]) {
+        return 0;
+    }
+    const mo_off: usize = ((mo - 1) as usize) * 3;
+    if !smtp_put_at(out, cap, &pos, &SMTP_MONTH[0], mo_off, 3) {
+        return 0;
+    }
+    if !smtp_put(out, cap, &pos, &" "[0: 1]) {
+        return 0;
+    }
+    if !smtp_put_i64(out, cap, &pos, y) {
+        return 0;
+    }
+    if !smtp_put(out, cap, &pos, &" "[0: 1]) {
+        return 0;
+    }
+    if !smtp_put2(out, cap, &pos, hh) {
+        return 0;
+    }
+    if !smtp_put(out, cap, &pos, &":"[0: 1]) {
+        return 0;
+    }
+    if !smtp_put2(out, cap, &pos, mi) {
+        return 0;
+    }
+    if !smtp_put(out, cap, &pos, &":"[0: 1]) {
+        return 0;
+    }
+    if !smtp_put2(out, cap, &pos, ss) {
+        return 0;
+    }
+    if !smtp_put(out, cap, &pos, &" +0000"[0: 6]) {
+        return 0;
+    }
+    return pos;
+}
+
+/// 正文 → base64 折行文本（每行 ≤ 76 字符，行尾 CRLF）。返回写入长度；0 = 正文太大或容量不够。
+export fn smtp_base64_body(body: &[byte], out: &byte, cap: usize) usize {
+    if body.len == 0 {
+        return 0;
+    }
+    if body.len > (SMTP_B64_MAX / 4) * 3 - 3 {
+        return 0;
+    }
+    var tmp: [byte: SMTP_B64_MAX] = [0: SMTP_B64_MAX];
+    const n: usize = encode_base64(body, tmp[0: SMTP_B64_MAX]) catch {
+        return 0;
+    };
+    var pos: usize = 0;
+    var i: usize = 0;
+    while i < n {
+        var chunk: usize = n - i;
+        if chunk > SMTP_B64_LINE {
+            chunk = SMTP_B64_LINE;
+        }
+        if !smtp_put_at(out, cap, &pos, &tmp[0], i, chunk) {
+            return 0;
+        }
+        if !smtp_put(out, cap, &pos, &"\r\n"[0: 2]) {
+            return 0;
+        }
+        i = i + chunk;
+    }
+    return pos;
+}
+
+/// 组装整封邮件（含头与正文），返回长度；0 = 容量不够/参数非法。
+/// 结尾自带一行 CRLF（调用方随后发 `.` + CRLF 结束 DATA）。
+export fn smtp_build_message(c: &const SmtpCfg, from: &[byte], to: &[byte],
+    subject: &[byte], body: &[byte], now_sec: i64, seq: i64, out: &byte, cap: usize) usize {
+    if !smtp_addr_ok(from) || !smtp_addr_ok(to) || !smtp_subject_ok(subject) {
+        return 0;
+    }
+    var pos: usize = 0;
+    var date: [byte: 40] = [0: 40];
+    const dn: usize = smtp_rfc822_date(now_sec, &date[0], 40);
+    if dn == 0 {
+        return 0;
+    }
+    if !smtp_put(out, cap, &pos, &"Date: "[0: 6]) {
+        return 0;
+    }
+    if !smtp_put(out, cap, &pos, date[0: dn]) {
+        return 0;
+    }
+    if !smtp_put(out, cap, &pos, &"\r\nFrom: "[0: 8]) {
+        return 0;
+    }
+    if !smtp_put(out, cap, &pos, from) {
+        return 0;
+    }
+    if !smtp_put(out, cap, &pos, &"\r\nTo: "[0: 6]) {
+        return 0;
+    }
+    if !smtp_put(out, cap, &pos, to) {
+        return 0;
+    }
+    if !smtp_put(out, cap, &pos, &"\r\nSubject: "[0: 11]) {
+        return 0;
+    }
+    if !smtp_put(out, cap, &pos, subject) {
+        return 0;
+    }
+    if !smtp_put(out, cap, &pos, &"\r\nMessage-ID: <"[0: 15]) {
+        return 0;
+    }
+    if !smtp_put_i64(out, cap, &pos, seq) {
+        return 0;
+    }
+    if !smtp_put(out, cap, &pos, &"."[0: 1]) {
+        return 0;
+    }
+    if !smtp_put_i64(out, cap, &pos, now_sec) {
+        return 0;
+    }
+    if !smtp_put(out, cap, &pos, &"@"[0: 1]) {
+        return 0;
+    }
+    if !smtp_put(out, cap, &pos, c.hostname[0: c.hostname_len]) {
+        return 0;
+    }
+    if !smtp_put(out, cap, &pos, &">\r\nMIME-Version: 1.0"[0: 20]) {
+        return 0;
+    }
+    if !smtp_put(out, cap, &pos,
+        &"\r\nContent-Type: text/plain; charset=utf-8"[0: 41]) {
+        return 0;
+    }
+    if !smtp_put(out, cap, &pos,
+        &"\r\nContent-Transfer-Encoding: base64"[0: 35]) {
+        return 0;
+    }
+    if !smtp_put(out, cap, &pos, &"\r\n\r\n"[0: 4]) {
+        return 0;
+    }
+    if body.len == 0 {
+        return pos;
+    }
+    // `smtp_base64_body` 总是从目标起始写，所以先编码到临时缓冲再追加到头后面。
+    var tmp: [byte: SMTP_B64_MAX] = [0: SMTP_B64_MAX];
+    const tn: usize = smtp_base64_body(body, &tmp[0], SMTP_B64_MAX);
+    if tn == 0 {
+        return 0;
+    }
+    if !smtp_put(out, cap, &pos, tmp[0: tn]) {
+        return 0;
+    }
+    return pos;
+}
+
+/// 供 `src/net/smtp.uya` 拼命令行用的公开追加（内部就是 `smtp_put`）。
+export fn smtp_append(dst: &byte, cap: usize, pos: &usize, src: &[byte]) bool {
+    return smtp_put(dst, cap, pos, src);
+}

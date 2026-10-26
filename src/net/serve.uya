@@ -3642,6 +3642,10 @@ export fn serve_run(lfd: i32, stats: &ServeStats) !i32 {
         if plugin_pool_ready() {
             plugin_pool_tick_at(srv_now_ms() as i64);
         }
+        // D7：OTP 邮件投递在子进程里跑，这里只做 WNOHANG 收尸 + 超时 SIGKILL
+        if mailer_enabled() {
+            mailer_tick(srv_now_ms());
+        }
         if srv_stop_requested() != 0 && stopping == 0 {
             stopping = 1;
             stop_at = srv_now_ms() +% SRV_SHUTDOWN_MS;
@@ -3705,6 +3709,10 @@ export fn serve_run(lfd: i32, stats: &ServeStats) !i32 {
     }
     _ = sys_close(epfd) catch {};
     g_epfd = 0 - 1;
+    // D7：停机时杀掉还没跑完的邮件 relay 子进程（邮件不是关键路径，不等待）
+    if mailer_enabled() {
+        mailer_shutdown();
+    }
     rc = 0;
     return rc;
 }
@@ -3789,6 +3797,28 @@ fn srv_otp(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 400, SRV_JSON_400, keep);
         return;
     };
+    // D7：验证码必须有出口。
+    //   * 配了 SMTP → 入队，由 relay 子进程异步投递（这里只 fork，不等网络）；
+    //   * 没配 SMTP 但开了 --dev-otp → 直接把 code 回给调用方；
+    //   * 两个都没有 → 503：不再静默回 ok 让人等一封永远不来的信。
+    if mailer_enabled() {
+        var subj: [byte: 64] = [0: 64];
+        const sn: usize = mailer_otp_subject(&subj[0], 64);
+        var body: [byte: 512] = [0: 512];
+        const bn: usize = mailer_otp_body(code[0: cn], 600, &body[0], 512);
+        if sn == 0 || bn == 0 {
+            srv_static(c, 503, SRV_JSON_503, keep);
+            return;
+        }
+        mailer_enqueue(email[0: en], subj[0: sn], body[0: bn]) catch {
+            // 队列满 / fork 失败：让客户端稍后重试，而不是假装发出去了
+            srv_static(c, 503, SRV_JSON_503, keep);
+            return;
+        };
+    } else if !g_dev_otp {
+        srv_static(c, 503, SRV_JSON_503, keep);
+        return;
+    }
     var w: JsonW = JsonW{};
     jsonw_init(&w);
     jsonw_obj(&w);
