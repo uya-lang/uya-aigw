@@ -31,3 +31,9 @@ logs/
 
 # Uya 构建缓存（uya build 生成）
 .uyacache/
+
+# 本机凭据/临时凭据文件：绝不入库（曾经因为 `git add -A` 误提交过一次）
+smtps.txt
+smtp.env
+poster@ersunfu.cn
+*.授权码
