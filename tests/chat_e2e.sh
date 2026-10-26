@@ -283,6 +283,11 @@ echo "$MACJ" | grep -q '"role":"admin"' || { echo "$MAC" >&2; fail "mcp catalog 
 echo "$MACJ" | grep -q '"path":"/admin/backup"' || { echo "$MAC" >&2; fail "mcp catalog backup"; }
 echo "$MACJ" | grep -q '"path":"/admin/billing"' || { echo "$MAC" >&2; fail "mcp catalog billing"; }
 echo "$MACJ" | grep -q '"path":"/admin/pricing"' || { echo "$MAC" >&2; fail "mcp catalog pricing"; }
+# POST /admin/pricing 是 README §10 的已知缺陷（恒 400），目录里不该宣传它
+if echo "$MACJ" | grep -q '"method":"POST","path":"/admin/pricing"'; then
+  echo "$MAC" >&2; fail "mcp catalog 不该暴露 POST /admin/pricing"
+fi
+echo "$MACJ" | grep -q '"path":"/admin/price-entries"' || { echo "$MAC" >&2; fail "mcp catalog price-entries"; }
 if echo "$MACJ" | grep -q '"path":"/v1/me"'; then echo "$MAC" >&2; fail "mcp catalog 管理员不该看到自助接口"; fi
 MC=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer test-admin' \
   --data '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"api_call","arguments":{"method":"GET","path":"/admin/backup"}}}' "$BASE/mcp")

@@ -985,8 +985,10 @@ const SRV_ROUTES: [SrvRouteDef: 46] = [
     SrvRouteDef{ path: &"/admin/health"[0: 13], route: ROUTE_ADMIN_HEALTH, mcp: 1, admin_only: true,
         desc: &"schema 版本、实体计数、最近备份日"[0: 46],
         example: &""[0: 0] },
-    SrvRouteDef{ path: &"/admin/pricing"[0: 14], route: ROUTE_ADMIN_PRICING, mcp: 3, admin_only: true,
-        desc: &"价目：GET 查 sell+cost，POST 建卡写价目"[0: 49],
+    // 写入走 `POST /admin/price-entries`（往当前生效卡追加）；`POST /admin/pricing` 是 README §10
+    // 记录的已知缺陷（恒 400），所以目录里只暴露 GET，免得模型去撞坏路径。
+    SrvRouteDef{ path: &"/admin/pricing"[0: 14], route: ROUTE_ADMIN_PRICING, mcp: 1, admin_only: true,
+        desc: &"价目：查 sell+cost（写价目用 POST /admin/price-entries）"[0: 66],
         example: &"/admin/pricing?model=mock-model&provider=mock&ts=1700000000"[0: 59] },
     SrvRouteDef{ path: &"/admin/price-entries"[0: 20], route: ROUTE_ADMIN_PRICES, mcp: 3, admin_only: true,
         desc: &"当前价目卡的条目列表 / 追加条目"[0: 45],
@@ -5343,15 +5345,13 @@ fn srv_mcp_capture_end() void {
 }
 
 fn srv_mcp_req_reset(src: &SrvConn, is_get: bool) void {
+    // 上一次 api_call 的请求体是堆缓冲，必须走 srv_body_reset 归还（否则泄缓冲 + 占名额）。
+    srv_body_reset(&g_mcp_fc);
     g_mcp_fc.keep = true;
     g_mcp_fc.is_get = is_get;
     g_mcp_fc.is_head_req = false;
-    g_mcp_fc.body_len = 0;
     g_mcp_fc.path_len = 0;
     g_mcp_fc.auth_len = 0;
-    g_mcp_fc.body_overflow = false;
-    g_mcp_fc.body_busy = false;
-    g_mcp_fc.body_big = Buf{ ptr: null, len: 0, cap: 0 };
     var i: usize = 0;
     while i < src.auth_len && i < 256 {
         g_mcp_fc.auth[i] = src.auth[i];
@@ -5546,22 +5546,31 @@ fn srv_mcp_api_catalog(c: &SrvConn, id: i64, role: i32) void {
     srv_mcp_send_jsonw(c, id, &w);
 }
 
+/// 往临时请求体追加一段字节（走 `srv_body_put`，堆缓冲按需增长）。
+fn srv_mcp_body_append(s: &[byte]) bool {
+    var i: usize = 0;
+    while i < s.len {
+        if !srv_body_put(&g_mcp_fc, s[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
 /// POST 体：原样透传 `arguments.body`（对象/数组按原文 span，字符串取其内容）；
 /// 缺省给 `{}`（这些接口的 body 都是 JSON 对象）。
 fn srv_mcp_set_body_raw(d: &JsonDoc, args: i32) bool {
     const node: i32 = srv_mcp_arg_node(d, args, "body");
     if node < 0 {
-        g_mcp_fc.body[0] = 123 as byte; // {
-        g_mcp_fc.body[1] = 125 as byte; // }
-        g_mcp_fc.body_len = 2;
-        return true;
+        return srv_mcp_body_append(&"{}"[0: 2]);
     }
-    const n: usize = json_raw(d, node, &g_mcp_fc.body[0], SRV_BODY_INLINE);
-    if n == 0 || n >= SRV_BODY_INLINE {
+    // 暂存用 out 缓冲：它要等到 srv_mcp_send_captured 才会被重置，此刻还是空的。
+    const n: usize = json_raw(d, node, &g_mcp_aux.out[0], SRV_MCP_OUT_MAX);
+    if n == 0 || n >= SRV_MCP_OUT_MAX {
         return false;
     }
-    g_mcp_fc.body_len = n;
-    return true;
+    return srv_mcp_body_append(g_mcp_aux.out[0: n]);
 }
 
 /// `api_call`：按目录里的一条调真实 REST handler（鉴权/参数校验都走 handler 自己）。
@@ -5611,6 +5620,7 @@ fn srv_mcp_api_call(c: &SrvConn, stats: &ServeStats, d: &JsonDoc, args: i32,
     srv_mcp_capture_begin();
     srv_begin_response(&g_mcp_fc, stats);
     srv_mcp_capture_end();
+    srv_body_reset(&g_mcp_fc); // handler 已经读完，请求体（可能占大包名额）马上归还
     srv_mcp_send_captured(c, id);
 }
 
