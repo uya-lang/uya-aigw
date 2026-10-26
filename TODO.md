@@ -52,25 +52,16 @@ ingest 幂等 + usage 分片 `hash(user_id)%4`、spool、journal 重放、集群
 > 已全部补完（D1 每请求日志、D2 连接池、D3 重试退避、D4 代理 CONNECT、
 > D5 `kind=stdio` 插件供应商），每项一次提交，明细见 `TODO_DONE.md`。
 
-## Phase E：handler 协程化（并发吞吐）
+## Phase E：handler 协程化（并发吞吐）——已完成
 
-> 压测结论（2026-10-26，本机 ab + opencode 上游）：改造前单进程吞吐 ≈ 1/上游延迟
-> （约 0.8 rps），8 并发时客户端延迟线性涨到 8×，CPU 0.2%；纯本地端点 `/healthz`
-> 无 keep-alive 17k rps、`/v1/usage` 5k rps。根因：请求处理在事件循环里同步
-> `wait_i32` 等上游。
-
-已完成（E1–E3，非流式 chat）：在途槽 + waker fd 挂主 epoll + 无 fd 可等时自旋，
-8 并发吞吐 0.64 → 3.2 rps（5×），延迟不再随并发线性膨胀。
-
-- ~~E1 `upstream_post` 的 future 化~~（done：直接 `htc_open_async` / `htc_body_async`）
-- ~~E2 `SrvConn` 在途状态 + 槽表~~（done：`ST_WAIT` + `SrvUpJob`，上限 32）
-- ~~E3 主循环 epoll 接管 future 的 waker fd~~（done：`srv_up_arm` / `srv_up_tick` / `srv_up_need_spin`）
-- E4 responses 非流式、chat 流式已搬进在途槽；**responses 流式**（`srv_responses_stream`）仍是阻塞实现。
-- E5 验收：`make test` 全绿 + 并发基准（8/32 并发吞吐随并发上升、延迟不线性膨胀）。
+> 压测结论（改造前，本机 ab + opencode 上游）：单进程吞吐 ≈ 1/上游延迟（约 0.8 rps），
+> 8 并发时延迟线性涨到 8×，CPU 0.2%。根因：请求处理在事件循环里同步 `wait_i32` 等上游。
+> 现在 chat / responses 的 JSON 与 SSE 四条路径都进在途槽（上限 32），waker fd 挂主 epoll、
+> 无 fd 可等时自旋；槽满/断开时退回阻塞实现或中止。明细见 `TODO_DONE.md` 的 E1–E5。
 
 ## 当前建议顺序
 
-全部阶段（T / A / B / C / D1）已完成；D2→D5 按上面顺序补接线。
+全部阶段（T / A / B / C / D）与 Phase E 均已完成，暂无未完成任务。
 
 ---
 

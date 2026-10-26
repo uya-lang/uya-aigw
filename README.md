@@ -534,9 +534,11 @@ docs/                     # overview、tls-provider、spike findings、deploy、
   之外的认证方式（Basic 已支持）。
 - **传输**：内置 HTTPS 只做 TLS（`scheme=http` 需显式允许明文，默认关闭）；HTTP/1.1 +
   keep-alive，无 HTTP/2。
-- **并发模型**：单线程 epoll 事件循环，且请求处理里同步等上游 → **单进程吞吐 ≈ 1/上游延迟**
-  （实测约 0.8 rps，8 并发时延迟线性涨 8×）。横向扩展用多进程绑同一端口（`SO_REUSEPORT`，
-  实测 4 进程 `/v1/usage` 5.0k → 16.1k rps）。彻底解法是把 handler 协程化（TODO Phase E）。
+- **并发模型**：单线程 epoll 事件循环。`/v1/chat/completions` 与 `/v1/responses`（含流式）
+  已协程化：上游等待期间主循环继续服务其它连接，单进程最多 **32 个在途请求**
+  （`SRV_UP_MAX`），超出的请求退回阻塞实现。实测（opencode 上游，8 并发）改造前 0.64 rps、
+  延迟线性涨到 8×；改造后 2.8–4.0 rps，延迟≈单请求延迟；4 进程 + `SO_REUSEPORT`
+  可继续线性扩展。复现：`python3 tests/bench_gateway.py <url> <key> <model> 16 8`。
 - **预算不硬拦截**：只做 `over_budget` 标记 + 站内通知（见 §6.4）。
 - **计费精度**：nano-USD 整数，单 token 成本向下取整的累计误差在 `1e-9 USD/token` 量级。
 - 无 Prometheus `/metrics`：用 `requests.log`、`/admin/health`、`/v1/usage` 观测。

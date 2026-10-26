@@ -1629,6 +1629,11 @@ struct SrvUpJob {
     has_ev: bool,
     usage_found: bool,
     usage: PriceUsage,
+    // E4c：responses 流式的累积状态
+    rout: [byte: RESP_OUTPUT_MAX],
+    rout_len: usize,
+    tcs: [SrvToolCall: SRV_TC_MAX],
+    rs_closed: bool,
 }
 
 var g_jobs: [SrvUpJob: 32] = [];
@@ -1755,6 +1760,8 @@ fn srv_up_alloc(ci: i32) i32 {
             job.has_ev = false;
             job.usage_found = false;
             job.usage = PriceUsage{ input_tokens: 0, output_tokens: 0, cache_read_tokens: 0 };
+            job.rout_len = 0;
+            job.rs_closed = false;
             job.rmodel_len = 0;
             job.rinput_len = 0;
             job.rprev_len = 0;
@@ -2146,7 +2153,7 @@ fn srv_up_spawn(j: i32, stats: &ServeStats, drive: bool) void {
         return;
     };
     job.nowu = nowu;
-    if job.plan.stream && job.kind != 2 {
+    if job.plan.stream && job.kind < 2 {
         // 流式在 E4 之前仍是阻塞实现（已 rare：仅失败转移换到流式上游时）。
         srv_chat_stream(c, &job.plan, &job.cfg, nowu, job.uid, &job.lg);
         srv_log_emit(&job.lg);
@@ -2158,7 +2165,7 @@ fn srv_up_spawn(j: i32, stats: &ServeStats, drive: bool) void {
     }
     job.has_fut = true;
     job.phase = SRV_UP_PHASE_OPEN;
-    const as_stream: bool = job.kind == 2;
+    const as_stream: bool = job.kind >= 2;
     var dl: u64 = nowu +% 60000;
     if as_stream {
         dl = nowu +% 10000;
@@ -2310,13 +2317,281 @@ fn srv_up_stream_end(j: i32, stats: &ServeStats) void {
     srv_up_release(j);
 }
 
+/// E4c：responses 流式打开成功 → SSE 头 + response.created。
+fn srv_up_restream_opened(j: i32, stats: &ServeStats) void {
+    if j < 0 || (j as usize) >= (SRV_UP_MAX as usize) {
+        return;
+    }
+    const job: &SrvUpJob = &g_jobs[j as usize];
+    if job.ci < 0 || (job.ci as usize) >= SRV_MAX_CONNS {
+        srv_up_release(j);
+        return;
+    }
+    const c: &SrvConn = &g_conns[job.ci as usize];
+    lb_report(job.plan.provider_id, true, store_now());
+    job.lg.stream = true;
+    const fl: !i32 = sys_fcntl(c.fd, 3, 0);
+    const flags: i32 = fl catch {
+        0;
+    };
+    if flags != 0 {
+        _ = sys_fcntl(c.fd, 4, flags & (0 -% 2049)) catch {};
+    }
+    var head: [byte: 256] = [0: 256];
+    const hn: usize = hsrv_resp_head(&head[0], 256, 200, &SRV_CTYPE_SSE[0: 17], 17,
+        0 as i64, true, false);
+    if !srv_send_all(c.fd, head[0: hn]) {
+        srv_up_restream_end(j, stats);
+        return;
+    }
+    job.stream_started = true;
+    job.lg.status = 200;
+    var jw: JsonW = JsonW{};
+    jsonw_init(&jw);
+    jsonw_obj(&jw);
+    jsonw_key(&jw, &"type"[0: 4]);
+    jsonw_str(&jw, &"response.created"[0: 16]);
+    jsonw_key(&jw, &"response"[0: 8]);
+    jsonw_obj(&jw);
+    jsonw_key(&jw, &"id"[0: 2]);
+    jsonw_str(&jw, job.lg.rid[0: job.lg.rid_len]);
+    jsonw_key(&jw, &"object"[0: 6]);
+    jsonw_str(&jw, &"response"[0: 8]);
+    jsonw_key(&jw, &"model"[0: 5]);
+    jsonw_str(&jw, job.plan.model[0: job.plan.model_len]);
+    jsonw_key(&jw, &"previous_response_id"[0: 20]);
+    jsonw_str(&jw, job.rprev[0: job.rprev_len]);
+    jsonw_end_obj(&jw);
+    jsonw_end_obj(&jw);
+    if !srv_sse_frame(c.fd, &"response.created"[0: 16], 16, jsonw_span(&jw)) {
+        srv_up_restream_end(j, stats);
+        return;
+    }
+    srv_up_restream_next(j, stats);
+}
+
+fn srv_up_restream_next(j: i32, stats: &ServeStats) void {
+    if j < 0 || (j as usize) >= (SRV_UP_MAX as usize) {
+        return;
+    }
+    const job: &SrvUpJob = &g_jobs[j as usize];
+    job.phase = SRV_UP_PHASE_EVENT;
+    job.has_ev = false;
+    job.has_fut = true;
+    job.fut = htc_next_event_async(&job.call, &job.has_ev, 5000 as u64);
+    _ = stats;
+}
+
+/// 一个上游事件 → 若干 responses 事件（文本增量 / 工具调用增量）。
+fn srv_up_restream_event(j: i32, is_err: bool, rc: i32, stats: &ServeStats) void {
+    if j < 0 || (j as usize) >= (SRV_UP_MAX as usize) {
+        return;
+    }
+    const job: &SrvUpJob = &g_jobs[j as usize];
+    if job.ci < 0 || (job.ci as usize) >= SRV_MAX_CONNS {
+        srv_up_release(j);
+        return;
+    }
+    const c: &SrvConn = &g_conns[job.ci as usize];
+    if is_err || rc == 0 || !job.has_ev {
+        srv_up_restream_end(j, stats);
+        return;
+    }
+    if job.lg.ttft_ms == 0 {
+        job.lg.ttft_ms = srv_now_ms() -| job.lg.start_ms;
+    }
+    var jd: JsonDoc = JsonDoc{};
+    var jw: JsonW = JsonW{};
+    if sse_is_done(&job.call.sse) {
+        job.sse_done = true;
+    } else if job.call.sse.ev.data_len > 0 && job.call.sse.ev.data[0] == (123 as byte) {
+        json_parse(&jd, job.call.sse.ev.data[0: job.call.sse.ev.data_len]) catch {};
+        if billing_usage_parse(&jd, json_root(&jd), &job.usage) {
+            job.usage_found = true;
+        }
+        const choices: i32 = json_get(&jd, json_root(&jd), &"choices"[0: 7]);
+        const c0: i32 = json_arr_at(&jd, choices, 0);
+        const delta: i32 = json_get(&jd, c0, &"delta"[0: 5]);
+        const content: i32 = json_get(&jd, delta, &"content"[0: 7]);
+        if json_kind(&jd, content) == JSON_STR {
+            var chunk: [byte: 1024] = [0: 1024];
+            const cn: usize = json_str(&jd, content, &chunk[0], 1024);
+            if cn > 0 {
+                var i: usize = 0;
+                while i < cn && job.rout_len < RESP_OUTPUT_MAX {
+                    job.rout[job.rout_len] = chunk[i];
+                    job.rout_len = job.rout_len + 1;
+                    i = i + 1;
+                }
+                jsonw_init(&jw);
+                jsonw_obj(&jw);
+                jsonw_key(&jw, &"type"[0: 4]);
+                jsonw_str(&jw, &"response.output_text.delta"[0: 26]);
+                jsonw_key(&jw, &"delta"[0: 5]);
+                jsonw_str(&jw, chunk[0: cn]);
+                jsonw_end_obj(&jw);
+                if !srv_sse_frame(c.fd, &"response.output_text.delta"[0: 26], 26,
+                    jsonw_span(&jw)) {
+                    job.rs_closed = true;
+                }
+            }
+        }
+        if !job.rs_closed {
+            const tca: i32 = json_get(&jd, delta, &"tool_calls"[0: 10]);
+            if tca >= 0 {
+                const tn: usize = json_arr_len(&jd, tca);
+                var ti: usize = 0;
+                while ti < tn && ti < SRV_TC_MAX && !job.rs_closed {
+                    const el: i32 = json_arr_at(&jd, tca, ti);
+                    const fnode: i32 = json_get(&jd, el, &"function"[0: 8]);
+                    const raw_slot: i64 = json_i64(&jd, json_get(&jd, el, &"index"[0: 5]));
+                    var slot: usize = 0;
+                    if raw_slot > 0 && raw_slot < 4 {
+                        slot = raw_slot as usize;
+                    }
+                    const tc: &SrvToolCall = &job.tcs[slot];
+                    const cid: i32 = json_get(&jd, el, &"id"[0: 2]);
+                    if cid >= 0 && json_kind(&jd, cid) == JSON_STR && tc.id_len == 0 {
+                        var cb: [byte: SRV_TC_ID_MAX] = [0: SRV_TC_ID_MAX];
+                        const cn2: usize = json_str(&jd, cid, &cb[0], SRV_TC_ID_MAX);
+                        tc.id_len = srv_tc_copy(&tc.id[0], SRV_TC_ID_MAX, cb[0: cn2]);
+                    }
+                    const fname: i32 = json_get(&jd, fnode, &"name"[0: 4]);
+                    if fname >= 0 && json_kind(&jd, fname) == JSON_STR && tc.name_len == 0 {
+                        var nb: [byte: SRV_TC_NAME_MAX] = [0: SRV_TC_NAME_MAX];
+                        const nn: usize = json_str(&jd, fname, &nb[0], SRV_TC_NAME_MAX);
+                        tc.name_len = srv_tc_copy(&tc.name[0], SRV_TC_NAME_MAX, nb[0: nn]);
+                    }
+                    if !tc.started && (tc.id_len > 0 || tc.name_len > 0) {
+                        tc.started = true;
+                        if !srv_tc_emit_added(c, tc, slot) {
+                            job.rs_closed = true;
+                        }
+                    }
+                    if !job.rs_closed {
+                        const farg: i32 = json_get(&jd, fnode, &"arguments"[0: 9]);
+                        if farg >= 0 && json_kind(&jd, farg) == JSON_STR {
+                            var ab: [byte: 512] = [0: 512];
+                            const an: usize = json_str(&jd, farg, &ab[0], 512);
+                            if an > 0 {
+                                var k: usize = 0;
+                                while k < an && tc.args_len < SRV_TC_ARGS_MAX {
+                                    tc.args[tc.args_len] = ab[k];
+                                    tc.args_len = tc.args_len + 1;
+                                    k = k + 1;
+                                }
+                                if !srv_tc_emit_delta(c, tc, slot, ab[0: an]) {
+                                    job.rs_closed = true;
+                                }
+                            }
+                        }
+                    }
+                    ti = ti + 1;
+                }
+            }
+        }
+    }
+    if job.rs_closed || job.sse_done {
+        srv_up_restream_end(j, stats);
+        return;
+    }
+    sse_consume(&job.call.sse);
+    job.sse_events = job.sse_events +% 1;
+    if job.sse_events >= 4096 {
+        srv_up_restream_end(j, stats);
+        return;
+    }
+    srv_up_restream_next(j, stats);
+}
+
+/// responses 流式收尾：工具调用 done → 结算 → 落库 → response.completed → 关连接。
+fn srv_up_restream_end(j: i32, stats: &ServeStats) void {
+    if j < 0 || (j as usize) >= (SRV_UP_MAX as usize) {
+        return;
+    }
+    const job: &SrvUpJob = &g_jobs[j as usize];
+    if job.ci < 0 || (job.ci as usize) >= SRV_MAX_CONNS {
+        srv_up_release(j);
+        return;
+    }
+    const c: &SrvConn = &g_conns[job.ci as usize];
+    _ = stats;
+    var di: usize = 0;
+    while di < SRV_TC_MAX {
+        if job.tcs[di].started && !job.rs_closed {
+            _ = srv_tc_emit_done(c, &job.tcs[di], di);
+        }
+        di = di + 1;
+    }
+    var settle: BillingResult = BillingResult{ cost_nano: 0, price_nano: 0, rate_version: 0, duplicate: false, found: false };
+    if job.usage_found {
+        billing_settle_deferred(job.lg.rid[0: job.lg.rid_len], job.uid, store_now(), 0,
+            job.plan.model[0: job.plan.model_len],
+            job.plan.provider_name[0: job.plan.provider_name_len], &job.usage, &settle) catch {};
+    }
+    srv_log_usage(&job.lg, &job.usage, settle.cost_nano);
+    if job.lg.rid_len > 0 {
+        resp_store(runtime_db(), job.lg.rid[0: job.lg.rid_len], job.uid, store_now(),
+            job.plan.model[0: job.plan.model_len], job.rprev[0: job.rprev_len],
+            job.rinput[0: job.rinput_len], job.rout[0: job.rout_len], &"{}"[0: 2]) catch {};
+    }
+    var jw: JsonW = JsonW{};
+    jsonw_init(&jw);
+    jsonw_obj(&jw);
+    jsonw_key(&jw, &"type"[0: 4]);
+    jsonw_str(&jw, &"response.completed"[0: 18]);
+    jsonw_key(&jw, &"response"[0: 8]);
+    jsonw_obj(&jw);
+    jsonw_key(&jw, &"id"[0: 2]);
+    jsonw_str(&jw, job.lg.rid[0: job.lg.rid_len]);
+    jsonw_key(&jw, &"usage"[0: 5]);
+    jsonw_obj(&jw);
+    jsonw_key(&jw, &"input_tokens"[0: 12]);
+    jsonw_i64(&jw, job.usage.input_tokens);
+    jsonw_key(&jw, &"output_tokens"[0: 13]);
+    jsonw_i64(&jw, job.usage.output_tokens);
+    jsonw_key(&jw, &"cost_nano"[0: 9]);
+    jsonw_i64(&jw, settle.cost_nano);
+    jsonw_key(&jw, &"price_nano"[0: 10]);
+    jsonw_i64(&jw, settle.price_nano);
+    jsonw_end_obj(&jw);
+    jsonw_key(&jw, &"output"[0: 6]);
+    jsonw_arr(&jw);
+    di = 0;
+    while di < SRV_TC_MAX {
+        if job.tcs[di].started {
+            srv_tc_write_item(&jw, &job.tcs[di], di);
+        }
+        di = di + 1;
+    }
+    jsonw_end_arr(&jw);
+    jsonw_end_obj(&jw);
+    jsonw_end_obj(&jw);
+    if !job.rs_closed {
+        _ = srv_sse_frame(c.fd, &"response.completed"[0: 18], 18, jsonw_span(&jw));
+    }
+    if job.stream_started {
+        _ = srv_send_all(c.fd, &"0\r\n\r\n"[0: 5]);
+    }
+    if job.lg.status == 0 {
+        job.lg.status = 200;
+    }
+    srv_log_emit(&job.lg);
+    srv_chat_close(c);
+    srv_up_release(j);
+}
+
 fn srv_up_ready(j: i32, is_err: bool, rc: i32, stats: &ServeStats) void {
     if j < 0 || (j as usize) >= (SRV_UP_MAX as usize) {
         return;
     }
     const job: &SrvUpJob = &g_jobs[j as usize];
     if job.phase == SRV_UP_PHASE_EVENT {
-        srv_up_stream_event(j, is_err, rc, stats);
+        if job.kind == 3 {
+            srv_up_restream_event(j, is_err, rc, stats);
+        } else {
+            srv_up_stream_event(j, is_err, rc, stats);
+        }
         return;
     }
     if job.phase == SRV_UP_PHASE_OPEN {
@@ -2327,6 +2602,10 @@ fn srv_up_ready(j: i32, is_err: bool, rc: i32, stats: &ServeStats) void {
                 return;
             }
             srv_up_fail(j, stats, true);
+            return;
+        }
+        if job.kind == 3 {
+            srv_up_restream_opened(j, stats);
             return;
         }
         if job.kind == 2 {
@@ -4098,22 +4377,8 @@ fn srv_responses_async_try(c: &SrvConn, stats: &ServeStats) bool {
     }
     c.state = ST_WAIT;
     if job.plan.stream {
-        // 流式仍是阻塞实现（E4b 再协程化）
-        var cfg: HttppConfig = httpp_empty();
-        if !upstream_config(&job.plan.host[0], job.plan.host_len, job.plan.port,
-            job.plan.auth_type, &job.plan.secret[0], job.plan.secret_len, &cfg) {
-            srv_up_respond(j, 400, SRV_JSON_400, stats, false);
-            return true;
-        }
-        const nowu: u64 = now_ms() catch {
-            srv_up_respond(j, 502, SRV_JSON_502, stats, false);
-            return true;
-        };
-        srv_responses_stream(c, key.user_id, &job.plan, &cfg, job.lg.rid[0: job.lg.rid_len],
-            job.rinput[0: job.rinput_len], job.rprev[0: job.rprev_len], &job.lg);
-        srv_log_emit(&job.lg);
-        srv_up_release(j);
-        return true;
+        // E4c：流式同样走 job（OPEN → EVENT 循环）
+        job.kind = 3;
     }
     srv_up_spawn(j, stats, false);
     if job.has_fut {
