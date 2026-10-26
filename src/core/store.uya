@@ -465,7 +465,8 @@ export fn store_create_key(d: &Db, user_id: i64, name: &[byte], now: i64,
 
 /// 校验一把 Key。未撤销、前缀命中且哈希一致才算通过。
 export fn store_verify_key(d: &Db, token: &[byte], out: &StoreKey) !void {
-    if token.len < STORE_KEY_TOKEN_LEN {
+    // 长度必须**精确**：只校验前 N 字节会让「正确 key + 后缀」也能通过。
+    if token.len != STORE_KEY_TOKEN_LEN {
         return error.KeyInvalid;
     }
     var i: usize = 0;

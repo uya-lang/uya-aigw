@@ -234,8 +234,13 @@ echo "$RST" | grep -q '"arguments":"{\\"city\\":\\"SF\\"}"' || { echo "$RST" >&2
 echo "$RST" | grep -q '"output":\[{"type":"function_call"' || { echo "$RST" >&2; fail "tool output array"; }
 echo "$RST" | grep -q 'response.completed' || { echo "$RST" >&2; fail "tool completed"; }
 
-# 4b2) models：公开列表来自 provider_models
-MJSON=$(curl -s --max-time 10 "http://127.0.0.1:$PORT/v1/models")
+# 4b2) models：列表来自 provider_models，且必须带有效 Key
+MCODE=$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/v1/models")
+[ "$MCODE" = "401" ] || fail "models without key status=$MCODE"
+MCODE=$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${TOKEN}x" \
+  "http://127.0.0.1:$PORT/v1/models")
+[ "$MCODE" = "401" ] || fail "models with key+suffix status=$MCODE"
+MJSON=$(curl -s --max-time 10 -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/v1/models")
 echo "$MJSON" | grep -q '"id":"mock-model"' || { echo "$MJSON" >&2; fail "models list"; }
 
 # 4c) 用量汇总（A6：billing 实时 upsert usage_daily）

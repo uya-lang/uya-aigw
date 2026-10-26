@@ -1299,6 +1299,18 @@ fn srv_models(c: &SrvConn) void {
         srv_static(c, 200, SRV_JSON_MODELS, keep);
         return;
     }
+    // 与 OpenAI 一致：/v1/models 必须带有效 Key（原先未校验，裸奔）。
+    var tok: [byte: 256] = [0: 256];
+    const tn: usize = chat_bearer_span(&c.auth[0], c.auth_len, &tok[0], 256);
+    if tn == 0 {
+        srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    }
+    var mk: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
+    store_verify_key_fast(runtime_db(), tok[0: tn], store_now(), &mk) catch {
+        srv_static(c, 401, SRV_JSON_401, keep);
+        return;
+    };
     var w: JsonW = JsonW{};
     jsonw_init(&w);
     jsonw_obj(&w);

@@ -74,6 +74,20 @@ fn test_key_lifecycle() !void {
     try store_verify_key(&d, tok[0: n], &k);
     try assert_eq_i32(k.user_id as i32, u.id as i32);
 
+    // 尾部追加一个字符也必须失败（长度精确匹配）
+    var longer: [byte: 41] = [0: 41];
+    var q: usize = 0;
+    while q < n && q < 41 {
+        longer[q] = tok[q];
+        q = q + 1;
+    }
+    longer[40] = 'x';
+    var longer_bad: bool = false;
+    _ = store_verify_key(&d, longer[0: 41], &k) catch |_| {
+        longer_bad = true;
+    };
+    try assert_eq_bool(longer_bad, true);
+
     // 改一位就应当失效
     tok[20] = if tok[20] == ('0' as byte) { '1' as byte } else { '0' as byte };
     var bad: bool = false;
