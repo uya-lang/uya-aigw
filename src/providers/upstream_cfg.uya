@@ -21,6 +21,36 @@ export fn upstream_config(host: &const byte, host_len: usize, port: i32,
     if !httpp_set_host(cfg, host, host_len) {
         return false;
     }
+    // D6：额外上游头（如 opencode 的 x-opencode-session）。格式 `Name: Value`。
+    {
+        const ev: &byte = getenv(&"AIGW_UPSTREAM_HEADER"[0] as &const byte);
+        if (ev as usize) != 0 {
+            var nm: [byte: 128] = [0: 128];
+            var nn: usize = 0;
+            var vv: [byte: 256] = [0: 256];
+            var vn: usize = 0;
+            var i: usize = 0;
+            var seen: bool = false;
+            while ev[i] != (0 as byte) && i < 4096 {
+                const ch: byte = ev[i];
+                if ch == (58 as byte) && !seen {
+                    seen = true;
+                } else if seen {
+                    if vn < 256 && !(vn == 0 && (ch == (32 as byte) || ch == (9 as byte))) {
+                        vv[vn] = ch;
+                        vn = vn + 1;
+                    }
+                } else if nn < 128 {
+                    nm[nn] = ch;
+                    nn = nn + 1;
+                }
+                i = i + 1;
+            }
+            if nn > 0 && seen {
+                _ = httpp_set_extra_header(cfg, &nm[0], nn, &vv[0], vn);
+            }
+        }
+    }
     if secret_len > 0 {
         if !httpp_set_secret(cfg, secret, secret_len) {
             return false;

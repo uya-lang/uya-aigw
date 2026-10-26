@@ -199,6 +199,7 @@ aigw tls pin   <host> <sha256hex> [--file <tsv>]
 | `NO_PROXY` / `no_proxy` | 代理白名单（`--no-proxy` 优先） | serve 启动 |
 | `AIGW_PLUGIN_CMD` | stdio 插件命令（`--plugin-cmd` 优先） | serve 启动 |
 | `SSL_CERT_FILE` | 额外的 PEM 信任根（与 `--ca` 叠加） | 上游 TLS 校验 |
+| `AIGW_UPSTREAM_HEADER` | 给所有上游请求追加一条头，格式 `Name: Value`（如 opencode 的 `x-opencode-session`） | 上游请求构造 |
 | `UYA` / `UYA_ROOT` | 编译期工具链与标准库路径 | Makefile / e2e 脚本 |
 
 测试脚本另用私有变量（不参与生产）：`AIGW_MODE`、`AIGW_DB`、`AIGW_UPSTREAM_PORT`、
@@ -293,6 +294,8 @@ curl -s -X POST -H "Authorization: Bearer $ADMIN" \
 - **重试**：`408/425/429/500/502/503/504` 按 `Retry-After` 或指数退避（100ms 起、封顶 30s）
   重试同一家，最多 3 次；传输层失败则熔断该家 30s 并换下一家（最多 3 家）。
 - 流式（SSE）请求不复用连接、不重试（已开始输出后无法重试）。
+- 有的上游要求额外路由头（如 `opencode.ai/zen` 的 `x-opencode-session`）：用
+  `AIGW_UPSTREAM_HEADER="x-opencode-session: <id>"` 统一追加一条。
 
 ### 6.3 价目、分时与计费
 

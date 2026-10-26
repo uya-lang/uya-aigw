@@ -42,6 +42,11 @@ export struct HttppConfig {
     allow_private: bool,
     aliases: [HttppAlias: HTTPP_MAX_MODELS],
     alias_count: usize,
+    // 额外上游头（D6）：`AIGW_UPSTREAM_HEADER="Name: Value"`，只加一条
+    extra_name: [byte: HTTPP_NAME_MAX],
+    extra_name_len: usize,
+    extra_value: [byte: 256],
+    extra_value_len: usize,
 }
 
 export fn httpp_empty() HttppConfig {
@@ -156,6 +161,28 @@ export fn httpp_set_secret(cfg: &HttppConfig, spec: &const byte, spec_len: usize
         return true;
     }
     return false;
+}
+
+/// D6：设置一条额外上游头（名字: 值）。空值表示不设置。
+export fn httpp_set_extra_header(cfg: &HttppConfig, name: &const byte, name_len: usize,
+    value: &const byte, value_len: usize) bool {
+    cfg.extra_name_len = 0;
+    cfg.extra_value_len = 0;
+    if name_len == 0 || name_len > HTTPP_NAME_MAX || value_len > 256 {
+        return false;
+    }
+    if !httpp_copy(&cfg.extra_name[0], HTTPP_NAME_MAX, name, name_len) {
+        return false;
+    }
+    cfg.extra_name_len = name_len;
+    if value_len == 0 {
+        return true;
+    }
+    if !httpp_copy(&cfg.extra_value[0], 256, value, value_len) {
+        return false;
+    }
+    cfg.extra_value_len = value_len;
+    return true;
 }
 
 export fn httpp_add_alias(cfg: &HttppConfig, alias: &const byte, alias_len: usize,
@@ -293,6 +320,12 @@ export fn httpp_build_request(cfg: &const HttppConfig, method: &const byte, meth
     if !buf_append_cstr(out, "\r\n" as &const byte) { return false; }
     if cfg.secret_len > 0 {
         if !httpp_auth_line(cfg, out) { return false; }
+    }
+    if cfg.extra_name_len > 0 && cfg.extra_value_len > 0 {
+        if !buf_append(out, &cfg.extra_name[0], cfg.extra_name_len) { return false; }
+        if !buf_append_cstr(out, ": " as &const byte) { return false; }
+        if !buf_append(out, &cfg.extra_value[0], cfg.extra_value_len) { return false; }
+        if !buf_append_cstr(out, "\r\n" as &const byte) { return false; }
     }
     if !buf_append_cstr(out, "Content-Type: application/json\r\nAccept: " as &const byte) { return false; }
     if stream {
