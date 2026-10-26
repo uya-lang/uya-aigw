@@ -89,7 +89,10 @@
 - A8（已落地）：schema v6 priority/weight + `lb.uya`（优先级/加权/会话亲和/熔断），
   serve 失败自动换 provider 重试；插件级重绑在 `plugin_pool_call` 内（同槽换进程重试一次）。
 - A7（已落地）：管理 REST（health/pricing GET+POST/billing/backup）+ MCP
-  （initialize/tools/list/tools/call：pricing_get、billing_query、backup_status）。
+  （initialize/tools/list/tools/call）。
+- A7b（已落地）：MCP 按凭据分权——`--admin-key` 可用全部 12 个 `admin_*` 工具；
+  普通 API Key 只看到 13 个账号自助工具，`billing_query`/`usage_get`/`requests_list`
+  强制本账号（忽略传入的 `user_id`），`admin_*` 一律 `-32001 permission denied`。
 - A5（已落地）：`/v1/responses` 非流式 + previous_response_id 续轮 + 流式事件
   （created/delta/completed + tool_calls 分片）；reasoning 不单独透传。
 - A4（已完成）：JSON DOM/构造器、providers/路由、billing 结算、chat 编排、serve 接线
