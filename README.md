@@ -199,6 +199,9 @@ aigw tls pin   <host> <sha256hex> [--file <tsv>]
 | `NO_PROXY` / `no_proxy` | 代理白名单（`--no-proxy` 优先） | serve 启动 |
 | `AIGW_PLUGIN_CMD` | stdio 插件命令（`--plugin-cmd` 优先） | serve 启动 |
 | `SSL_CERT_FILE` | 额外的 PEM 信任根（与 `--ca` 叠加） | 上游 TLS 校验 |
+| `AIGW_ASYNC_OFF` | 空 | `1` = 关闭 handler 协程化，强制走阻塞实现（排障/对比用） |
+| `HTTPS_PROXY` / `https_proxy` / `NO_PROXY` | 空 | 出站代理（D4）。**注意**：环境里有代理而代理不可用，上游会 `ECONNREFUSED(111)` 并秒回 502 —— 本机实例请 `unset` 或配 `NO_PROXY` |
+| `AIGW_ASYNC_DEBUG` | 空 | `1` = 打印在途请求的 spawn/fail 细节（含错误 id） |
 | `AIGW_UPSTREAM_HEADER` | 给所有上游请求追加一条头，格式 `Name: Value`（如 opencode 的 `x-opencode-session`） | 上游请求构造 |
 | `UYA` / `UYA_ROOT` | 编译期工具链与标准库路径 | Makefile / e2e 脚本 |
 
@@ -534,6 +537,8 @@ docs/                     # overview、tls-provider、spike findings、deploy、
   之外的认证方式（Basic 已支持）。
 - **传输**：内置 HTTPS 只做 TLS（`scheme=http` 需显式允许明文，默认关闭）；HTTP/1.1 +
   keep-alive，无 HTTP/2。
+- **上游失败语义**：传输层失败会熔断该 provider 30s（单 provider 时这段时间请求返回 400）；
+  复用连接被对端关闭（`HtcStale`）会换新连接立即重试一次，不计故障。
 - **并发模型**：单线程 epoll 事件循环。`/v1/chat/completions` 与 `/v1/responses`（含流式）
   已协程化：上游等待期间主循环继续服务其它连接，单进程最多 **32 个在途请求**
   （`SRV_UP_MAX`），超出的请求退回阻塞实现。实测（opencode 上游，8 并发）改造前 0.64 rps、

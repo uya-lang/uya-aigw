@@ -1609,6 +1609,7 @@ struct SrvUpJob {
     uid: i64,
     attempts: i32,
     http_tries: i32,
+    stale_tries: i32,
     resp: [byte: 8192],
     rn: usize,
     st: i32,
@@ -1639,6 +1640,12 @@ struct SrvUpJob {
 var g_jobs: [SrvUpJob: 32] = [];
 var g_up_waker: Waker = Waker{};
 var g_up_next_ms: u64 = 0;
+
+/// 排障开关：`AIGW_ASYNC_OFF=1` 强制走阻塞实现（对比用）；`AIGW_ASYNC_DEBUG=1` 打印上游失败细节。
+fn srv_env_on(name: &const byte) bool {
+    const ev: &byte = getenv(name);
+    return (ev as usize) != 0;
+}
 
 fn srv_up_active() i32 {
     var n: i32 = 0;
@@ -1748,6 +1755,7 @@ fn srv_up_alloc(ci: i32) i32 {
             job.armed = 0;
             job.attempts = 0;
             job.http_tries = 0;
+            job.stale_tries = 0;
             job.rn = 0;
             job.st = 0;
             job.retry_after = 0;
@@ -1800,12 +1808,14 @@ fn srv_up_poll_one(j: i32, stats: &ServeStats) void {
     const p: Poll<!i32> = job.fut.poll(&g_up_waker);
     var ready: bool = false;
     var is_err: bool = false;
+    var err_id: i32 = 0;
     var rc: i32 = 0;
     match p {
         .Ready(v) => {
             ready = true;
-            rc = v catch |_| {
+            rc = v catch |err| {
                 is_err = true;
+                err_id = @error_id(err) as i32;
                 0;
             };
         },
@@ -1817,7 +1827,7 @@ fn srv_up_poll_one(j: i32, stats: &ServeStats) void {
     }
     job.has_fut = false;
     srv_up_disarm(j);
-    srv_up_ready(j, is_err, rc, stats);
+    srv_up_ready(j, is_err, err_id, rc, stats);
 }
 
 /// 有在途 future 却没有任何 fd 可等（DNS/写缓冲/deadline 判定等阶段）→ 主循环自旋，
@@ -2068,7 +2078,7 @@ fn srv_up_after(j: i32, stats: &ServeStats, drive: bool) void {
 }
 
 /// 传输层失败：熔断 + 换一家（最多 3 家），换完就重新发起。
-fn srv_up_fail(j: i32, stats: &ServeStats, drive: bool) void {
+fn srv_up_fail(j: i32, stats: &ServeStats, drive: bool, err_id: i32) void {
     if j < 0 || (j as usize) >= (SRV_UP_MAX as usize) {
         return;
     }
@@ -2078,6 +2088,21 @@ fn srv_up_fail(j: i32, stats: &ServeStats, drive: bool) void {
         return;
     }
     const c: &SrvConn = &g_conns[job.ci as usize];
+    // 复用连接被对端关掉（HtcStale）：换新连接立刻重试一次，不算故障、不熔断。
+    if job.phase == SRV_UP_PHASE_OPEN && err_id == (@error_id(error.HtcStale) as i32)
+        && job.stale_tries < 1 {
+        job.stale_tries = job.stale_tries +% 1;
+        srv_up_spawn(j, stats, drive);
+        if job.has_fut {
+            srv_up_poll_one(j, stats);
+        }
+        return;
+    }
+    if srv_env_on(&"AIGW_ASYNC_DEBUG"[0] as &const byte) {
+        printf("[up] fail err=%d phase=%d kind=%d attempts=%d host=%s port=%d\n" as *byte,
+            err_id, job.phase, job.kind, job.attempts, &job.cfg.host[0] as &const byte,
+            job.cfg.port as i32);
+    }
     lb_report(job.plan.provider_id, false, store_now());
     if job.kind == 1 {
         srv_up_respond(j, 502, SRV_JSON_502, stats, drive);
@@ -2141,13 +2166,13 @@ fn srv_up_spawn(j: i32, stats: &ServeStats, drive: bool) void {
         srv_up_after(j, stats, drive);
         return;
     }
-    var cfg: HttppConfig = httpp_empty();
+    // 直接填 job.cfg：HttppConfig 很大（含 aliases 数组），先建局部再整体赋值
+    // 在这版编译器上不可靠（实测赋值后 host/secret 丢失 → 上游 502）。
     if !upstream_config(&job.plan.host[0], job.plan.host_len, job.plan.port,
-        job.plan.auth_type, &job.plan.secret[0], job.plan.secret_len, &cfg) {
+        job.plan.auth_type, &job.plan.secret[0], job.plan.secret_len, &job.cfg) {
         srv_up_respond(j, 400, SRV_JSON_400, stats, drive);
         return;
     }
-    job.cfg = cfg;
     const nowu: u64 = now_ms() catch {
         srv_up_respond(j, 502, SRV_JSON_502, stats, drive);
         return;
@@ -2162,6 +2187,11 @@ fn srv_up_spawn(j: i32, stats: &ServeStats, drive: bool) void {
             srv_drive(c, stats);
         }
         return;
+    }
+    if srv_env_on(&"AIGW_ASYNC_DEBUG"[0] as &const byte) {
+        printf("[up] spawn kind=%d host=%s port=%d deadline_ms=%d\n" as *byte,
+            job.kind, &job.cfg.host[0] as &const byte, job.cfg.port as i32,
+            (nowu +% 60000) as i32);
     }
     job.has_fut = true;
     job.phase = SRV_UP_PHASE_OPEN;
@@ -2581,7 +2611,7 @@ fn srv_up_restream_end(j: i32, stats: &ServeStats) void {
     srv_up_release(j);
 }
 
-fn srv_up_ready(j: i32, is_err: bool, rc: i32, stats: &ServeStats) void {
+fn srv_up_ready(j: i32, is_err: bool, err_id: i32, rc: i32, stats: &ServeStats) void {
     if j < 0 || (j as usize) >= (SRV_UP_MAX as usize) {
         return;
     }
@@ -2601,7 +2631,7 @@ fn srv_up_ready(j: i32, is_err: bool, rc: i32, stats: &ServeStats) void {
                 srv_up_respond(j, 502, SRV_JSON_502, stats, true);
                 return;
             }
-            srv_up_fail(j, stats, true);
+            srv_up_fail(j, stats, true, err_id);
             return;
         }
         if job.kind == 3 {
@@ -2620,7 +2650,7 @@ fn srv_up_ready(j: i32, is_err: bool, rc: i32, stats: &ServeStats) void {
         return;
     }
     if is_err || rc != 0 {
-        srv_up_fail(j, stats, true);
+        srv_up_fail(j, stats, true, err_id);
         return;
     }
     job.st = job.call.head.status;
@@ -2635,6 +2665,9 @@ fn srv_up_ready(j: i32, is_err: bool, rc: i32, stats: &ServeStats) void {
 
 /// 非流式 chat 的协程入口：成功挂起返回 true；没有空槽返回 false 走阻塞老路。
 fn srv_chat_async_try(c: &SrvConn, stats: &ServeStats) bool {
+    if srv_env_on(&"AIGW_ASYNC_OFF"[0] as &const byte) {
+        return false;
+    }
     const ci: i32 = srv_slot_of(c.fd);
     if ci < 0 {
         return false;
@@ -4284,6 +4317,9 @@ fn srv_admin_backup(c: &SrvConn, stats: &ServeStats) void {
 
 /// E4：responses 的协程入口（非流式）。成功挂起返回 true。
 fn srv_responses_async_try(c: &SrvConn, stats: &ServeStats) bool {
+    if srv_env_on(&"AIGW_ASYNC_OFF"[0] as &const byte) {
+        return false;
+    }
     const ci: i32 = srv_slot_of(c.fd);
     if ci < 0 {
         return false;
