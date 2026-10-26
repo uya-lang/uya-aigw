@@ -447,8 +447,9 @@ drain 迁移、ingest 幂等 + 区间重算、本地 spool 重放。拓扑、启
 - 在途作业上限 **4**；超过时 `/v1/auth/otp` 直接 503。单个作业 30s 没结束会被 SIGKILL。
 - 结果只进日志：`smtp-relay: sent to=<addr>` / `smtp-relay: send failed err=<id>`；
   失败不自动重试（用户重新点一次即可）。
-- 协议范围：单收件人、纯文本、UTF-8、正文 base64（RFC 2045 折行）、`Date`/`Message-ID`
-  自带；不做 DKIM/管道化/SMTPUTF8/多收件人/IPv6 字面量。
+- 协议范围：单收件人、纯文本、正文 UTF-8 走 base64（RFC 2045 折行）、`Date`/`Message-ID`
+  自带；**主题只收可打印 ASCII**（非 ASCII 要 RFC 2047 编码字，没做，直接塞会乱码）；
+  不做 DKIM/管道化/SMTPUTF8/多收件人/IPv6 字面量。
 - **安全闸**：收件人与主题里出现 CR/LF 一律拒绝（头注入），地址先做语法校验；
   密码也可以放在 URL 里（`%40`、`%3A` 需要转义）。
 - 自签/内网 CA 用 `--mail-ca <pem>`（有就用它，没有走系统信任库）。

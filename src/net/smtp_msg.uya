@@ -210,6 +210,9 @@ export fn smtp_addr_ok(a: &[byte]) bool {
 
 /// 主题：单行、可见 ASCII/UTF-8、无 CR/LF（防头注入）。UTF-8 原样发（8bit 头），
 /// 现代 MTA 基本都收；纯 ASCII 场景不受影响。
+/// 主题只收可打印 ASCII（32..126）。
+/// 非 ASCII 必须走 RFC 2047 编码字（`=?UTF-8?B?...?=`），本实现没做——直接塞原始
+/// UTF-8 字节会让收件端按 GBK 解出乱码，所以宁可拒绝（正文不受影响：正文走 base64）。
 export fn smtp_subject_ok(s: &[byte]) bool {
     if s.len > 200 {
         return false;
@@ -217,7 +220,7 @@ export fn smtp_subject_ok(s: &[byte]) bool {
     var i: usize = 0;
     while i < s.len {
         const b: byte = s[i];
-        if b == ('\r' as byte) || b == ('\n' as byte) || b == (0 as byte) {
+        if b < (32 as byte) || b > (126 as byte) {
             return false;
         }
         i = i + 1;

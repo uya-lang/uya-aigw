@@ -127,6 +127,8 @@ fn test_addr() !void {
     // 头注入：主题里带 CRLF 必须拒绝
     try assert_eq_bool(smtp_subject_ok(&"hi\r\nBcc: evil@x"[0: 15]), false);
     try assert_eq_bool(smtp_subject_ok(&"aigw login code"[0: 15]), true);
+    // 非 ASCII 主题：会变成乱码，宁可拒（正文不受影响）
+    try assert_eq_bool(smtp_subject_ok(&"配置自检"[0: 12]), false);
 }
 
 fn test_reply() !void {
