@@ -634,6 +634,8 @@ export fn serve_listen(ip: &[byte], port: u16) !i32 {
         _ = sys_close(fd) catch {};
         return error.ListenFailed;
     };
+    // E0：允许 N 个进程绑同一端口，由内核做连接均衡（协程化之前的水平扩展手段）。
+    _ = sys_setsockopt(fd, SOL_SOCKET, 15, &one as &void, 4 as u32) catch {};
     var ipb: [byte: 4] = [0: 4];
     ipb[0] = ((packed >> 24) & 255u32) as byte;
     ipb[1] = ((packed >> 16) & 255u32) as byte;

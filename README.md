@@ -169,7 +169,7 @@ aigw tls pin   <host> <sha256hex> [--file <tsv>]
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `--host` | `0.0.0.0` | 监听地址 |
-| `--port` | `8080` | 监听端口；`0` = 内核分配（看 stdout 的 `listen port=`） |
+| `--port` | `8080` | 监听端口；`0` = 内核分配（看 stdout 的 `listen port=`）。监听开了 `SO_REUSEPORT`，**多个进程可绑同一端口**，内核做连接均衡（单进程吞吐受上游等待串行化限制，见 §10.1） |
 | `--db` | `data/aigw.db` | SQLite 数据库路径（自动建库 + 迁移 + journal 重放） |
 | `--data-dir` | `data` | 运行目录：journal、备份、`requests.log`、`audit.jsonl`、`spool.jsonl` |
 | `--ca` | 空 | 额外的 PEM 信任根（上游自签/私有 CA 用） |
@@ -534,7 +534,9 @@ docs/                     # overview、tls-provider、spike findings、deploy、
   之外的认证方式（Basic 已支持）。
 - **传输**：内置 HTTPS 只做 TLS（`scheme=http` 需显式允许明文，默认关闭）；HTTP/1.1 +
   keep-alive，无 HTTP/2。
-- **并发模型**：单线程 epoll 事件循环；CPU 密集场景靠多进程/集群横向扩展，不靠多核单进程。
+- **并发模型**：单线程 epoll 事件循环，且请求处理里同步等上游 → **单进程吞吐 ≈ 1/上游延迟**
+  （实测约 0.8 rps，8 并发时延迟线性涨 8×）。横向扩展用多进程绑同一端口（`SO_REUSEPORT`，
+  实测 4 进程 `/v1/usage` 5.0k → 16.1k rps）。彻底解法是把 handler 协程化（TODO Phase E）。
 - **预算不硬拦截**：只做 `over_budget` 标记 + 站内通知（见 §6.4）。
 - **计费精度**：nano-USD 整数，单 token 成本向下取整的累计误差在 `1e-9 USD/token` 量级。
 - 无 Prometheus `/metrics`：用 `requests.log`、`/admin/health`、`/v1/usage` 观测。
