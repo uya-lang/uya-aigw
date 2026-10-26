@@ -56,6 +56,8 @@ const ST_HEAD: i32 = 1;
 const ST_BODY: i32 = 2;
 const ST_WRITE: i32 = 3;
 const ST_SSE: i32 = 4;
+/// E2：请求已挂起，等上游 future 完成（不再读这个连接）。
+const ST_WAIT: i32 = 5;
 
 // chunked 包体解析阶段
 const CH_SIZE: i32 = 0;
@@ -707,6 +709,7 @@ fn srv_close_slot(slot: i32) void {
     if slot < 0 || (slot as usize) >= SRV_MAX_CONNS {
         return;
     }
+    srv_up_abort_ci(slot);
     const i: usize = slot as usize;
     const fd: i32 = g_conns[i].fd;
     if fd >= 0 {
@@ -1568,12 +1571,523 @@ fn srv_usage(c: &SrvConn, stats: &ServeStats) void {
 }
 
 /// chat：鉴权 → 解析/路由 → 非流式结算 / 流式透传。
+// ---------------------------------------------------------------
+// E2/E3：在途上游请求（把「等上游」从阻塞改成事件驱动）
+//
+// 非流式 chat 的处理被拆成「发起 future → 主循环 poll → 完成后续跑」：
+//   * 未来 `htc_open_async` / `htc_body_async` 的句柄与全部中间状态（plan/cfg/log/
+//     响应缓冲）放在固定槽里，槽数 SRV_UP_MAX 就是单进程在途上限；
+//   * 槽里登记的 waker fd 也挂到服务主 epoll 上，就绪即可推进；另有 20ms 兜底轮询
+//     让 future 内部的 deadline 能按时生效；
+//   * 槽满 / 流式 / 插件 / 失败转移后变成流式或插件时，退回原来的阻塞实现
+//     （`srv_chat_block`），行为与改造前完全一致。
+//
+// 这一步只覆盖非流式 chat；responses 与 SSE 仍在 E4。
+// ---------------------------------------------------------------
+
+const SRV_UP_MAX: i32 = 32;
+const SRV_UP_FDS: i32 = 4;
+const SRV_UP_TICK_MS: i32 = 20;
+const SRV_UP_PHASE_OPEN: i32 = 0;
+const SRV_UP_PHASE_BODY: i32 = 1;
+
+struct SrvUpJob {
+    used: bool,
+    ci: i32,
+    phase: i32,
+    has_fut: bool,
+    armed: i32,
+    fds: [i32: SRV_UP_FDS],
+    fut: Future<!i32>,
+    call: HtcCall,
+    cfg: HttppConfig,
+    plan: ChatPlan,
+    lg: SrvReqLog,
+    tok: [byte: 256],
+    tok_len: usize,
+    uid: i64,
+    attempts: i32,
+    http_tries: i32,
+    resp: [byte: 8192],
+    rn: usize,
+    st: i32,
+    retry_after: u32,
+    nowu: u64,
+}
+
+var g_jobs: [SrvUpJob: 32] = [];
+var g_up_waker: Waker = Waker{};
+var g_up_next_ms: u64 = 0;
+
+fn srv_up_active() i32 {
+    var n: i32 = 0;
+    var j: i32 = 0;
+    while j < SRV_UP_MAX {
+        if g_jobs[j as usize].used {
+            n = n + 1;
+        }
+        j = j + 1;
+    }
+    return n;
+}
+
+fn srv_up_fd_owner(fd: i32) i32 {
+    var j: i32 = 0;
+    while j < SRV_UP_MAX {
+        const job: &SrvUpJob = &g_jobs[j as usize];
+        if job.used {
+            var i: i32 = 0;
+            while i < job.armed && i < SRV_UP_FDS {
+                if job.fds[i as usize] == fd {
+                    return j;
+                }
+                i = i + 1;
+            }
+        }
+        j = j + 1;
+    }
+    return 0 - 1;
+}
+
+fn srv_up_disarm(j: i32) void {
+    if j < 0 || (j as usize) >= (SRV_UP_MAX as usize) {
+        return;
+    }
+    const job: &SrvUpJob = &g_jobs[j as usize];
+    var i: i32 = 0;
+    while i < job.armed && i < SRV_UP_FDS {
+        _ = sys_epoll_ctl_del(g_epfd, job.fds[i as usize]) catch {};
+        i = i + 1;
+    }
+    job.armed = 0;
+}
+
+/// 把本轮 poll 登记的 fd 兴趣挂到主 epoll（与 upwait.wait_i32 的换算一致）。
+fn srv_up_arm(j: i32) void {
+    if j < 0 || (j as usize) >= (SRV_UP_MAX as usize) {
+        return;
+    }
+    const job: &SrvUpJob = &g_jobs[j as usize];
+    srv_up_disarm(j);
+    var i: i32 = 0;
+    while i < g_up_waker._io_slot_count && i < SRV_UP_FDS && job.armed < SRV_UP_FDS {
+        const fd: i32 = g_up_waker._io_slot_fds[i as usize];
+        const interest: i32 = g_up_waker._io_slot_interests[i as usize];
+        if fd >= 0 {
+            var mask: u32 = 0;
+            if interest == 1 || interest == 3 {
+                mask = mask | (EPOLLIN as u32);
+            }
+            if interest == 2 || interest == 3 {
+                mask = mask | (EPOLLOUT as u32);
+            }
+            if mask == 0 {
+                mask = EPOLLIN as u32;
+            }
+            var ev: EpollEvent = epoll_event_with_fd(mask, fd);
+            _ = sys_epoll_ctl(g_epfd, EPOLL_CTL_ADD, fd, &ev) catch {
+                0;
+            };
+            job.fds[job.armed as usize] = fd;
+            job.armed = job.armed +% 1;
+        }
+        i = i + 1;
+    }
+    if job.armed == 0 && g_up_waker._event_fd_bound != 0 && g_up_waker._event_fd >= 0 {
+        const evfd: i32 = g_up_waker._event_fd;
+        var ev: EpollEvent = epoll_event_with_fd(EPOLLIN as u32, evfd);
+        _ = sys_epoll_ctl(g_epfd, EPOLL_CTL_ADD, evfd, &ev) catch {
+            0;
+        };
+        job.fds[job.armed as usize] = evfd;
+        job.armed = job.armed +% 1;
+    }
+}
+
+fn srv_up_release(j: i32) void {
+    if j < 0 || (j as usize) >= (SRV_UP_MAX as usize) {
+        return;
+    }
+    const job: &SrvUpJob = &g_jobs[j as usize];
+    srv_up_disarm(j);
+    job.has_fut = false;
+    job.used = false;
+    htc_call_free(&job.call);
+}
+
+fn srv_up_alloc(ci: i32) i32 {
+    var j: i32 = 0;
+    while j < SRV_UP_MAX {
+        const job: &SrvUpJob = &g_jobs[j as usize];
+        if !job.used {
+            job.used = true;
+            job.ci = ci;
+            job.phase = SRV_UP_PHASE_OPEN;
+            job.has_fut = false;
+            job.armed = 0;
+            job.attempts = 0;
+            job.http_tries = 0;
+            job.rn = 0;
+            job.st = 0;
+            job.retry_after = 0;
+            job.nowu = 0;
+            job.uid = 0;
+            job.tok_len = 0;
+            htc_call_init(&job.call);
+            return j;
+        }
+        j = j + 1;
+    }
+    return 0 - 1;
+}
+
+/// 连接关闭时中止它名下的在途请求（future 帧无法取消，停止 poll 即可，
+/// 至少保证不会往已复用的连接槽写响应）。
+fn srv_up_abort_ci(ci: i32) void {
+    var j: i32 = 0;
+    while j < SRV_UP_MAX {
+        const job: &SrvUpJob = &g_jobs[j as usize];
+        if job.used && job.ci == ci {
+            srv_up_release(j);
+        }
+        j = j + 1;
+    }
+}
+
+fn srv_up_poll_one(j: i32, stats: &ServeStats) void {
+    if j < 0 || (j as usize) >= (SRV_UP_MAX as usize) {
+        return;
+    }
+    const job: &SrvUpJob = &g_jobs[j as usize];
+    if !job.used || !job.has_fut {
+        return;
+    }
+    g_up_waker.reset();
+    g_up_waker.clear_io_interest();
+    const p: Poll<!i32> = job.fut.poll(&g_up_waker);
+    var ready: bool = false;
+    var is_err: bool = false;
+    var rc: i32 = 0;
+    match p {
+        .Ready(v) => {
+            ready = true;
+            rc = v catch |_| {
+                is_err = true;
+                0;
+            };
+        },
+        .Pending(_) => {},
+    };
+    if !ready {
+        srv_up_arm(j);
+        return;
+    }
+    job.has_fut = false;
+    srv_up_disarm(j);
+    srv_up_ready(j, is_err, rc, stats);
+}
+
+/// 有在途 future 却没有任何 fd 可等（DNS/写缓冲/deadline 判定等阶段）→ 主循环自旋，
+/// 语义与 `wait_i32` 的忙轮询一致；区别是自旋期间主循环照常服务其它连接。
+fn srv_up_need_spin() bool {
+    var j: i32 = 0;
+    while j < SRV_UP_MAX {
+        const job: &SrvUpJob = &g_jobs[j as usize];
+        if job.used && job.has_fut && job.armed == 0 {
+            return true;
+        }
+        j = j + 1;
+    }
+    return false;
+}
+
+/// 兜底轮询：future 的 deadline 靠 poll 才能推进，fd 不来时也要定期问一次。
+fn srv_up_tick(stats: &ServeStats) void {
+    if srv_up_active() == 0 {
+        return;
+    }
+    const now: u64 = srv_now_ms();
+    const due: bool = now >= g_up_next_ms;
+    var j: i32 = 0;
+    while j < SRV_UP_MAX {
+        const job: &SrvUpJob = &g_jobs[j as usize];
+        if job.used && job.has_fut && (job.armed == 0 || due) {
+            srv_up_poll_one(j, stats);
+        }
+        j = j + 1;
+    }
+    if due {
+        g_up_next_ms = now +% (SRV_UP_TICK_MS as u64);
+    }
+}
+
+/// 回包 + 收尾：先拷进连接输出缓冲，再释放槽，最后视调用场景决定是否继续驱动。
+fn srv_up_respond(j: i32, status: i32, body: &[byte], stats: &ServeStats, drive: bool) void {
+    if j < 0 || (j as usize) >= (SRV_UP_MAX as usize) {
+        return;
+    }
+    const job: &SrvUpJob = &g_jobs[j as usize];
+    const ci: i32 = job.ci;
+    if ci < 0 || (ci as usize) >= SRV_MAX_CONNS {
+        srv_up_release(j);
+        return;
+    }
+    const c: &SrvConn = &g_conns[ci as usize];
+    job.lg.status = status;
+    srv_log_emit(&job.lg);
+    srv_static(c, status, body, c.keep);
+    srv_up_release(j);
+    if drive {
+        srv_drive(c, stats);
+    }
+}
+
+/// 上游 200 之后：结算 + 日志字段 + 回包。
+fn srv_up_after(j: i32, stats: &ServeStats, drive: bool) void {
+    if j < 0 || (j as usize) >= (SRV_UP_MAX as usize) {
+        return;
+    }
+    const job: &SrvUpJob = &g_jobs[j as usize];
+    lb_report(job.plan.provider_id, true, store_now());
+    if job.st != 200 {
+        // D3：429/5xx 按 Retry-After 或指数退避重试同一家。
+        if httpc_status_retryable(job.st) && job.http_tries < SRV_HTTP_RETRY_MAX {
+            const wait_ms: u32 = httpc_backoff_ms(job.http_tries, SRV_BACKOFF_BASE_MS,
+                job.retry_after);
+            job.http_tries = job.http_tries +% 1;
+            srv_sleep_ms(wait_ms);
+            srv_up_spawn(j, stats, drive);
+            if job.has_fut {
+                srv_up_poll_one(j, stats);
+            }
+            return;
+        }
+        srv_up_respond(j, job.st, job.resp[0: job.rn], stats, drive);
+        return;
+    }
+    if job.lg.rid_len == 0 {
+        srv_up_respond(j, 502, SRV_JSON_502, stats, drive);
+        return;
+    }
+    var settle: BillingResult = BillingResult{ cost_nano: 0, price_nano: 0, rate_version: 0, duplicate: false, found: false };
+    chat_settle_deferred(job.lg.rid[0: job.lg.rid_len], job.uid, store_now(), 0,
+        &job.plan, job.resp[0: job.rn], &settle) catch {
+        srv_up_respond(j, 502, SRV_JSON_502, stats, drive);
+        return;
+    };
+    var jd: JsonDoc = JsonDoc{};
+    var usg: PriceUsage = PriceUsage{ input_tokens: 0, output_tokens: 0, cache_read_tokens: 0 };
+    json_parse(&jd, job.resp[0: job.rn]) catch {};
+    if billing_usage_parse(&jd, json_root(&jd), &usg) {
+        srv_log_usage(&job.lg, &usg, settle.cost_nano);
+    } else {
+        job.lg.cost_nano = settle.cost_nano;
+    }
+    job.lg.ttft_ms = srv_now_ms() -| job.lg.start_ms;
+    srv_up_respond(j, job.st, job.resp[0: job.rn], stats, drive);
+}
+
+/// 传输层失败：熔断 + 换一家（最多 3 家），换完就重新发起。
+fn srv_up_fail(j: i32, stats: &ServeStats, drive: bool) void {
+    if j < 0 || (j as usize) >= (SRV_UP_MAX as usize) {
+        return;
+    }
+    const job: &SrvUpJob = &g_jobs[j as usize];
+    if job.ci < 0 || (job.ci as usize) >= SRV_MAX_CONNS {
+        srv_up_release(j);
+        return;
+    }
+    const c: &SrvConn = &g_conns[job.ci as usize];
+    lb_report(job.plan.provider_id, false, store_now());
+    lb_block_for(job.plan.provider_id, store_now(), 30);
+    job.attempts = job.attempts +% 1;
+    if job.attempts >= 3 {
+        srv_up_respond(j, 502, SRV_JSON_502, stats, drive);
+        return;
+    }
+    chat_prepare_span_session(runtime_db(), &c.body[0], c.body_len,
+        job.tok[0: job.tok_len], store_now(), &job.plan) catch {
+        srv_up_respond(j, 502, SRV_JSON_502, stats, drive);
+        return;
+    };
+    if job.plan.stdio {
+        job.plan.stream = false;
+    }
+    srv_log_plan(&job.lg, &job.plan);
+    srv_up_spawn(j, stats, drive);
+    if job.has_fut {
+        srv_up_poll_one(j, stats);
+    }
+}
+
+/// 按当前 plan 重新发起一次上游请求（可能是插件 / 流式 / HTTP）。
+fn srv_up_spawn(j: i32, stats: &ServeStats, drive: bool) void {
+    if j < 0 || (j as usize) >= (SRV_UP_MAX as usize) {
+        return;
+    }
+    const job: &SrvUpJob = &g_jobs[j as usize];
+    if job.ci < 0 || (job.ci as usize) >= SRV_MAX_CONNS {
+        srv_up_release(j);
+        return;
+    }
+    const c: &SrvConn = &g_conns[job.ci as usize];
+    htc_call_free(&job.call);
+    htc_call_init(&job.call);
+    job.phase = SRV_UP_PHASE_OPEN;
+    job.has_fut = false;
+    job.armed = 0;
+    job.rn = 0;
+    job.st = 0;
+    job.retry_after = 0;
+    if job.plan.stdio {
+        var failed: bool = false;
+        var st: i32 = 0;
+        var rn: usize = 0;
+        plug_chat(&job.plan.upstream_model[0], job.plan.upstream_len,
+            job.plan.payload[0: job.plan.payload_len], job.plan.timeout_ms,
+            job.nowu as i64, &job.resp[0], 8192, &st, &rn) catch {
+            failed = true;
+        };
+        if failed {
+            srv_up_respond(j, 502, SRV_JSON_502, stats, drive);
+            return;
+        }
+        job.st = st;
+        job.rn = rn;
+        srv_up_after(j, stats, drive);
+        return;
+    }
+    var cfg: HttppConfig = httpp_empty();
+    if !upstream_config(&job.plan.host[0], job.plan.host_len, job.plan.port,
+        job.plan.auth_type, &job.plan.secret[0], job.plan.secret_len, &cfg) {
+        srv_up_respond(j, 400, SRV_JSON_400, stats, drive);
+        return;
+    }
+    job.cfg = cfg;
+    const nowu: u64 = now_ms() catch {
+        srv_up_respond(j, 502, SRV_JSON_502, stats, drive);
+        return;
+    };
+    job.nowu = nowu;
+    if job.plan.stream {
+        // 流式在 E4 之前仍是阻塞实现（已 rare：仅失败转移换到流式上游时）。
+        srv_chat_stream(c, &job.plan, &job.cfg, nowu, job.uid, &job.lg);
+        srv_log_emit(&job.lg);
+        srv_up_release(j);
+        if drive {
+            srv_drive(c, stats);
+        }
+        return;
+    }
+    job.has_fut = true;
+    job.phase = SRV_UP_PHASE_OPEN;
+    job.fut = htc_open_async(&job.cfg, &g_up_ctx, &"POST"[0: 4],
+        job.plan.path[0: job.plan.path_len],
+        job.plan.payload[0: job.plan.payload_len],
+        false, nowu, nowu +% 60000, &job.call);
+}
+
+fn srv_up_ready(j: i32, is_err: bool, rc: i32, stats: &ServeStats) void {
+    if j < 0 || (j as usize) >= (SRV_UP_MAX as usize) {
+        return;
+    }
+    const job: &SrvUpJob = &g_jobs[j as usize];
+    if job.phase == SRV_UP_PHASE_OPEN {
+        if is_err || rc != 0 {
+            srv_up_fail(j, stats, true);
+            return;
+        }
+        job.phase = SRV_UP_PHASE_BODY;
+        job.rn = 0;
+        job.has_fut = true;
+        job.fut = htc_body_async(&job.call, &job.resp[0], 8192, &job.rn);
+        srv_up_poll_one(j, stats);
+        return;
+    }
+    if is_err || rc != 0 {
+        srv_up_fail(j, stats, true);
+        return;
+    }
+    job.st = job.call.head.status;
+    job.retry_after = htc_retry_after_s(&job.call);
+    // 与 upstream_post 一致：能复用的连接归还池子再释放 call。
+    if htc_call_reusable(&job.call) {
+        _ = htc_pool_put(&g_up_ctx.pool, &job.cfg.host[0], job.cfg.host_len,
+            job.cfg.port, g_up_ctx.mode, job.nowu, &job.call.conn);
+    }
+    srv_up_after(j, stats, true);
+}
+
+/// 非流式 chat 的协程入口：成功挂起返回 true；没有空槽返回 false 走阻塞老路。
+fn srv_chat_async_try(c: &SrvConn, stats: &ServeStats) bool {
+    const ci: i32 = srv_slot_of(c.fd);
+    if ci < 0 {
+        return false;
+    }
+    const j: i32 = srv_up_alloc(ci);
+    if j < 0 || (j as usize) >= (SRV_UP_MAX as usize) {
+        return false;
+    }
+    const job: &SrvUpJob = &g_jobs[j as usize];
+    srv_log_init(&job.lg, c, &"chat"[0: 4]);
+    if !runtime_ready() {
+        srv_up_respond(j, 503, SRV_JSON_503, stats, false);
+        return true;
+    }
+    if c.body_overflow {
+        srv_up_respond(j, 413, SRV_JSON_413, stats, false);
+        return true;
+    }
+    var tok: [byte: 256] = [0: 256];
+    const tn: usize = chat_bearer_span(&c.auth[0], c.auth_len, &tok[0], 256);
+    if tn == 0 {
+        srv_up_respond(j, 401, SRV_JSON_401, stats, false);
+        return true;
+    }
+    var key: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
+    store_verify_key_fast(runtime_db(), tok[0: tn], store_now(), &key) catch {
+        srv_up_respond(j, 401, SRV_JSON_401, stats, false);
+        return true;
+    };
+    srv_log_user(&job.lg, key.user_id);
+    job.uid = key.user_id;
+    var ti: usize = 0;
+    while ti < tn && ti < 256 {
+        job.tok[ti] = tok[ti];
+        ti = ti + 1;
+    }
+    job.tok_len = ti;
+    chat_prepare_span_session(runtime_db(), &c.body[0], c.body_len, tok[0: tn],
+        store_now(), &job.plan) catch {
+        srv_up_respond(j, 400, SRV_JSON_400, stats, false);
+        return true;
+    };
+    if job.plan.stdio {
+        job.plan.stream = false;
+    }
+    srv_log_plan(&job.lg, &job.plan);
+    c.state = ST_WAIT;
+    srv_up_spawn(j, stats, false);
+    if job.has_fut {
+        srv_up_poll_one(j, stats);
+    }
+    return true;
+}
+
+/// E2：非流式 chat 走协程化路径；槽满了才退回阻塞实现（行为不变）。
 fn srv_chat(c: &SrvConn, stats: &ServeStats) void {
+    stats.requests = stats.requests +% 1;
+    if srv_chat_async_try(c, stats) {
+        return;
+    }
+    srv_chat_block(c, stats);
+}
+
+fn srv_chat_block(c: &SrvConn, stats: &ServeStats) void {
     const keep: bool = c.keep;
     var lg: SrvReqLog = SrvReqLog{};
     srv_log_init(&lg, c, &"chat"[0: 4]);
     defer { srv_log_emit(&lg); }
-    stats.requests = stats.requests +% 1;
     if !runtime_ready() {
         lg.status = 503;
         srv_static(c, 503, SRV_JSON_503, keep);
@@ -2092,6 +2606,9 @@ fn srv_drive(c: &SrvConn, stats: &ServeStats) void {
     var guard: i32 = 0;
     while guard < 256 {
         guard = guard + 1;
+        if c.state == ST_WAIT {
+            return;
+        }
         if c.state == ST_HEAD {
             srv_compact(c);
             var req: HsrvReq = HsrvReq{};
@@ -2237,6 +2754,9 @@ fn srv_on_readable(c: &SrvConn, stats: &ServeStats) void {
             return;
         }
         if c.state == ST_SSE {
+            return;
+        }
+        if c.state == ST_WAIT {
             return;
         }
         srv_compact(c);
@@ -2489,9 +3009,16 @@ export fn serve_run(lfd: i32, stats: &ServeStats) !i32 {
                 break;
             }
         }
+        // E3：在途请求到点就问一次（future deadline 靠 poll 推进）
+        srv_up_tick(stats);
         var tmo: i32 = SRV_IDLE_MS;
         if stats.sse > 0 || stopping != 0 {
             tmo = SRV_TICK_MS;
+        }
+        if srv_up_need_spin() {
+            tmo = 0;
+        } else if srv_up_active() > 0 && tmo > SRV_UP_TICK_MS {
+            tmo = SRV_UP_TICK_MS;
         }
         const waited: !i32 = sys_epoll_wait(epfd, &events[0], SRV_EV_MAX, tmo);
         const n: i32 = waited catch |_| {
@@ -2501,7 +3028,11 @@ export fn serve_run(lfd: i32, stats: &ServeStats) !i32 {
         while k < n {
             const fd: i32 = epoll_event_fd(&events[k as usize]);
             const evs: u32 = events[k as usize].events;
-            if fd == g_listen_fd {
+            const uj: i32 = srv_up_fd_owner(fd);
+            if uj >= 0 {
+                // E3：在途上游 future 的 fd 就绪 → 直接 poll 它
+                srv_up_poll_one(uj, stats);
+            } else if fd == g_listen_fd {
                 srv_accept_all(stats);
             } else {
                 srv_on_event(fd, evs, stats);

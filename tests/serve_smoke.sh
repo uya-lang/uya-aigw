@@ -85,12 +85,9 @@ BASE="http://127.0.0.1:$PORT"
 BODY=$(curl -s --max-time 5 "$BASE/healthz")
 [ "$BODY" = '{"ok":true}' ] || fail "healthz body=[$BODY]"
 
-# 2) /v1/models 占位
-MODELS=$(curl -s --max-time 5 "$BASE/v1/models")
-case "$MODELS" in
-  '{"object":"list","data":[]}') ;;
-  *) fail "models body=[$MODELS]" ;;
-esac
+# 2) /v1/models 需要有效 Key（无 Key → 401；有 Key 的空列表由 chat e2e 覆盖）
+CODE=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$BASE/v1/models")
+[ "$CODE" = "401" ] || fail "models without key status=$CODE"
 
 # 3) chat 路由：body 采集 + Bearer 鉴权（假 Key → 401）
 CODE=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' -X POST \

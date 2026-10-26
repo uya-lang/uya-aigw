@@ -54,18 +54,19 @@ ingest 幂等 + usage 分片 `hash(user_id)%4`、spool、journal 重放、集群
 
 ## Phase E：handler 协程化（并发吞吐）
 
-> 压测结论（2026-10-26，本机 ab + opencode 上游）：单进程吞吐 ≈ 1/上游延迟（约 0.8 rps），
-> 8 并发时客户端延迟线性涨到 8×，CPU 0.2%；而纯本地端点 `/healthz` 无 keep-alive
-> 17k rps、`/v1/usage` 5k rps、`-k` 时 98k/5.8k rps。根因：请求处理在事件循环里同步
-> `wait_i32` 等上游，等待期间无法处理其它连接。
+> 压测结论（2026-10-26，本机 ab + opencode 上游）：改造前单进程吞吐 ≈ 1/上游延迟
+> （约 0.8 rps），8 并发时客户端延迟线性涨到 8×，CPU 0.2%；纯本地端点 `/healthz`
+> 无 keep-alive 17k rps、`/v1/usage` 5k rps。根因：请求处理在事件循环里同步
+> `wait_i32` 等上游。
 
-- E1 新增 `upstream_post_async`（直接 `@await htc_open_async` / `htc_body_async`，不套 `wait_i32`）。
-- E2 `SrvConn` 增加“在途请求”状态：保存 plan/cfg/响应缓冲/request_id/计时，读到请求后
-  进入 `SRV_ST_UPSTREAM` 并立即返回主循环，不再阻塞。
-- E3 主循环把「连接 fd + 在途 future 的 waker fd」一起注册 epoll；future Ready 后
-  继续结算 + 写响应（状态机拆成 `srv_chat_begin` / `srv_chat_finish`）。
-- E4 先做 chat 非流式，再流式 SSE（逐事件 await），最后 responses 与插件路径。
-- E5 验收：`make e2e` 全绿 + 新并发基准（8/32 并发下吞吐应随并发上升，延迟不线性膨胀）。
+已完成（E1–E3，非流式 chat）：在途槽 + waker fd 挂主 epoll + 无 fd 可等时自旋，
+8 并发吞吐 0.64 → 3.2 rps（5×），延迟不再随并发线性膨胀。
+
+- ~~E1 `upstream_post` 的 future 化~~（done：直接 `htc_open_async` / `htc_body_async`）
+- ~~E2 `SrvConn` 在途状态 + 槽表~~（done：`ST_WAIT` + `SrvUpJob`，上限 32）
+- ~~E3 主循环 epoll 接管 future 的 waker fd~~（done：`srv_up_arm` / `srv_up_tick` / `srv_up_need_spin`）
+- E4 把 responses / 流式 SSE 也搬到同一套在途机制（现在这两条路径仍会阻塞事件循环）。
+- E5 验收：`make test` 全绿 + 并发基准（8/32 并发吞吐随并发上升、延迟不线性膨胀）。
 
 ## 当前建议顺序
 
