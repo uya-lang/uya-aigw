@@ -494,6 +494,7 @@ drain 迁移、ingest 幂等 + 区间重算、本地 spool 重放。拓扑、启
 | POST | `/v1/keys/revoke` | `{"key_id":N}` |
 | GET/POST | `/v1/budget` | 查看 / 设置月预算（`{"monthly_nano":N}`） |
 | GET | `/v1/notifications` | 站内通知（预算超额、改价等） |
+| GET | `/v1/pricing` | 本账号某模型的卖价：`?model=…&ts=…`（进价不返回） |
 
 ### 管理接口（`Bearer <--admin-key>`）
 
@@ -511,17 +512,29 @@ drain 迁移、ingest 幂等 + 区间重算、本地 spool 重放。拓扑、启
 | GET | `/admin/backup` | `last_backup_day`、`keep`（每日自动备份，保留 7 天） |
 | GET | `/admin/audit` | 最近的 `audit.jsonl` 记录 |
 | GET | `/admin`、`/ui/app.js`、`/ui/admin.js` | 管理后台静态页（CSP/安全头已开） |
-| POST | `/mcp` | JSON-RPC over HTTP：`initialize`、`tools/list`、`tools/call`；凭据决定工具集（见 §7.1） |
+| POST | `/mcp` | JSON-RPC over HTTP：只有 `api_catalog`（查接口目录）+ `api_call`（调接口）两个工具，目录由路由表自动生成（见 §7.1） |
 
 ### 7.1 MCP（`POST /mcp`）
 
 无状态 JSON-RPC：一次 POST 一条请求，`Authorization: Bearer <key>`。
-同一端点按凭据分权：
 
-| 凭据 | 角色 | 可用工具 |
+**只暴露两个工具**（`initialize` / `tools/list` / `tools/call`）：
+
+| 工具 | 作用 |
+|---|---|
+| `api_catalog` | 列出当前凭据**能调的 REST 接口**（method、path、示例、一句说明） |
+| `api_call` | 调其中一个：`{method: "GET\|POST", path: "/admin/billing?user_id=0", body: {...}}`；`path` 可直接带 query，`body` 原样透传给 handler |
+
+目录**由网关路由表（`SRV_ROUTES`）自动生成**，不是手写清单：新增一个 REST 接口只要在路由表加一行，
+`api_catalog` 立刻能查到、`api_call` 立刻能调到，MCP 代码一行都不用改。流式/集群内部/静态页在表里标
+`mcp: 0`，不对外暴露；`admin_only` 决定可见角色。
+
+| 凭据 | 角色 | 目录内容 |
 |---|---|---|
-| `--admin-key` | 管理员 | `pricing_get` / `billing_query`（可查任意 `user_id`）、`backup_status`、`admin_health`、`admin_users`、`admin_providers`、`admin_models`、`admin_bind`、`admin_pricing_create`、`admin_price_entries_get`、`admin_price_entries_put`、`admin_audit` |
-| 普通 API Key（`aigw_sk_...`） | 账号自助 | `pricing_get`（仅卖价）、`billing_query` / `usage_get` / `requests_list`（强制本账号）、`me`、`models_list`、`estimate_get`、`budget_get` / `budget_set`、`keys_list` / `keys_create` / `keys_revoke`、`notifications_list`；调用任何 `admin_*` 返回 `-32001 permission denied` |
+| `--admin-key` | 管理员 | 路由表里 `admin_only` 的行（`/admin/*`） |
+| 普通 API Key（`aigw_sk_...`） | 账号自助 | 自助行（`/v1/*`：`me`、`usage`、`pricing`、`requests`、`budget`、`keys`、`estimate`、`notifications`…）；调 `/admin/*` 返回 `-32001 permission denied` |
+
+账号范围只认 `Authorization`：自助接口的 `user_id` 由 Bearer 反查，query 里塞别人的 id 也查不到别人的账。
 
 接入 Claude Code：
 
@@ -529,6 +542,9 @@ drain 迁移、ingest 幂等 + 区间重算、本地 spool 重放。拓扑、启
 claude mcp add --transport http aigw http://127.0.0.1:8080/mcp \
   --header "Authorization: Bearer <admin-key 或 API Key>"
 ```
+
+用起来是「先查目录再调接口」：模型想知道备份状态，就先 `api_catalog` 看到 `GET /admin/backup`，
+再 `api_call` 调它——而不是占一个工具位。
 
 
 ### 集群内部接口

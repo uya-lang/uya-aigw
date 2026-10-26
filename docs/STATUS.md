@@ -90,9 +90,14 @@
   serve 失败自动换 provider 重试；插件级重绑在 `plugin_pool_call` 内（同槽换进程重试一次）。
 - A7（已落地）：管理 REST（health/pricing GET+POST/billing/backup）+ MCP
   （initialize/tools/list/tools/call）。
-- A7b（已落地）：MCP 按凭据分权——`--admin-key` 可用全部 12 个 `admin_*` 工具；
-  普通 API Key 只看到 13 个账号自助工具，`billing_query`/`usage_get`/`requests_list`
-  强制本账号（忽略传入的 `user_id`），`admin_*` 一律 `-32001 permission denied`。
+- A7b（已落地，A7c 已收敛）：MCP 按凭据分权——`--admin-key` 映射管理面，普通 API Key
+  映射账号自助；`billing_query`/`usage_get`/`requests_list` 强制本账号（忽略传入的 `user_id`），
+  管理面一律 `-32001 permission denied`。
+- A7c（已落地）：MCP 不再逐接口堆工具，只留 `api_catalog`（查目录）+ `api_call`（调接口）。
+  目录与可调范围由 `src/net/serve.uya` 的 `SRV_ROUTES` **路由表自动派生**——新加一个 REST
+  接口只要在表里加一行，网关路由 / MCP 目录 / MCP 调用三处同时生效（`mcp` 位控制是否对外，
+  `admin_only` 控制可见角色）。调用直接走 `srv_begin_response` 复用 handler，没有第二套业务逻辑。
+  顺带把「普通 Key 看卖价」从 MCP 虚拟工具变成真接口 `GET /v1/pricing`。
 - A5（已落地）：`/v1/responses` 非流式 + previous_response_id 续轮 + 流式事件
   （created/delta/completed + tool_calls 分片）；reasoning 不单独透传。
 - A4（已完成）：JSON DOM/构造器、providers/路由、billing 结算、chat 编排、serve 接线

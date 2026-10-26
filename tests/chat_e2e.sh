@@ -263,58 +263,93 @@ echo "$AK" | grep -q '"ok":true' || { echo "$AK" >&2; fail "admin backup"; }
 AN=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$BASE/admin/health")
 [ "$AN" = "401" ] || fail "admin without key expected 401, got $AN"
 
-# 4e) A7 MCP：initialize / tools/list / tools/call + A7b 角色隔离
+# 4e) A7c MCP：只有 api_catalog + api_call 两个工具，目录由路由表自动生成
 M0=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer test-admin' \
   --data '{"jsonrpc":"2.0","id":1,"method":"initialize"}' "$BASE/mcp")
 echo "$M0" | grep -q '"protocolVersion"' || { echo "$M0" >&2; fail "mcp initialize"; }
 MT=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer test-admin' \
   --data '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' "$BASE/mcp")
-echo "$MT" | grep -q '"pricing_get"' || { echo "$MT" >&2; fail "mcp tools/list"; }
-echo "$MT" | grep -q '"admin_health"' || { echo "$MT" >&2; fail "mcp admin tools/list"; }
+echo "$MT" | grep -q '"api_catalog"' || { echo "$MT" >&2; fail "mcp tools/list catalog"; }
+echo "$MT" | grep -q '"api_call"' || { echo "$MT" >&2; fail "mcp tools/list call"; }
+[ "$(echo "$MT" | grep -o '"name":"[a-z_]*"' | wc -l)" = "2" ] || { echo "$MT" >&2; fail "mcp tools/list 应当只有 2 个工具"; }
+if echo "$MT" | grep -q '"pricing_get"\|"admin_health"\|"backup_status"'; then
+  echo "$MT" >&2; fail "mcp tools/list 不该再暴露逐接口工具"
+fi
+# 目录：管理员只看得到 admin_only 行（含 A7c 之后新加的接口也一样自动出现）
+MAC=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer test-admin' \
+  --data '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"api_catalog","arguments":{}}}' "$BASE/mcp")
+MACJ=$(printf '%s' "$MAC" | sed 's/\\"/"/g')
+echo "$MACJ" | grep -q '"role":"admin"' || { echo "$MAC" >&2; fail "mcp catalog role"; }
+echo "$MACJ" | grep -q '"path":"/admin/backup"' || { echo "$MAC" >&2; fail "mcp catalog backup"; }
+echo "$MACJ" | grep -q '"path":"/admin/billing"' || { echo "$MAC" >&2; fail "mcp catalog billing"; }
+echo "$MACJ" | grep -q '"path":"/admin/pricing"' || { echo "$MAC" >&2; fail "mcp catalog pricing"; }
+if echo "$MACJ" | grep -q '"path":"/v1/me"'; then echo "$MAC" >&2; fail "mcp catalog 管理员不该看到自助接口"; fi
 MC=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer test-admin' \
-  --data '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"backup_status","arguments":{}}}' "$BASE/mcp")
-echo "$MC" | grep -q 'last_backup_day' || { echo "$MC" >&2; fail "mcp tools/call"; }
+  --data '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"api_call","arguments":{"method":"GET","path":"/admin/backup"}}}' "$BASE/mcp")
+echo "$MC" | grep -q 'last_backup_day' || { echo "$MC" >&2; fail "mcp api_call backup"; }
 MAH=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer test-admin' \
-  --data '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"admin_health","arguments":{}}}' "$BASE/mcp")
-echo "$MAH" | grep -q 'schema' || { echo "$MAH" >&2; fail "mcp admin_health"; }
+  --data '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"api_call","arguments":{"method":"GET","path":"/admin/health"}}}' "$BASE/mcp")
+echo "$MAH" | grep -q 'schema' || { echo "$MAH" >&2; fail "mcp api_call admin_health"; }
 MAP=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer test-admin' \
-  --data '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"pricing_get","arguments":{"model":"mock-model","provider":"mock","ts":1700000000}}}' "$BASE/mcp")
-echo "$MAP" | grep -q '\\"sell\\"' || { echo "$MAP" >&2; fail "mcp admin pricing sell"; }
-echo "$MAP" | grep -q '\\"cost\\"' || { echo "$MAP" >&2; fail "mcp admin pricing cost"; }
+  --data '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"api_call","arguments":{"method":"GET","path":"/admin/pricing?model=mock-model&provider=mock&ts=1700000000"}}}' "$BASE/mcp")
+echo "$MAP" | grep -q '\\"sell\\"' || { echo "$MAP" >&2; fail "mcp api_call admin pricing sell"; }
+echo "$MAP" | grep -q '\\"cost\\"' || { echo "$MAP" >&2; fail "mcp api_call admin pricing cost"; }
 MAB=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer test-admin' \
-  --data '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"billing_query","arguments":{"user_id":0,"from_day":0,"to_day":999999}}}' "$BASE/mcp")
+  --data '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"api_call","arguments":{"method":"GET","path":"/admin/billing?user_id=0&from_day=0&to_day=999999"}}}' "$BASE/mcp")
 MABJ=$(printf '%s' "$MAB" | sed 's/\\"/"/g')
-echo "$MABJ" | grep -q '"model":"mock-model"' || { echo "$MAB" >&2; fail "mcp admin billing"; }
+echo "$MABJ" | grep -q '"model":"mock-model"' || { echo "$MAB" >&2; fail "mcp api_call admin billing"; }
+# 管理员调自助接口 → 目录里没有 → 明确报未登记（而不是偷偷放过）
+MAD=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer test-admin' \
+  --data '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"api_call","arguments":{"method":"GET","path":"/v1/me"}}}' "$BASE/mcp")
+echo "$MAD" | grep -q 'unknown endpoint' || { echo "$MAD" >&2; fail "mcp admin v1 reject"; }
 
-# 普通 API Key：tools/list 不含 admin_*，只能操作自己账号
+# 普通 API Key：目录只有自助接口，管理面一律 -32001
 MUT=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $TOKEN" \
   --data '{"jsonrpc":"2.0","id":10,"method":"tools/list"}' "$BASE/mcp")
-echo "$MUT" | grep -q '"keys_list"' || { echo "$MUT" >&2; fail "mcp user tools/list"; }
+echo "$MUT" | grep -q '"api_catalog"' || { echo "$MUT" >&2; fail "mcp user tools/list"; }
 if echo "$MUT" | grep -q '"admin_'; then echo "$MUT" >&2; fail "mcp user tools/list leaked admin"; fi
+MUC=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $TOKEN" \
+  --data '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"api_catalog","arguments":{}}}' "$BASE/mcp")
+MUCJ=$(printf '%s' "$MUC" | sed 's/\\"/"/g')
+echo "$MUCJ" | grep -q '"role":"user"' || { echo "$MUC" >&2; fail "mcp user catalog role"; }
+echo "$MUCJ" | grep -q '"path":"/v1/me"' || { echo "$MUC" >&2; fail "mcp user catalog me"; }
+echo "$MUCJ" | grep -q '"path":"/v1/usage"' || { echo "$MUC" >&2; fail "mcp user catalog usage"; }
+# A7c 新加的 /v1/pricing 没改一行 MCP 代码就出现在目录里（路由表驱动）
+echo "$MUCJ" | grep -q '"path":"/v1/pricing"' || { echo "$MUC" >&2; fail "mcp catalog 未自动收录新接口"; }
+if echo "$MUCJ" | grep -q '"path":"/admin/'; then echo "$MUC" >&2; fail "mcp user catalog leaked admin"; fi
 MUM=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $TOKEN" \
-  --data '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"me","arguments":{}}}' "$BASE/mcp")
+  --data '{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"api_call","arguments":{"method":"GET","path":"/v1/me"}}}' "$BASE/mcp")
 echo "$MUM" | grep -q 'user_id' || { echo "$MUM" >&2; fail "mcp user me"; }
 MUD=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $TOKEN" \
-  --data '{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"admin_health","arguments":{}}}' "$BASE/mcp")
+  --data '{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"api_call","arguments":{"method":"GET","path":"/admin/health"}}}' "$BASE/mcp")
 echo "$MUD" | grep -q 'permission denied' || { echo "$MUD" >&2; fail "mcp user admin denied"; }
 echo "$MUD" | grep -q -- '-32001' || { echo "$MUD" >&2; fail "mcp user admin deny code"; }
 MUP=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $TOKEN" \
-  --data '{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"pricing_get","arguments":{"model":"mock-model"}}}' "$BASE/mcp")
+  --data '{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"api_call","arguments":{"method":"GET","path":"/v1/pricing?model=mock-model"}}}' "$BASE/mcp")
 MUPJ=$(printf '%s' "$MUP" | sed 's/\\"/"/g')
 echo "$MUPJ" | grep -q '"sell"' || { echo "$MUP" >&2; fail "mcp user pricing sell"; }
 if echo "$MUPJ" | grep -q '"cost"'; then echo "$MUP" >&2; fail "mcp user pricing leaked cost"; fi
-# user_id 参数必须被忽略：传别人的 id 仍只返回自己的用量
-MUB=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $TOKEN" \
-  --data '{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"billing_query","arguments":{"user_id":999,"from_day":0,"to_day":999999}}}' "$BASE/mcp")
-MUBJ=$(printf '%s' "$MUB" | sed 's/\\"/"/g')
-echo "$MUBJ" | grep -q '"model":"mock-model"' || { echo "$MUB" >&2; fail "mcp user billing self scope"; }
-echo "$MUBJ" | grep -q '"requests":6' || { echo "$MUB" >&2; fail "mcp user billing own rows"; }
+echo "$MUP" | grep -q '"status":200' || { echo "$MUP" >&2; fail "mcp api_call 应带回 status"; }
+# 查不到的价格 → handler 的 404 要能透出来（isError + status），模型才好区分「没这个模型」和「没权限」
+MNM=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $TOKEN" \
+  --data '{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"api_call","arguments":{"method":"GET","path":"/v1/pricing?model=no-such-model"}}}' "$BASE/mcp")
+echo "$MNM" | grep -q '"status":404' || { echo "$MNM" >&2; fail "mcp api_call 404 status"; }
+echo "$MNM" | grep -q '"isError":true' || { echo "$MNM" >&2; fail "mcp api_call 404 isError"; }
+# 账号范围只认 Bearer：query 里塞别人的 user_id 也查不到别人的账
 MUU=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $TOKEN" \
-  --data '{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"usage_get","arguments":{}}}' "$BASE/mcp")
+  --data '{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"api_call","arguments":{"method":"GET","path":"/v1/usage?user_id=999&from_day=0&to_day=999999"}}}' "$BASE/mcp")
 MUUJ=$(printf '%s' "$MUU" | sed 's/\\"/"/g')
-echo "$MUUJ" | grep -q '"requests":6' || { echo "$MUU" >&2; fail "mcp user usage"; }
+echo "$MUUJ" | grep -q '"requests":6' || { echo "$MUU" >&2; fail "mcp user usage self scope"; }
+# POST + body 透传
+MUK=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $TOKEN" \
+  --data '{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"api_call","arguments":{"method":"POST","path":"/v1/keys","body":{"name":"mcp-made"}}}}' "$BASE/mcp")
+echo "$MUK" | grep -q 'aigw_sk_' || { echo "$MUK" >&2; fail "mcp user keys post"; }
+# 参数校验
+MBG=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $TOKEN" \
+  --data '{"jsonrpc":"2.0","id":17,"method":"tools/call","params":{"name":"api_call","arguments":{"method":"GET","path":"/nope"}}}' "$BASE/mcp")
+echo "$MBG" | grep -q 'unknown endpoint' || { echo "$MBG" >&2; fail "mcp unknown path"; }
 MNA=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' -X POST \
-  --data '{"jsonrpc":"2.0","id":16,"method":"initialize"}' "$BASE/mcp")
+  --data '{"jsonrpc":"2.0","id":18,"method":"initialize"}' "$BASE/mcp")
 [ "$MNA" = "401" ] || fail "mcp without auth expected 401, got $MNA"
 
 # 4f) B1 controller：注册/心跳/配置/状态

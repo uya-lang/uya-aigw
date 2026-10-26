@@ -141,8 +141,52 @@ fn test_writer_escape() !void {
     try assert_eq_bool(tj_eq(jsonw_span(&w), &"0"[0: 1]), true);
 }
 
+/// A7c：`json_raw` 原样取回原文（对象/数组/数字保真，字符串给解码内容）。
+fn test_raw() !void {
+    var buf: [byte: 128] = [0: 128];
+    var d: JsonDoc = JsonDoc{};
+    const text: &[byte] = &"{\"a\":1.50,\"b\":\"x y\",\"c\":[1, 2 ,3],\"t\":true,\"n\":null}"[0: 52];
+    try json_parse(&d, text);
+    const root: i32 = json_root(&d);
+    // 整个对象：与输入逐字节相同（`1.50` 不被规整成 `1.5`，空格/键序不变）
+    const rn: usize = json_raw(&d, root, &buf[0], 128);
+    try assert_eq_i32(rn as i32, 52);
+    try assert_eq_bool(tj_eq(buf[0: rn], text), true);
+    // 嵌套数组按自己的 span 截取
+    const c: i32 = json_get(&d, root, &"c"[0: 1]);
+    const cn: usize = json_raw(&d, c, &buf[0], 128);
+    try assert_eq_bool(tj_eq(buf[0: cn], &"[1, 2 ,3]"[0: 9]), true);
+    // 数字原样（含小数）
+    const a: i32 = json_get(&d, root, &"a"[0: 1]);
+    const an: usize = json_raw(&d, a, &buf[0], 128);
+    try assert_eq_bool(tj_eq(buf[0: an], &"1.50"[0: 4]), true);
+    // 字符串给解码后的内容
+    const b: i32 = json_get(&d, root, &"b"[0: 1]);
+    const bn: usize = json_raw(&d, b, &buf[0], 128);
+    try assert_eq_bool(tj_eq(buf[0: bn], &"x y"[0: 3]), true);
+    // 布尔 / null 写字面量
+    const t: i32 = json_get(&d, root, &"t"[0: 1]);
+    const tn: usize = json_raw(&d, t, &buf[0], 128);
+    try assert_eq_bool(tj_eq(buf[0: tn], &"true"[0: 4]), true);
+    const nl: i32 = json_get(&d, root, &"n"[0: 1]);
+    const nln: usize = json_raw(&d, nl, &buf[0], 128);
+    try assert_eq_bool(tj_eq(buf[0: nln], &"null"[0: 4]), true);
+    // 空容器 / cap 截断 / 不存在的节点
+    try json_parse(&d, &"{\"e\":{},\"z\":[]}"[0: 15]);
+    const r2: i32 = json_root(&d);
+    const e: i32 = json_get(&d, r2, &"e"[0: 1]);
+    const en: usize = json_raw(&d, e, &buf[0], 128);
+    try assert_eq_bool(tj_eq(buf[0: en], &"{}"[0: 2]), true);
+    const z: i32 = json_get(&d, r2, &"z"[0: 1]);
+    const zn: usize = json_raw(&d, z, &buf[0], 128);
+    try assert_eq_bool(tj_eq(buf[0: zn], &"[]"[0: 2]), true);
+    try assert_eq_i32(json_raw(&d, e, &buf[0], 1) as i32, 1);
+    try assert_eq_i32(json_raw(&d, 0 - 1, &buf[0], 128) as i32, 0);
+}
+
 test "parse_nested" { run_test("parse_nested", test_parse_nested); }
 test "escapes" { run_test("escapes", test_escapes); }
 test "errors" { run_test("errors", test_errors); }
 test "writer" { run_test("writer", test_writer); }
 test "writer_escape" { run_test("writer_escape", test_writer_escape); }
+test "raw" { run_test("raw", test_raw); }

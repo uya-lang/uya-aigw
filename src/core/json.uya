@@ -364,10 +364,15 @@ fn js_parse_obj(d: &JsonDoc, p: &usize, depth: i32) !i32 {
         return error.JsonTooDeep;
     }
     const node: i32 = try js_new(d, JSON_OBJ);
+    // A7c：记下对象在 `src` 里的原始 span，`json_raw` 可原样取回（不经重新序列化，
+    // 浮点/转义/键序都不变）。字符串与数字另有各自的 span 含义（见 JsonNode）。
+    const begin: usize = p[0];
     p[0] = p[0] + 1; // {
     js_skip(d, p);
     if js_byte(d, p[0]) == (125 as byte) { // }
         p[0] = p[0] + 1;
+        js_node(d, node).start = begin;
+        js_node(d, node).end = p[0];
         return node;
     }
     var first: i32 = 0 - 1;
@@ -401,6 +406,8 @@ fn js_parse_obj(d: &JsonDoc, p: &usize, depth: i32) !i32 {
         return error.JsonBadInput;
     }
     js_node(d, node).child = first;
+    js_node(d, node).start = begin;
+    js_node(d, node).end = p[0];
     return node;
 }
 
@@ -409,10 +416,14 @@ fn js_parse_arr(d: &JsonDoc, p: &usize, depth: i32) !i32 {
         return error.JsonTooDeep;
     }
     const node: i32 = try js_new(d, JSON_ARR);
+    // A7c：数组同样记原始 span（见 js_parse_obj）。
+    const begin: usize = p[0];
     p[0] = p[0] + 1; // [
     js_skip(d, p);
     if js_byte(d, p[0]) == (93 as byte) { // ]
         p[0] = p[0] + 1;
+        js_node(d, node).start = begin;
+        js_node(d, node).end = p[0];
         return node;
     }
     var first: i32 = 0 - 1;
@@ -438,6 +449,8 @@ fn js_parse_arr(d: &JsonDoc, p: &usize, depth: i32) !i32 {
         return error.JsonBadInput;
     }
     js_node(d, node).child = first;
+    js_node(d, node).start = begin;
+    js_node(d, node).end = p[0];
     return node;
 }
 
@@ -539,6 +552,55 @@ export fn json_str(d: &JsonDoc, node: i32, out: &byte, cap: usize) usize {
     var w: usize = 0;
     while i < n.end && w < cap {
         out[w] = js_str_byte(d, i);
+        i = i + 1;
+        w = w + 1;
+    }
+    return w;
+}
+
+fn js_copy_lit(out: &byte, cap: usize, lit: &[const byte]) usize {
+    var i: usize = 0;
+    while i < lit.len && i < cap {
+        out[i] = lit[i];
+        i = i + 1;
+    }
+    return i;
+}
+
+/// A7c：取节点在**原文**里的 JSON 文本，不做重新序列化——对象/数组/数字按
+/// `src` 里的 span 原样截取（浮点精度、`\u` 转义写法、键序都不变），字符串给
+/// 解码后的内容，布尔/null 写字面量。MCP 通用调用靠它把 `arguments.body`
+/// 一字不改地转给 REST handler。
+export fn json_raw(d: &JsonDoc, node: i32, out: &byte, cap: usize) usize {
+    const k: i32 = json_kind(d, node);
+    if k == JSON_STR {
+        return json_str(d, node, out, cap);
+    }
+    if k == JSON_BOOL {
+        if js_node(d, node).bval {
+            return js_copy_lit(out, cap, &"true"[0: 4]);
+        }
+        return js_copy_lit(out, cap, &"false"[0: 5]);
+    }
+    if k == JSON_NULL {
+        return js_copy_lit(out, cap, &"null"[0: 4]);
+    }
+    if k < 0 {
+        return 0;
+    }
+    const n: &JsonNode = js_node(d, node);
+    var end: usize = n.end;
+    if end > d.src_len {
+        end = d.src_len;
+    }
+    var start: usize = n.start;
+    if start > end {
+        start = end;
+    }
+    var i: usize = start;
+    var w: usize = 0;
+    while i < end && w < cap {
+        out[w] = js_byte(d, i);
         i = i + 1;
         w = w + 1;
     }
