@@ -1006,6 +1006,23 @@ const SRV_SEC_HEADERS: &[byte] = &"Content-Security-Policy: default-src 'self'; 
 
 fn srv_static_ct(c: &SrvConn, status: i32, body: &[byte], keep: bool,
     ctype: &[byte], ctype_len: usize) void {
+    // A7b：MCP 工具复用 REST handler——把 handler 原本要写回连接的响应体
+    // 捕获到固定缓冲，再包装成 JSON-RPC 工具结果。单线程、同步调用，
+    // 捕获期间不会穿插其他响应。
+    if g_mcp_cap_on {
+        var cn: usize = body.len;
+        if cn > SRV_MCP_CAP_MAX {
+            cn = SRV_MCP_CAP_MAX;
+        }
+        var ci: usize = 0;
+        while ci < cn {
+            g_mcp_aux.cap_buf[ci] = body[ci];
+            ci = ci + 1;
+        }
+        g_mcp_cap_len = cn;
+        g_mcp_cap_status = status;
+        return;
+    }
     var n: usize = 0;
     if ctype_len == 23 || ctype_len == 22 {
         n = hsrv_resp_head_extra(&c.out[0], SRV_OUT_CAP, status, ctype, ctype_len,
@@ -4910,10 +4927,67 @@ fn srv_responses_block(c: &SrvConn, stats: &ServeStats) void {
 }
 
 // ---------------------------------------------------------------
-// A7：MCP（JSON-RPC over HTTP POST /mcp，Bearer --admin-key）
+// A7b：MCP（JSON-RPC over HTTP POST /mcp）
+//
+// 两种凭据：
+//   * `--admin-key`：可调用全部管理操作（与 /admin/* 共用同一套 handler）；
+//   * 网关 API Key（`aigw_sk_...`）：只能操作该 Key 所属账号（/v1/* 自助接口）。
+//
+// 为避免 MCP 与 REST 两套逻辑漂移，工具同步调用现有 handler，并把它写出的
+// `srv_static*` 响应捕获到固定缓冲。事件循环单线程、handler 同步执行，
+// 捕获期间不会穿插其他响应。管理员与账号的权限边界仍由 handler 自己再校验一次。
 // ---------------------------------------------------------------
 
-fn srv_bytes_eq(a: &[byte], b: &[byte]) bool {
+const SRV_MCP_ANON: i32 = 0;
+const SRV_MCP_USER: i32 = 1;
+const SRV_MCP_ADMIN: i32 = 2;
+
+// tools/call -> 具体 REST handler
+const SRV_MCP_OP_ADMIN_PRICING_GET: i32 = 1;
+const SRV_MCP_OP_ADMIN_HEALTH: i32 = 2;
+const SRV_MCP_OP_ADMIN_USERS: i32 = 3;
+const SRV_MCP_OP_ADMIN_PROVIDERS: i32 = 4;
+const SRV_MCP_OP_ADMIN_MODELS: i32 = 5;
+const SRV_MCP_OP_ADMIN_BIND: i32 = 6;
+const SRV_MCP_OP_ADMIN_PRICING_POST: i32 = 7;
+const SRV_MCP_OP_ADMIN_PRICES: i32 = 8;
+const SRV_MCP_OP_ADMIN_BACKUP: i32 = 9;
+const SRV_MCP_OP_ADMIN_AUDIT: i32 = 10;
+const SRV_MCP_OP_ME: i32 = 11;
+const SRV_MCP_OP_MODELS: i32 = 12;
+const SRV_MCP_OP_USAGE: i32 = 13;
+const SRV_MCP_OP_REQUESTS: i32 = 14;
+const SRV_MCP_OP_ESTIMATE: i32 = 15;
+const SRV_MCP_OP_BUDGET: i32 = 16;
+const SRV_MCP_OP_KEYS: i32 = 17;
+const SRV_MCP_OP_KEY_REVOKE: i32 = 18;
+const SRV_MCP_OP_NOTIFICATIONS: i32 = 19;
+const SRV_MCP_OP_ADMIN_BILLING: i32 = 20;
+
+// handler 响应体捕获（允许的最大单次响应；与 srv_static_ct 的捕获钩子共用）。
+const SRV_MCP_CAP_MAX: usize = 65536;
+// JSON-RPC 输出缓冲：工具结果要作为 text 字符串再转义一次，最坏接近 2 倍。
+const SRV_MCP_OUT_MAX: usize = 163840;
+
+/// 编译器对「裸的全局定长数组」切片会拿到错元素类型的切片
+/// （把 `g_arr[0: n]` 当成 slice_int32，见 mailer.uya），
+/// 套一层结构体的字段就正常。
+struct McpAux {
+    cap_buf: [byte: SRV_MCP_CAP_MAX],
+    out: [byte: SRV_MCP_OUT_MAX],
+}
+
+var g_mcp_aux: McpAux = McpAux{};
+var g_mcp_cap_on: bool = false;
+var g_mcp_cap_status: i32 = 0;
+var g_mcp_cap_len: usize = 0;
+var g_mcp_out_len: usize = 0;
+var g_mcp_out_over: bool = false;
+
+// 只用于 MCP 调 handler 的临时请求对象；单线程复用。
+var g_mcp_fc: SrvConn = SrvConn{};
+
+fn srv_mcp_eq(a: &[const byte], b: &[const byte]) bool {
     if a.len != b.len {
         return false;
     }
@@ -4927,6 +5001,1096 @@ fn srv_bytes_eq(a: &[byte], b: &[byte]) bool {
     return true;
 }
 
+fn srv_mcp_has_prefix(s: &[const byte], p: &[const byte]) bool {
+    if s.len < p.len {
+        return false;
+    }
+    return srv_mcp_eq(s[0: p.len], p);
+}
+
+// ---------------- 输出构造 ----------------
+
+fn srv_mcp_ob(b: byte) void {
+    if g_mcp_out_len < SRV_MCP_OUT_MAX {
+        g_mcp_aux.out[g_mcp_out_len] = b;
+        g_mcp_out_len = g_mcp_out_len + 1;
+        return;
+    }
+    g_mcp_out_over = true;
+}
+
+fn srv_mcp_os(s: &[const byte]) void {
+    var i: usize = 0;
+    while i < s.len {
+        srv_mcp_ob(s[i]);
+        i = i + 1;
+    }
+}
+
+fn srv_mcp_hex_digit(v: i32) byte {
+    if v < 10 {
+        return (48 +% v) as byte;
+    }
+    return (87 +% v) as byte;
+}
+
+/// JSON 字符串转义（与 jsonw 的规则一致）。
+fn srv_mcp_oe(s: &[const byte]) void {
+    var i: usize = 0;
+    while i < s.len {
+        const ch: byte = s[i];
+        if ch == (34 as byte) {
+            srv_mcp_ob(92 as byte);
+            srv_mcp_ob(34 as byte);
+        } else if ch == (92 as byte) {
+            srv_mcp_ob(92 as byte);
+            srv_mcp_ob(92 as byte);
+        } else if ch == (10 as byte) {
+            srv_mcp_ob(92 as byte);
+            srv_mcp_ob(110 as byte);
+        } else if ch == (13 as byte) {
+            srv_mcp_ob(92 as byte);
+            srv_mcp_ob(114 as byte);
+        } else if ch == (9 as byte) {
+            srv_mcp_ob(92 as byte);
+            srv_mcp_ob(116 as byte);
+        } else if ch == (8 as byte) {
+            srv_mcp_ob(92 as byte);
+            srv_mcp_ob(98 as byte);
+        } else if ch == (12 as byte) {
+            srv_mcp_ob(92 as byte);
+            srv_mcp_ob(102 as byte);
+        } else if ch < (32 as byte) {
+            srv_mcp_ob(92 as byte);
+            srv_mcp_ob(117 as byte);
+            srv_mcp_ob(48 as byte);
+            srv_mcp_ob(48 as byte);
+            srv_mcp_ob(srv_mcp_hex_digit(((ch as i32) / 16) % 16));
+            srv_mcp_ob(srv_mcp_hex_digit((ch as i32) % 16));
+        } else {
+            srv_mcp_ob(ch);
+        }
+        i = i + 1;
+    }
+}
+
+/// 带符号的 i64 文本（`srv_i64_text` 只处理非负数，JSON-RPC id 可正可负）。
+fn srv_mcp_i64_text(v: i64, out: &byte, cap: usize) usize {
+    var x: u64 = 0;
+    var neg: bool = false;
+    if v < 0 {
+        neg = true;
+        x = (0 as i64 -% v) as u64;
+    } else {
+        x = v as u64;
+    }
+    var digits: [byte: 20] = [0: 20];
+    var d: usize = 0;
+    if x == 0 {
+        digits[0] = 48;
+        d = 1;
+    } else {
+        while x > 0 && d < 20 {
+            digits[d] = (48 +% (x % (10 as u64))) as byte;
+            x = x / (10 as u64);
+            d = d + 1;
+        }
+    }
+    var n: usize = 0;
+    if neg && n < cap {
+        out[n] = 45;
+        n = n + 1;
+    }
+    while d > 0 && n < cap {
+        d = d - 1;
+        out[n] = digits[d];
+        n = n + 1;
+    }
+    return n;
+}
+
+fn srv_mcp_oi(v: i64) void {
+    var b: [byte: 24] = [0: 24];
+    const n: usize = srv_mcp_i64_text(v, &b[0], 24);
+    srv_mcp_os(b[0: n]);
+}
+
+fn srv_mcp_send_error(c: &SrvConn, id: i64, code: i64, msg: &[const byte]) void {
+    g_mcp_out_len = 0;
+    g_mcp_out_over = false;
+    srv_mcp_os("{\"jsonrpc\":\"2.0\",\"id\":");
+    srv_mcp_oi(id);
+    srv_mcp_os(",\"error\":{\"code\":");
+    srv_mcp_oi(code);
+    srv_mcp_os(",\"message\":\"");
+    srv_mcp_oe(msg);
+    srv_mcp_os("\"}}");
+    srv_static(c, 200, g_mcp_aux.out[0: g_mcp_out_len], c.keep);
+}
+
+/// 把捕获到的 handler 响应包装成 tools/call 结果；非 200 用 isError 标出来。
+fn srv_mcp_send_captured(c: &SrvConn, id: i64) void {
+    g_mcp_out_len = 0;
+    g_mcp_out_over = false;
+    srv_mcp_os("{\"jsonrpc\":\"2.0\",\"id\":");
+    srv_mcp_oi(id);
+    srv_mcp_os(",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"");
+    srv_mcp_oe(g_mcp_aux.cap_buf[0: g_mcp_cap_len]);
+    if g_mcp_cap_status == 200 {
+        srv_mcp_os("\"}]}}");
+    } else {
+        srv_mcp_os("\"}],\"isError\":true}}");
+    }
+    if g_mcp_out_over {
+        srv_mcp_send_error(c, id, -32000, "tool result too large");
+        return;
+    }
+    srv_static(c, 200, g_mcp_aux.out[0: g_mcp_out_len], c.keep);
+}
+
+/// 把 JsonW 构造的 JSON 当作工具结果返回（用户侧裁剪过的少量字段）。
+fn srv_mcp_send_jsonw(c: &SrvConn, id: i64, w: &JsonW) void {
+    if !jsonw_ok(w) {
+        srv_mcp_send_error(c, id, -32000, "result too large");
+        return;
+    }
+    const s: &[byte] = jsonw_span(w);
+    if s.len > SRV_MCP_CAP_MAX {
+        srv_mcp_send_error(c, id, -32000, "result too large");
+        return;
+    }
+    var i: usize = 0;
+    while i < s.len {
+        g_mcp_aux.cap_buf[i] = s[i];
+        i = i + 1;
+    }
+    g_mcp_cap_len = i;
+    g_mcp_cap_status = 200;
+    srv_mcp_send_captured(c, id);
+}
+
+// ---------------- 鉴权 ----------------
+
+fn srv_mcp_principal(c: &SrvConn, uid: &i64) i32 {
+    if srv_admin_ok(c) {
+        uid[0] = 0;
+        return SRV_MCP_ADMIN;
+    }
+    var tok: [byte: 256] = [0: 256];
+    const tn: usize = chat_bearer_span(&c.auth[0], c.auth_len, &tok[0], 256);
+    if tn == 0 {
+        return SRV_MCP_ANON;
+    }
+    var k: StoreKey = StoreKey{ key_id: 0, user_id: 0, rpm: 0, tpm: 0 };
+    store_verify_key_fast(runtime_db(), tok[0: tn], store_now(), &k) catch {
+        return SRV_MCP_ANON;
+    };
+    uid[0] = k.user_id;
+    return SRV_MCP_USER;
+}
+
+// ---------------- 复用 REST handler ----------------
+
+fn srv_mcp_capture_begin() void {
+    g_mcp_cap_on = true;
+    g_mcp_cap_status = 0;
+    g_mcp_cap_len = 0;
+}
+
+fn srv_mcp_capture_end() void {
+    g_mcp_cap_on = false;
+}
+
+fn srv_mcp_req_reset(src: &SrvConn, is_get: bool) void {
+    g_mcp_fc.keep = true;
+    g_mcp_fc.is_get = is_get;
+    g_mcp_fc.is_head_req = false;
+    g_mcp_fc.body_len = 0;
+    g_mcp_fc.path_len = 0;
+    g_mcp_fc.auth_len = 0;
+    g_mcp_fc.body_overflow = false;
+    g_mcp_fc.body_busy = false;
+    g_mcp_fc.body_big = Buf{ ptr: null, len: 0, cap: 0 };
+    var i: usize = 0;
+    while i < src.auth_len && i < 256 {
+        g_mcp_fc.auth[i] = src.auth[i];
+        i = i + 1;
+    }
+    g_mcp_fc.auth_len = i;
+}
+
+fn srv_mcp_path_add(s: &[const byte]) bool {
+    if g_mcp_fc.path_len > 1024 {
+        return false;
+    }
+    var p: usize = g_mcp_fc.path_len;
+    var i: usize = 0;
+    while i < s.len && p < 1024 {
+        g_mcp_fc.path[p] = s[i];
+        p = p + 1;
+        i = i + 1;
+    }
+    if i < s.len {
+        return false;
+    }
+    g_mcp_fc.path_len = p;
+    return true;
+}
+
+fn srv_mcp_path_base(s: &[const byte]) bool {
+    g_mcp_fc.path_len = 0;
+    return srv_mcp_path_add(s);
+}
+
+fn srv_mcp_q_i64(key: &[const byte], v: i64) bool {
+    var b: [byte: 24] = [0: 24];
+    const n: usize = srv_mcp_i64_text(v, &b[0], 24);
+    if !srv_mcp_path_add("&") {
+        return false;
+    }
+    if !srv_mcp_path_add(key) {
+        return false;
+    }
+    if !srv_mcp_path_add("=") {
+        return false;
+    }
+    return srv_mcp_path_add(b[0: n]);
+}
+
+fn srv_mcp_q_str(key: &[const byte], v: &[const byte]) bool {
+    var i: usize = 0;
+    while i < v.len {
+        if v[i] == (38 as byte) {
+            return false;
+        }
+        i = i + 1;
+    }
+    if !srv_mcp_path_add("&") {
+        return false;
+    }
+    if !srv_mcp_path_add(key) {
+        return false;
+    }
+    if !srv_mcp_path_add("=") {
+        return false;
+    }
+    return srv_mcp_path_add(v);
+}
+
+fn srv_mcp_set_body(w: &JsonW) bool {
+    if !jsonw_ok(w) {
+        return false;
+    }
+    const s: &[byte] = jsonw_span(w);
+    if s.len > SRV_BODY_INLINE {
+        return false;
+    }
+    var i: usize = 0;
+    while i < s.len && i < SRV_BODY_INLINE {
+        g_mcp_fc.body[i] = s[i];
+        i = i + 1;
+    }
+    g_mcp_fc.body_len = i;
+    return true;
+}
+
+fn srv_mcp_run(fc: &SrvConn, stats: &ServeStats, op: i32) void {
+    if op == SRV_MCP_OP_ADMIN_PRICING_GET {
+        srv_admin_pricing_get(fc, stats);
+        return;
+    }
+    if op == SRV_MCP_OP_ADMIN_BILLING {
+        srv_admin_billing(fc, stats);
+        return;
+    }
+    if op == SRV_MCP_OP_ADMIN_HEALTH {
+        srv_admin_health(fc, stats);
+        return;
+    }
+    if op == SRV_MCP_OP_ADMIN_USERS {
+        srv_admin_users(fc, stats);
+        return;
+    }
+    if op == SRV_MCP_OP_ADMIN_PROVIDERS {
+        srv_admin_providers(fc, stats);
+        return;
+    }
+    if op == SRV_MCP_OP_ADMIN_MODELS {
+        srv_admin_models(fc, stats);
+        return;
+    }
+    if op == SRV_MCP_OP_ADMIN_BIND {
+        srv_admin_bind(fc, stats);
+        return;
+    }
+    if op == SRV_MCP_OP_ADMIN_PRICING_POST {
+        srv_admin_pricing_post(fc, stats);
+        return;
+    }
+    if op == SRV_MCP_OP_ADMIN_PRICES {
+        srv_admin_prices(fc, stats);
+        return;
+    }
+    if op == SRV_MCP_OP_ADMIN_BACKUP {
+        srv_admin_backup(fc, stats);
+        return;
+    }
+    if op == SRV_MCP_OP_ADMIN_AUDIT {
+        srv_admin_audit(fc, stats);
+        return;
+    }
+    if op == SRV_MCP_OP_ME {
+        srv_me(fc, stats);
+        return;
+    }
+    if op == SRV_MCP_OP_MODELS {
+        srv_models(fc);
+        return;
+    }
+    if op == SRV_MCP_OP_USAGE {
+        srv_usage(fc, stats);
+        return;
+    }
+    if op == SRV_MCP_OP_REQUESTS {
+        srv_requests(fc, stats);
+        return;
+    }
+    if op == SRV_MCP_OP_ESTIMATE {
+        srv_estimate(fc, stats);
+        return;
+    }
+    if op == SRV_MCP_OP_BUDGET {
+        srv_budget(fc, stats);
+        return;
+    }
+    if op == SRV_MCP_OP_KEYS {
+        srv_keys(fc, stats);
+        return;
+    }
+    if op == SRV_MCP_OP_KEY_REVOKE {
+        srv_key_revoke(fc, stats);
+        return;
+    }
+    if op == SRV_MCP_OP_NOTIFICATIONS {
+        srv_notifications(fc, stats);
+        return;
+    }
+}
+
+fn srv_mcp_call_prepared(c: &SrvConn, stats: &ServeStats, id: i64, op: i32) void {
+    srv_mcp_capture_begin();
+    srv_mcp_run(&g_mcp_fc, stats, op);
+    srv_mcp_capture_end();
+    srv_mcp_send_captured(c, id);
+}
+
+fn srv_mcp_call_simple(c: &SrvConn, stats: &ServeStats, id: i64,
+    path: &[const byte], op: i32) void {
+    srv_mcp_req_reset(c, true);
+    if !srv_mcp_path_base(path) {
+        srv_mcp_send_error(c, id, -32602, "invalid params");
+        return;
+    }
+    srv_mcp_call_prepared(c, stats, id, op);
+}
+
+// ---------------- 参数/请求体辅助 ----------------
+
+fn srv_mcp_key(w: &JsonW, k: &[const byte]) void {
+    jsonw_key(w, k[0: k.len]);
+}
+
+fn srv_mcp_str(w: &JsonW, s: &[const byte]) void {
+    jsonw_str(w, s[0: s.len]);
+}
+
+fn srv_mcp_arg_node(d: &JsonDoc, args: i32, key: &[const byte]) i32 {
+    return json_get(d, args, key[0: key.len]);
+}
+
+fn srv_mcp_has(d: &JsonDoc, args: i32, key: &[const byte]) bool {
+    return srv_mcp_arg_node(d, args, key) >= 0;
+}
+
+fn srv_mcp_arg_i64(d: &JsonDoc, args: i32, key: &[const byte]) i64 {
+    return json_i64(d, srv_mcp_arg_node(d, args, key));
+}
+
+fn srv_mcp_arg_str(d: &JsonDoc, args: i32, key: &[const byte],
+    out: &byte, cap: usize) usize {
+    return json_str(d, srv_mcp_arg_node(d, args, key), out, cap);
+}
+
+fn srv_mcp_body_i64(d: &JsonDoc, args: i32, w: &JsonW, key: &[const byte]) void {
+    if !srv_mcp_has(d, args, key) {
+        return;
+    }
+    srv_mcp_key(w, key);
+    jsonw_i64(w, srv_mcp_arg_i64(d, args, key));
+}
+
+fn srv_mcp_body_str(d: &JsonDoc, args: i32, w: &JsonW, key: &[const byte],
+    cap: usize) void {
+    var b: [byte: 256] = [0: 256];
+    var c: usize = cap;
+    if c > 256 {
+        c = 256;
+    }
+    const n: usize = srv_mcp_arg_str(d, args, key, &b[0], c);
+    if n == 0 {
+        return;
+    }
+    srv_mcp_key(w, key);
+    srv_mcp_str(w, b[0: n]);
+}
+
+fn srv_mcp_bad(c: &SrvConn, id: i64) void {
+    srv_mcp_send_error(c, id, -32602, "invalid params");
+}
+
+// ---------------- tools/call：管理员 ----------------
+
+fn srv_mcp_admin_pricing(c: &SrvConn, stats: &ServeStats, d: &JsonDoc,
+    args: i32, id: i64) void {
+    var model: [byte: 128] = [0: 128];
+    const mn: usize = srv_mcp_arg_str(d, args, "model", &model[0], 128);
+    if mn == 0 {
+        srv_mcp_bad(c, id);
+        return;
+    }
+    var prov: [byte: 128] = [0: 128];
+    const pn: usize = srv_mcp_arg_str(d, args, "provider", &prov[0], 128);
+    srv_mcp_req_reset(c, true);
+    if !srv_mcp_path_base("/admin/pricing?") {
+        srv_mcp_bad(c, id);
+        return;
+    }
+    if !srv_mcp_q_str("model", model[0: mn]) {
+        srv_mcp_bad(c, id);
+        return;
+    }
+    if pn > 0 && !srv_mcp_q_str("provider", prov[0: pn]) {
+        srv_mcp_bad(c, id);
+        return;
+    }
+    if srv_mcp_has(d, args, "user_id") &&
+        !srv_mcp_q_i64("user_id", srv_mcp_arg_i64(d, args, "user_id")) {
+        srv_mcp_bad(c, id);
+        return;
+    }
+    if srv_mcp_has(d, args, "ts") &&
+        !srv_mcp_q_i64("ts", srv_mcp_arg_i64(d, args, "ts")) {
+        srv_mcp_bad(c, id);
+        return;
+    }
+    srv_mcp_call_prepared(c, stats, id, SRV_MCP_OP_ADMIN_PRICING_GET);
+}
+
+fn srv_mcp_admin_bind(c: &SrvConn, stats: &ServeStats, d: &JsonDoc,
+    args: i32, id: i64) void {
+    var prov: [byte: 64] = [0: 64];
+    const pn: usize = srv_mcp_arg_str(d, args, "provider", &prov[0], 64);
+    var model: [byte: 96] = [0: 96];
+    const mn: usize = srv_mcp_arg_str(d, args, "model", &model[0], 96);
+    if pn == 0 || mn == 0 {
+        srv_mcp_bad(c, id);
+        return;
+    }
+    var up: [byte: 96] = [0: 96];
+    const un: usize = srv_mcp_arg_str(d, args, "upstream_model", &up[0], 96);
+    var bw: JsonW = JsonW{};
+    jsonw_init(&bw);
+    jsonw_obj(&bw);
+    srv_mcp_key(&bw, "provider");
+    srv_mcp_str(&bw, prov[0: pn]);
+    srv_mcp_key(&bw, "model");
+    srv_mcp_str(&bw, model[0: mn]);
+    if un > 0 {
+        srv_mcp_key(&bw, "upstream_model");
+        srv_mcp_str(&bw, up[0: un]);
+    }
+    jsonw_end_obj(&bw);
+    srv_mcp_req_reset(c, false);
+    if !srv_mcp_path_base("/admin/bind") || !srv_mcp_set_body(&bw) {
+        srv_mcp_bad(c, id);
+        return;
+    }
+    srv_mcp_call_prepared(c, stats, id, SRV_MCP_OP_ADMIN_BIND);
+}
+
+fn srv_mcp_admin_pricing_create(c: &SrvConn, stats: &ServeStats, d: &JsonDoc,
+    args: i32, id: i64) void {
+    var model: [byte: 128] = [0: 128];
+    const mn: usize = srv_mcp_arg_str(d, args, "model", &model[0], 128);
+    const version: i64 = srv_mcp_arg_i64(d, args, "version");
+    if mn == 0 || version <= 0 {
+        srv_mcp_send_error(c, id, -32602, "model and version required");
+        return;
+    }
+    var bw: JsonW = JsonW{};
+    jsonw_init(&bw);
+    jsonw_obj(&bw);
+    srv_mcp_key(&bw, "model");
+    srv_mcp_str(&bw, model[0: mn]);
+    srv_mcp_key(&bw, "version");
+    jsonw_i64(&bw, version);
+    srv_mcp_body_i64(d, args, &bw, "kind");
+    var eff: i64 = srv_mcp_arg_i64(d, args, "effective_from");
+    if eff <= 0 {
+        eff = store_now();
+    }
+    srv_mcp_key(&bw, "effective_from");
+    jsonw_i64(&bw, eff);
+    srv_mcp_body_str(d, args, &bw, "provider", 128);
+    srv_mcp_body_str(d, args, &bw, "schedule", 256);
+    srv_mcp_body_i64(d, args, &bw, "user_id");
+    srv_mcp_body_i64(d, args, &bw, "input_nano_per_mtok");
+    srv_mcp_body_i64(d, args, &bw, "output_nano_per_mtok");
+    srv_mcp_body_i64(d, args, &bw, "cache_read_nano_per_mtok");
+    srv_mcp_body_i64(d, args, &bw, "per_request_nano");
+    jsonw_end_obj(&bw);
+    srv_mcp_req_reset(c, false);
+    if !srv_mcp_path_base("/admin/pricing") || !srv_mcp_set_body(&bw) {
+        srv_mcp_bad(c, id);
+        return;
+    }
+    srv_mcp_call_prepared(c, stats, id, SRV_MCP_OP_ADMIN_PRICING_POST);
+}
+
+fn srv_mcp_admin_price_put(c: &SrvConn, stats: &ServeStats, d: &JsonDoc,
+    args: i32, id: i64) void {
+    var model: [byte: 96] = [0: 96];
+    const mn: usize = srv_mcp_arg_str(d, args, "model", &model[0], 96);
+    if mn == 0 {
+        srv_mcp_bad(c, id);
+        return;
+    }
+    var bw: JsonW = JsonW{};
+    jsonw_init(&bw);
+    jsonw_obj(&bw);
+    srv_mcp_key(&bw, "model");
+    srv_mcp_str(&bw, model[0: mn]);
+    srv_mcp_body_str(d, args, &bw, "provider", 64);
+    srv_mcp_body_i64(d, args, &bw, "input");
+    srv_mcp_body_i64(d, args, &bw, "output");
+    srv_mcp_body_i64(d, args, &bw, "cache_read");
+    srv_mcp_body_i64(d, args, &bw, "per_request");
+    srv_mcp_body_str(d, args, &bw, "schedule", 256);
+    jsonw_end_obj(&bw);
+    srv_mcp_req_reset(c, false);
+    if !srv_mcp_path_base("/admin/price-entries") || !srv_mcp_set_body(&bw) {
+        srv_mcp_bad(c, id);
+        return;
+    }
+    srv_mcp_call_prepared(c, stats, id, SRV_MCP_OP_ADMIN_PRICES);
+}
+
+// ---------------- tools/call：普通 Key（只能操作自己账号） ----------------
+
+fn srv_mcp_user_pricing(c: &SrvConn, d: &JsonDoc, args: i32, id: i64,
+    uid: i64) void {
+    var model: [byte: 128] = [0: 128];
+    const mn: usize = srv_mcp_arg_str(d, args, "model", &model[0], 128);
+    if mn == 0 {
+        srv_mcp_bad(c, id);
+        return;
+    }
+    var ts: i64 = srv_mcp_arg_i64(d, args, "ts");
+    if ts <= 0 {
+        ts = store_now();
+    }
+    var sell: PriceRates = PriceRates{ input_nano_per_mtok: 0, output_nano_per_mtok: 0, cache_read_nano_per_mtok: 0, per_request_nano: 0, permille: 1000, card_id: 0, version: 0, found: false };
+    var no_prov: [byte: 1] = [0: 1];
+    price_lookup(runtime_db(), PRICE_KIND_SELL, model[0: mn], no_prov[0: 0],
+        uid, ts, 0, &sell) catch {
+        srv_mcp_send_error(c, id, -32000, "price not found");
+        return;
+    };
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    srv_mcp_key(&w, "model");
+    srv_mcp_str(&w, model[0: mn]);
+    srv_mcp_key(&w, "ts");
+    jsonw_i64(&w, ts);
+    srv_rates_out(&w, &"sell"[0: 4], &sell);
+    jsonw_end_obj(&w);
+    srv_mcp_send_jsonw(c, id, &w);
+}
+
+fn srv_mcp_user_billing(c: &SrvConn, d: &JsonDoc, args: i32, id: i64,
+    uid: i64) void {
+    srv_batch_sync();
+    var q: i64 = uid;
+    if q < 0 {
+        q = 0;
+    }
+    var from_day: i64 = srv_mcp_arg_i64(d, args, "from_day");
+    if from_day < 0 {
+        from_day = 0;
+    }
+    var to_day: i64 = srv_mcp_arg_i64(d, args, "to_day");
+    if to_day <= 0 {
+        to_day = 999999;
+    }
+    var rows: [RollupRow: 64] = [];
+    var n: usize = 0;
+    n = srv_rollup_query(q, from_day, to_day, &rows[0], 64);
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    srv_mcp_key(&w, "rows");
+    jsonw_arr(&w);
+    var i: usize = 0;
+    while i < n {
+        jsonw_obj(&w);
+        srv_mcp_key(&w, "day");
+        jsonw_i64(&w, rows[i].day);
+        srv_mcp_key(&w, "user_id");
+        jsonw_i64(&w, rows[i].user_id);
+        srv_mcp_key(&w, "model");
+        srv_mcp_str(&w, rows[i].model[0: rows[i].model_len]);
+        srv_mcp_key(&w, "provider");
+        srv_mcp_str(&w, rows[i].provider[0: rows[i].provider_len]);
+        srv_mcp_key(&w, "period");
+        srv_mcp_str(&w, rows[i].period[0: rows[i].period_len]);
+        srv_mcp_key(&w, "requests");
+        jsonw_i64(&w, rows[i].requests);
+        srv_mcp_key(&w, "input_tokens");
+        jsonw_i64(&w, rows[i].input_tokens);
+        srv_mcp_key(&w, "output_tokens");
+        jsonw_i64(&w, rows[i].output_tokens);
+        srv_mcp_key(&w, "cost_nano");
+        jsonw_i64(&w, rows[i].cost_nano);
+        srv_mcp_key(&w, "price_nano");
+        jsonw_i64(&w, rows[i].price_nano);
+        jsonw_end_obj(&w);
+        i = i + 1;
+    }
+    jsonw_end_arr(&w);
+    jsonw_end_obj(&w);
+    srv_mcp_send_jsonw(c, id, &w);
+}
+
+// ---------------- tools/call 入口 ----------------
+
+fn srv_mcp_admin_call(c: &SrvConn, stats: &ServeStats, d: &JsonDoc,
+    args: i32, name: &[const byte], id: i64) void {
+    if srv_mcp_eq(name, "pricing_get") {
+        srv_mcp_admin_pricing(c, stats, d, args, id);
+        return;
+    }
+    if srv_mcp_eq(name, "billing_query") {
+        srv_mcp_req_reset(c, true);
+        if !srv_mcp_path_base("/admin/billing?") {
+            srv_mcp_bad(c, id);
+            return;
+        }
+        if srv_mcp_has(d, args, "user_id") &&
+            !srv_mcp_q_i64("user_id", srv_mcp_arg_i64(d, args, "user_id")) {
+            srv_mcp_bad(c, id);
+            return;
+        }
+        if srv_mcp_has(d, args, "from_day") &&
+            !srv_mcp_q_i64("from_day", srv_mcp_arg_i64(d, args, "from_day")) {
+            srv_mcp_bad(c, id);
+            return;
+        }
+        if srv_mcp_has(d, args, "to_day") &&
+            !srv_mcp_q_i64("to_day", srv_mcp_arg_i64(d, args, "to_day")) {
+            srv_mcp_bad(c, id);
+            return;
+        }
+        srv_mcp_call_prepared(c, stats, id, SRV_MCP_OP_ADMIN_BILLING);
+        return;
+    }
+    if srv_mcp_eq(name, "backup_status") {
+        srv_mcp_call_simple(c, stats, id, "/admin/backup", SRV_MCP_OP_ADMIN_BACKUP);
+        return;
+    }
+    if srv_mcp_eq(name, "admin_health") {
+        srv_mcp_call_simple(c, stats, id, "/admin/health", SRV_MCP_OP_ADMIN_HEALTH);
+        return;
+    }
+    if srv_mcp_eq(name, "admin_users") {
+        srv_mcp_call_simple(c, stats, id, "/admin/users", SRV_MCP_OP_ADMIN_USERS);
+        return;
+    }
+    if srv_mcp_eq(name, "admin_providers") {
+        srv_mcp_call_simple(c, stats, id, "/admin/providers", SRV_MCP_OP_ADMIN_PROVIDERS);
+        return;
+    }
+    if srv_mcp_eq(name, "admin_models") {
+        srv_mcp_call_simple(c, stats, id, "/admin/models", SRV_MCP_OP_ADMIN_MODELS);
+        return;
+    }
+    if srv_mcp_eq(name, "admin_bind") {
+        srv_mcp_admin_bind(c, stats, d, args, id);
+        return;
+    }
+    if srv_mcp_eq(name, "admin_pricing_create") {
+        srv_mcp_admin_pricing_create(c, stats, d, args, id);
+        return;
+    }
+    if srv_mcp_eq(name, "admin_price_entries_get") {
+        srv_mcp_call_simple(c, stats, id, "/admin/price-entries",
+            SRV_MCP_OP_ADMIN_PRICES);
+        return;
+    }
+    if srv_mcp_eq(name, "admin_price_entries_put") {
+        srv_mcp_admin_price_put(c, stats, d, args, id);
+        return;
+    }
+    if srv_mcp_eq(name, "admin_audit") {
+        srv_mcp_call_simple(c, stats, id, "/admin/audit", SRV_MCP_OP_ADMIN_AUDIT);
+        return;
+    }
+    srv_mcp_send_error(c, id, -32602, "unknown tool");
+}
+
+fn srv_mcp_user_call(c: &SrvConn, stats: &ServeStats, d: &JsonDoc,
+    args: i32, name: &[const byte], id: i64, uid: i64) void {
+    if srv_mcp_has_prefix(name, "admin_") {
+        srv_mcp_send_error(c, id, -32001, "permission denied");
+        return;
+    }
+    if srv_mcp_eq(name, "pricing_get") {
+        srv_mcp_user_pricing(c, d, args, id, uid);
+        return;
+    }
+    if srv_mcp_eq(name, "billing_query") {
+        srv_mcp_user_billing(c, d, args, id, uid);
+        return;
+    }
+    if srv_mcp_eq(name, "me") {
+        srv_mcp_call_simple(c, stats, id, "/v1/me", SRV_MCP_OP_ME);
+        return;
+    }
+    if srv_mcp_eq(name, "models_list") {
+        srv_mcp_call_simple(c, stats, id, "/v1/models", SRV_MCP_OP_MODELS);
+        return;
+    }
+    if srv_mcp_eq(name, "usage_get") {
+        srv_mcp_req_reset(c, true);
+        if !srv_mcp_path_base("/v1/usage?") {
+            srv_mcp_bad(c, id);
+            return;
+        }
+        if srv_mcp_has(d, args, "from_day") {
+            const v: i64 = srv_mcp_arg_i64(d, args, "from_day");
+            if v < 0 || !srv_mcp_q_i64("from_day", v) {
+                srv_mcp_bad(c, id);
+                return;
+            }
+        }
+        if srv_mcp_has(d, args, "to_day") {
+            const v: i64 = srv_mcp_arg_i64(d, args, "to_day");
+            if v < 0 || !srv_mcp_q_i64("to_day", v) {
+                srv_mcp_bad(c, id);
+                return;
+            }
+        }
+        srv_mcp_call_prepared(c, stats, id, SRV_MCP_OP_USAGE);
+        return;
+    }
+    if srv_mcp_eq(name, "requests_list") {
+        var rid: [byte: 128] = [0: 128];
+        const rn: usize = srv_mcp_arg_str(d, args, "id", &rid[0], 128);
+        srv_mcp_req_reset(c, true);
+        if !srv_mcp_path_base("/v1/requests?") {
+            srv_mcp_bad(c, id);
+            return;
+        }
+        if rn > 0 && !srv_mcp_q_str("id", rid[0: rn]) {
+            srv_mcp_bad(c, id);
+            return;
+        }
+        if srv_mcp_has(d, args, "limit") {
+            const v: i64 = srv_mcp_arg_i64(d, args, "limit");
+            if v < 0 || !srv_mcp_q_i64("limit", v) {
+                srv_mcp_bad(c, id);
+                return;
+            }
+        }
+        if srv_mcp_has(d, args, "offset") {
+            const v: i64 = srv_mcp_arg_i64(d, args, "offset");
+            if v < 0 || !srv_mcp_q_i64("offset", v) {
+                srv_mcp_bad(c, id);
+                return;
+            }
+        }
+        srv_mcp_call_prepared(c, stats, id, SRV_MCP_OP_REQUESTS);
+        return;
+    }
+    if srv_mcp_eq(name, "estimate_get") {
+        var bw: JsonW = JsonW{};
+        jsonw_init(&bw);
+        jsonw_obj(&bw);
+        srv_mcp_body_str(d, args, &bw, "model", 128);
+        srv_mcp_body_str(d, args, &bw, "provider", 128);
+        srv_mcp_body_i64(d, args, &bw, "prompt_tokens");
+        srv_mcp_body_i64(d, args, &bw, "completion_tokens");
+        srv_mcp_body_i64(d, args, &bw, "cached_tokens");
+        jsonw_end_obj(&bw);
+        srv_mcp_req_reset(c, false);
+        if !srv_mcp_path_base("/v1/estimate") || !srv_mcp_set_body(&bw) {
+            srv_mcp_bad(c, id);
+            return;
+        }
+        srv_mcp_call_prepared(c, stats, id, SRV_MCP_OP_ESTIMATE);
+        return;
+    }
+    if srv_mcp_eq(name, "budget_get") {
+        srv_mcp_call_simple(c, stats, id, "/v1/budget", SRV_MCP_OP_BUDGET);
+        return;
+    }
+    if srv_mcp_eq(name, "budget_set") {
+        if !srv_mcp_has(d, args, "monthly_nano") {
+            srv_mcp_send_error(c, id, -32602, "monthly_nano required");
+            return;
+        }
+        const v: i64 = srv_mcp_arg_i64(d, args, "monthly_nano");
+        if v < 0 {
+            srv_mcp_bad(c, id);
+            return;
+        }
+        var bw: JsonW = JsonW{};
+        jsonw_init(&bw);
+        jsonw_obj(&bw);
+        srv_mcp_key(&bw, "monthly_nano");
+        jsonw_i64(&bw, v);
+        jsonw_end_obj(&bw);
+        srv_mcp_req_reset(c, false);
+        if !srv_mcp_path_base("/v1/budget") || !srv_mcp_set_body(&bw) {
+            srv_mcp_bad(c, id);
+            return;
+        }
+        srv_mcp_call_prepared(c, stats, id, SRV_MCP_OP_BUDGET);
+        return;
+    }
+    if srv_mcp_eq(name, "keys_list") {
+        srv_mcp_call_simple(c, stats, id, "/v1/keys", SRV_MCP_OP_KEYS);
+        return;
+    }
+    if srv_mcp_eq(name, "keys_create") {
+        var nm: [byte: 64] = [0: 64];
+        const nn: usize = srv_mcp_arg_str(d, args, "name", &nm[0], 64);
+        var bw: JsonW = JsonW{};
+        jsonw_init(&bw);
+        jsonw_obj(&bw);
+        if nn > 0 {
+            srv_mcp_key(&bw, "name");
+            srv_mcp_str(&bw, nm[0: nn]);
+        }
+        jsonw_end_obj(&bw);
+        srv_mcp_req_reset(c, false);
+        if !srv_mcp_path_base("/v1/keys") || !srv_mcp_set_body(&bw) {
+            srv_mcp_bad(c, id);
+            return;
+        }
+        srv_mcp_call_prepared(c, stats, id, SRV_MCP_OP_KEYS);
+        return;
+    }
+    if srv_mcp_eq(name, "keys_revoke") {
+        const kid: i64 = srv_mcp_arg_i64(d, args, "key_id");
+        if kid <= 0 {
+            srv_mcp_send_error(c, id, -32602, "key_id required");
+            return;
+        }
+        var bw: JsonW = JsonW{};
+        jsonw_init(&bw);
+        jsonw_obj(&bw);
+        srv_mcp_key(&bw, "key_id");
+        jsonw_i64(&bw, kid);
+        jsonw_end_obj(&bw);
+        srv_mcp_req_reset(c, false);
+        if !srv_mcp_path_base("/v1/keys/revoke") || !srv_mcp_set_body(&bw) {
+            srv_mcp_bad(c, id);
+            return;
+        }
+        srv_mcp_call_prepared(c, stats, id, SRV_MCP_OP_KEY_REVOKE);
+        return;
+    }
+    if srv_mcp_eq(name, "notifications_list") {
+        srv_mcp_call_simple(c, stats, id, "/v1/notifications",
+            SRV_MCP_OP_NOTIFICATIONS);
+        return;
+    }
+    srv_mcp_send_error(c, id, -32602, "unknown tool");
+}
+
+fn srv_mcp_tools_call(c: &SrvConn, stats: &ServeStats, d: &JsonDoc,
+    id: i64, role: i32, uid: i64) void {
+    const root: i32 = json_root(d);
+    const params: i32 = json_get(d, root, &"params"[0: 6]);
+    if params < 0 {
+        srv_mcp_bad(c, id);
+        return;
+    }
+    var name: [byte: 64] = [0: 64];
+    const nn: usize = json_str(d, json_get(d, params, &"name"[0: 4]),
+        &name[0], 64);
+    if nn == 0 {
+        srv_mcp_bad(c, id);
+        return;
+    }
+    const args: i32 = json_get(d, params, &"arguments"[0: 9]);
+    if role == SRV_MCP_ADMIN {
+        srv_mcp_admin_call(c, stats, d, args, name[0: nn], id);
+        return;
+    }
+    if role == SRV_MCP_USER {
+        srv_mcp_user_call(c, stats, d, args, name[0: nn], id, uid);
+        return;
+    }
+    srv_mcp_send_error(c, id, -32001, "unauthorized");
+}
+
+// ---------------- tools/list ----------------
+
+fn srv_mcp_tool(w: &JsonW, name: &[const byte], desc: &[const byte],
+    schema: &[const byte]) void {
+    jsonw_obj(w);
+    srv_mcp_key(w, "name");
+    srv_mcp_str(w, name);
+    srv_mcp_key(w, "description");
+    srv_mcp_str(w, desc);
+    srv_mcp_key(w, "inputSchema");
+    jsonw_sep(w);
+    jsonw_raw(w, schema[0: schema.len]);
+    jsonw_end_obj(w);
+}
+
+fn srv_mcp_tools_list(c: &SrvConn, id: i64, role: i32) void {
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    srv_mcp_key(&w, "jsonrpc");
+    srv_mcp_str(&w, "2.0");
+    srv_mcp_key(&w, "id");
+    jsonw_i64(&w, id);
+    srv_mcp_key(&w, "result");
+    jsonw_obj(&w);
+    srv_mcp_key(&w, "tools");
+    jsonw_arr(&w);
+    if role == SRV_MCP_ADMIN {
+        srv_mcp_tool(&w, "pricing_get",
+            "Query effective model rates. Admin key returns sell + cost.",
+            "{\"type\":\"object\",\"properties\":{\"model\":{\"type\":\"string\"},\"provider\":{\"type\":\"string\"},\"user_id\":{\"type\":\"integer\"},\"ts\":{\"type\":\"integer\"}},\"required\":[\"model\"]}");
+        srv_mcp_tool(&w, "billing_query",
+            "Query usage rollup. user_id=0 means all users.",
+            "{\"type\":\"object\",\"properties\":{\"user_id\":{\"type\":\"integer\"},\"from_day\":{\"type\":\"integer\"},\"to_day\":{\"type\":\"integer\"}}}");
+        srv_mcp_tool(&w, "backup_status",
+            "Backup status: last backup day and retention.",
+            "{\"type\":\"object\",\"properties\":{}}");
+        srv_mcp_tool(&w, "admin_health",
+            "Admin: schema version, entity counts, last backup day.",
+            "{\"type\":\"object\",\"properties\":{}}");
+        srv_mcp_tool(&w, "admin_users",
+            "Admin: list users.",
+            "{\"type\":\"object\",\"properties\":{}}");
+        srv_mcp_tool(&w, "admin_providers",
+            "Admin: list providers.",
+            "{\"type\":\"object\",\"properties\":{}}");
+        srv_mcp_tool(&w, "admin_models",
+            "Admin: list provider model bindings.",
+            "{\"type\":\"object\",\"properties\":{}}");
+        srv_mcp_tool(&w, "admin_bind",
+            "Admin: bind a model to a provider.",
+            "{\"type\":\"object\",\"properties\":{\"provider\":{\"type\":\"string\"},\"model\":{\"type\":\"string\"},\"upstream_model\":{\"type\":\"string\"}},\"required\":[\"provider\",\"model\"]}");
+        srv_mcp_tool(&w, "admin_pricing_create",
+            "Admin: create a price card and add one entry.",
+            "{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"integer\"},\"version\":{\"type\":\"integer\"},\"effective_from\":{\"type\":\"integer\"},\"model\":{\"type\":\"string\"},\"provider\":{\"type\":\"string\"},\"schedule\":{\"type\":\"string\"},\"user_id\":{\"type\":\"integer\"},\"input_nano_per_mtok\":{\"type\":\"integer\"},\"output_nano_per_mtok\":{\"type\":\"integer\"},\"cache_read_nano_per_mtok\":{\"type\":\"integer\"},\"per_request_nano\":{\"type\":\"integer\"}},\"required\":[\"model\",\"version\"]}");
+        srv_mcp_tool(&w, "admin_price_entries_get",
+            "Admin: list entries of the current price card.",
+            "{\"type\":\"object\",\"properties\":{}}");
+        srv_mcp_tool(&w, "admin_price_entries_put",
+            "Admin: append an entry to the current price card.",
+            "{\"type\":\"object\",\"properties\":{\"model\":{\"type\":\"string\"},\"provider\":{\"type\":\"string\"},\"input\":{\"type\":\"integer\"},\"output\":{\"type\":\"integer\"},\"cache_read\":{\"type\":\"integer\"},\"per_request\":{\"type\":\"integer\"},\"schedule\":{\"type\":\"string\"}},\"required\":[\"model\"]}");
+        srv_mcp_tool(&w, "admin_audit",
+            "Admin: recent audit log (JSONL).",
+            "{\"type\":\"object\",\"properties\":{}}");
+    } else {
+        srv_mcp_tool(&w, "pricing_get",
+            "Query effective sell rates for a model (cost is admin-only).",
+            "{\"type\":\"object\",\"properties\":{\"model\":{\"type\":\"string\"},\"ts\":{\"type\":\"integer\"}},\"required\":[\"model\"]}");
+        srv_mcp_tool(&w, "billing_query",
+            "Query usage rollup for this API key's account.",
+            "{\"type\":\"object\",\"properties\":{\"from_day\":{\"type\":\"integer\"},\"to_day\":{\"type\":\"integer\"}}}");
+        srv_mcp_tool(&w, "me",
+            "Current user id for this API key.",
+            "{\"type\":\"object\",\"properties\":{}}");
+        srv_mcp_tool(&w, "models_list",
+            "List models available through the gateway.",
+            "{\"type\":\"object\",\"properties\":{}}");
+        srv_mcp_tool(&w, "usage_get",
+            "Usage rollup for this API key's account.",
+            "{\"type\":\"object\",\"properties\":{\"from_day\":{\"type\":\"integer\"},\"to_day\":{\"type\":\"integer\"}}}");
+        srv_mcp_tool(&w, "requests_list",
+            "List request ledger rows for this API key's account.",
+            "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"},\"offset\":{\"type\":\"integer\"}}}");
+        srv_mcp_tool(&w, "estimate_get",
+            "Estimate cost/price for token counts.",
+            "{\"type\":\"object\",\"properties\":{\"model\":{\"type\":\"string\"},\"provider\":{\"type\":\"string\"},\"prompt_tokens\":{\"type\":\"integer\"},\"completion_tokens\":{\"type\":\"integer\"},\"cached_tokens\":{\"type\":\"integer\"}}}");
+        srv_mcp_tool(&w, "budget_get",
+            "Read monthly budget and current month spend.",
+            "{\"type\":\"object\",\"properties\":{}}");
+        srv_mcp_tool(&w, "budget_set",
+            "Set monthly budget in nano-USD.",
+            "{\"type\":\"object\",\"properties\":{\"monthly_nano\":{\"type\":\"integer\"}},\"required\":[\"monthly_nano\"]}");
+        srv_mcp_tool(&w, "keys_list",
+            "List API keys for this account.",
+            "{\"type\":\"object\",\"properties\":{}}");
+        srv_mcp_tool(&w, "keys_create",
+            "Create an API key for this account (plaintext returned once).",
+            "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}}}");
+        srv_mcp_tool(&w, "keys_revoke",
+            "Revoke one of this account's API keys.",
+            "{\"type\":\"object\",\"properties\":{\"key_id\":{\"type\":\"integer\"}},\"required\":[\"key_id\"]}");
+        srv_mcp_tool(&w, "notifications_list",
+            "In-app notifications for this account (JSONL).",
+            "{\"type\":\"object\",\"properties\":{}}");
+    }
+    jsonw_end_arr(&w);
+    jsonw_end_obj(&w);
+    jsonw_end_obj(&w);
+    if !jsonw_ok(&w) {
+        srv_mcp_send_error(c, id, -32000, "tools list too large");
+        return;
+    }
+    srv_static(c, 200, jsonw_span(&w), c.keep);
+}
+
+fn srv_mcp_initialize(c: &SrvConn, id: i64) void {
+    var w: JsonW = JsonW{};
+    jsonw_init(&w);
+    jsonw_obj(&w);
+    srv_mcp_key(&w, "jsonrpc");
+    srv_mcp_str(&w, "2.0");
+    srv_mcp_key(&w, "id");
+    jsonw_i64(&w, id);
+    srv_mcp_key(&w, "result");
+    jsonw_obj(&w);
+    srv_mcp_key(&w, "protocolVersion");
+    srv_mcp_str(&w, "2024-11-05");
+    srv_mcp_key(&w, "capabilities");
+    jsonw_obj(&w);
+    srv_mcp_key(&w, "tools");
+    jsonw_obj(&w);
+    jsonw_end_obj(&w);
+    jsonw_end_obj(&w);
+    srv_mcp_key(&w, "serverInfo");
+    jsonw_obj(&w);
+    srv_mcp_key(&w, "name");
+    srv_mcp_str(&w, "aigw");
+    srv_mcp_key(&w, "version");
+    srv_mcp_str(&w, "0.1");
+    jsonw_end_obj(&w);
+    jsonw_end_obj(&w);
+    jsonw_end_obj(&w);
+    srv_static(c, 200, jsonw_span(&w), c.keep);
+}
+
 fn srv_mcp(c: &SrvConn, stats: &ServeStats) void {
     const keep: bool = c.keep;
     stats.requests = stats.requests +% 1;
@@ -4934,7 +6098,9 @@ fn srv_mcp(c: &SrvConn, stats: &ServeStats) void {
         srv_static(c, 503, SRV_JSON_503, keep);
         return;
     }
-    if !srv_admin_ok(c) {
+    var uid: i64 = 0;
+    const role: i32 = srv_mcp_principal(c, &uid);
+    if role == SRV_MCP_ANON {
         srv_static(c, 401, SRV_JSON_401, keep);
         return;
     }
@@ -4951,195 +6117,21 @@ fn srv_mcp(c: &SrvConn, stats: &ServeStats) void {
     const root: i32 = json_root(&d);
     const id: i64 = json_i64(&d, json_get(&d, root, &"id"[0: 2]));
     var method: [byte: 64] = [0: 64];
-    const mn: usize = json_str(&d, json_get(&d, root, &"method"[0: 6]), &method[0], 64);
-    var w: JsonW = JsonW{};
-    jsonw_init(&w);
-    jsonw_obj(&w);
-    jsonw_key(&w, &"jsonrpc"[0: 7]);
-    jsonw_str(&w, &"2.0"[0: 3]);
-    jsonw_key(&w, &"id"[0: 2]);
-    jsonw_i64(&w, id);
-    if srv_bytes_eq(method[0: mn], &"initialize"[0: 10]) {
-        jsonw_key(&w, &"result"[0: 6]);
-        jsonw_obj(&w);
-        jsonw_key(&w, &"protocolVersion"[0: 15]);
-        jsonw_str(&w, &"2024-11-05"[0: 10]);
-        jsonw_key(&w, &"capabilities"[0: 12]);
-        jsonw_obj(&w);
-        jsonw_key(&w, &"tools"[0: 5]);
-        jsonw_obj(&w);
-        jsonw_end_obj(&w);
-        jsonw_end_obj(&w);
-        jsonw_key(&w, &"serverInfo"[0: 10]);
-        jsonw_obj(&w);
-        jsonw_key(&w, &"name"[0: 4]);
-        jsonw_str(&w, &"aigw"[0: 4]);
-        jsonw_key(&w, &"version"[0: 7]);
-        jsonw_str(&w, &"0.1"[0: 3]);
-        jsonw_end_obj(&w);
-        jsonw_end_obj(&w);
-    } else if srv_bytes_eq(method[0: mn], &"tools/list"[0: 10]) {
-        jsonw_key(&w, &"result"[0: 6]);
-        jsonw_obj(&w);
-        jsonw_key(&w, &"tools"[0: 5]);
-        jsonw_arr(&w);
-        jsonw_obj(&w);
-        jsonw_key(&w, &"name"[0: 4]);
-        jsonw_str(&w, &"pricing_get"[0: 11]);
-        jsonw_key(&w, &"description"[0: 11]);
-        jsonw_str(&w, &"query sell/cost rates"[0: 21]);
-        jsonw_key(&w, &"inputSchema"[0: 11]);
-        jsonw_obj(&w);
-        jsonw_key(&w, &"type"[0: 4]);
-        jsonw_str(&w, &"object"[0: 6]);
-        jsonw_end_obj(&w);
-        jsonw_end_obj(&w);
-        jsonw_obj(&w);
-        jsonw_key(&w, &"name"[0: 4]);
-        jsonw_str(&w, &"billing_query"[0: 13]);
-        jsonw_key(&w, &"description"[0: 11]);
-        jsonw_str(&w, &"query usage rollup"[0: 18]);
-        jsonw_key(&w, &"inputSchema"[0: 11]);
-        jsonw_obj(&w);
-        jsonw_key(&w, &"type"[0: 4]);
-        jsonw_str(&w, &"object"[0: 6]);
-        jsonw_end_obj(&w);
-        jsonw_end_obj(&w);
-        jsonw_obj(&w);
-        jsonw_key(&w, &"name"[0: 4]);
-        jsonw_str(&w, &"backup_status"[0: 13]);
-        jsonw_key(&w, &"description"[0: 11]);
-        jsonw_str(&w, &"backup status"[0: 13]);
-        jsonw_key(&w, &"inputSchema"[0: 11]);
-        jsonw_obj(&w);
-        jsonw_key(&w, &"type"[0: 4]);
-        jsonw_str(&w, &"object"[0: 6]);
-        jsonw_end_obj(&w);
-        jsonw_end_obj(&w);
-        jsonw_end_arr(&w);
-        jsonw_end_obj(&w);
-    } else if srv_bytes_eq(method[0: mn], &"tools/call"[0: 10]) {
-        const params: i32 = json_get(&d, root, &"params"[0: 6]);
-        var name: [byte: 64] = [0: 64];
-        const nn: usize = json_str(&d, json_get(&d, params, &"name"[0: 4]), &name[0], 64);
-        const args: i32 = json_get(&d, params, &"arguments"[0: 9]);
-        var iw: JsonW = JsonW{};
-        jsonw_init(&iw);
-        var known: bool = true;
-        if srv_bytes_eq(name[0: nn], &"pricing_get"[0: 11]) {
-            var model: [byte: 128] = [0: 128];
-            const mlen: usize = json_str(&d, json_get(&d, args, &"model"[0: 5]), &model[0], 128);
-            var prov: [byte: 128] = [0: 128];
-            const plen: usize = json_str(&d, json_get(&d, args, &"provider"[0: 8]), &prov[0], 128);
-            var uid: i64 = json_i64(&d, json_get(&d, args, &"user_id"[0: 7]));
-            if uid < 0 {
-                uid = 0;
-            }
-            var ts: i64 = json_i64(&d, json_get(&d, args, &"ts"[0: 2]));
-            if ts <= 0 {
-                ts = store_now();
-            }
-            var sell: PriceRates = PriceRates{ input_nano_per_mtok: 0, output_nano_per_mtok: 0, cache_read_nano_per_mtok: 0, per_request_nano: 0, permille: 1000, card_id: 0, version: 0, found: false };
-            var cost: PriceRates = PriceRates{ input_nano_per_mtok: 0, output_nano_per_mtok: 0, cache_read_nano_per_mtok: 0, per_request_nano: 0, permille: 1000, card_id: 0, version: 0, found: false };
-            var no_prov: [byte: 1] = [0: 1];
-            price_lookup(runtime_db(), PRICE_KIND_SELL, model[0: mlen], no_prov[0: 0], uid, ts, 0, &sell) catch {
-                known = false;
-            };
-            if known {
-                price_lookup(runtime_db(), PRICE_KIND_COST, model[0: mlen], prov[0: plen], 0, ts, 0, &cost) catch {
-                    known = false;
-                };
-            }
-            if known {
-                jsonw_obj(&iw);
-                jsonw_key(&iw, &"model"[0: 5]);
-                jsonw_str(&iw, model[0: mlen]);
-                jsonw_key(&iw, &"ts"[0: 2]);
-                jsonw_i64(&iw, ts);
-                srv_rates_out(&iw, &"sell"[0: 4], &sell);
-                srv_rates_out(&iw, &"cost"[0: 4], &cost);
-                jsonw_end_obj(&iw);
-            }
-        } else if srv_bytes_eq(name[0: nn], &"billing_query"[0: 13]) {
-            var uid: i64 = json_i64(&d, json_get(&d, args, &"user_id"[0: 7]));
-            if uid < 0 {
-                uid = 0;
-            }
-            var from_day: i64 = json_i64(&d, json_get(&d, args, &"from_day"[0: 8]));
-            if from_day < 0 {
-                from_day = 0;
-            }
-            var to_day: i64 = json_i64(&d, json_get(&d, args, &"to_day"[0: 6]));
-            if to_day <= 0 {
-                to_day = 999999;
-            }
-            var rows: [RollupRow: 64] = [];
-            var rn: usize = 0;
-            rn = srv_rollup_query(uid, from_day, to_day, &rows[0], 64);
-            jsonw_obj(&iw);
-            jsonw_key(&iw, &"rows"[0: 4]);
-            jsonw_arr(&iw);
-            var i: usize = 0;
-            while i < rn {
-                jsonw_obj(&iw);
-                jsonw_key(&iw, &"day"[0: 3]);
-                jsonw_i64(&iw, rows[i].day);
-                jsonw_key(&iw, &"model"[0: 5]);
-                jsonw_str(&iw, rows[i].model[0: rows[i].model_len]);
-                jsonw_key(&iw, &"requests"[0: 8]);
-                jsonw_i64(&iw, rows[i].requests);
-                jsonw_key(&iw, &"cost_nano"[0: 9]);
-                jsonw_i64(&iw, rows[i].cost_nano);
-                jsonw_key(&iw, &"price_nano"[0: 10]);
-                jsonw_i64(&iw, rows[i].price_nano);
-                jsonw_end_obj(&iw);
-                i = i + 1;
-            }
-            jsonw_end_arr(&iw);
-            jsonw_end_obj(&iw);
-        } else if srv_bytes_eq(name[0: nn], &"backup_status"[0: 13]) {
-            jsonw_obj(&iw);
-            jsonw_key(&iw, &"ok"[0: 2]);
-            jsonw_bool(&iw, true);
-            jsonw_key(&iw, &"last_backup_day"[0: 15]);
-            jsonw_i64(&iw, runtime_last_backup_day());
-            jsonw_end_obj(&iw);
-        } else {
-            known = false;
-        }
-        if !known {
-            jsonw_key(&w, &"error"[0: 5]);
-            jsonw_obj(&w);
-            jsonw_key(&w, &"code"[0: 4]);
-            jsonw_i64(&w, 0 - 32602);
-            jsonw_key(&w, &"message"[0: 7]);
-            jsonw_str(&w, &"invalid params"[0: 14]);
-            jsonw_end_obj(&w);
-        } else {
-            jsonw_key(&w, &"result"[0: 6]);
-            jsonw_obj(&w);
-            jsonw_key(&w, &"content"[0: 7]);
-            jsonw_arr(&w);
-            jsonw_obj(&w);
-            jsonw_key(&w, &"type"[0: 4]);
-            jsonw_str(&w, &"text"[0: 4]);
-            jsonw_key(&w, &"text"[0: 4]);
-            jsonw_str(&w, jsonw_span(&iw));
-            jsonw_end_obj(&w);
-            jsonw_end_arr(&w);
-            jsonw_end_obj(&w);
-        }
-    } else {
-        jsonw_key(&w, &"error"[0: 5]);
-        jsonw_obj(&w);
-        jsonw_key(&w, &"code"[0: 4]);
-        jsonw_i64(&w, 0 - 32601);
-        jsonw_key(&w, &"message"[0: 7]);
-        jsonw_str(&w, &"method not found"[0: 16]);
-        jsonw_end_obj(&w);
+    const mn: usize = json_str(&d, json_get(&d, root, &"method"[0: 6]),
+        &method[0], 64);
+    if srv_mcp_eq(method[0: mn], "initialize") {
+        srv_mcp_initialize(c, id);
+        return;
     }
-    jsonw_end_obj(&w);
-    srv_static(c, 200, jsonw_span(&w), keep);
+    if srv_mcp_eq(method[0: mn], "tools/list") {
+        srv_mcp_tools_list(c, id, role);
+        return;
+    }
+    if srv_mcp_eq(method[0: mn], "tools/call") {
+        srv_mcp_tools_call(c, stats, &d, id, role, uid);
+        return;
+    }
+    srv_mcp_send_error(c, id, -32601, "method not found");
 }
 
 // A5：responses 流式事件（response.created / output_text.delta / completed）

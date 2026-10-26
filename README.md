@@ -511,7 +511,25 @@ drain 迁移、ingest 幂等 + 区间重算、本地 spool 重放。拓扑、启
 | GET | `/admin/backup` | `last_backup_day`、`keep`（每日自动备份，保留 7 天） |
 | GET | `/admin/audit` | 最近的 `audit.jsonl` 记录 |
 | GET | `/admin`、`/ui/app.js`、`/ui/admin.js` | 管理后台静态页（CSP/安全头已开） |
-| POST | `/mcp` | JSON-RPC：`initialize`、`tools/list`、`tools/call`（`pricing_get`、`billing_query`、`backup_status`） |
+| POST | `/mcp` | JSON-RPC over HTTP：`initialize`、`tools/list`、`tools/call`；凭据决定工具集（见 §7.1） |
+
+### 7.1 MCP（`POST /mcp`）
+
+无状态 JSON-RPC：一次 POST 一条请求，`Authorization: Bearer <key>`。
+同一端点按凭据分权：
+
+| 凭据 | 角色 | 可用工具 |
+|---|---|---|
+| `--admin-key` | 管理员 | `pricing_get` / `billing_query`（可查任意 `user_id`）、`backup_status`、`admin_health`、`admin_users`、`admin_providers`、`admin_models`、`admin_bind`、`admin_pricing_create`、`admin_price_entries_get`、`admin_price_entries_put`、`admin_audit` |
+| 普通 API Key（`aigw_sk_...`） | 账号自助 | `pricing_get`（仅卖价）、`billing_query` / `usage_get` / `requests_list`（强制本账号）、`me`、`models_list`、`estimate_get`、`budget_get` / `budget_set`、`keys_list` / `keys_create` / `keys_revoke`、`notifications_list`；调用任何 `admin_*` 返回 `-32001 permission denied` |
+
+接入 Claude Code：
+
+```sh
+claude mcp add --transport http aigw http://127.0.0.1:8080/mcp \
+  --header "Authorization: Bearer <admin-key 或 API Key>"
+```
+
 
 ### 集群内部接口
 

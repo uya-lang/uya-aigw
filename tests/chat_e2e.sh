@@ -263,16 +263,59 @@ echo "$AK" | grep -q '"ok":true' || { echo "$AK" >&2; fail "admin backup"; }
 AN=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$BASE/admin/health")
 [ "$AN" = "401" ] || fail "admin without key expected 401, got $AN"
 
-# 4e) A7 MCP：initialize / tools/list / tools/call
+# 4e) A7 MCP：initialize / tools/list / tools/call + A7b 角色隔离
 M0=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer test-admin' \
   --data '{"jsonrpc":"2.0","id":1,"method":"initialize"}' "$BASE/mcp")
 echo "$M0" | grep -q '"protocolVersion"' || { echo "$M0" >&2; fail "mcp initialize"; }
 MT=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer test-admin' \
   --data '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' "$BASE/mcp")
 echo "$MT" | grep -q '"pricing_get"' || { echo "$MT" >&2; fail "mcp tools/list"; }
+echo "$MT" | grep -q '"admin_health"' || { echo "$MT" >&2; fail "mcp admin tools/list"; }
 MC=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer test-admin' \
   --data '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"backup_status","arguments":{}}}' "$BASE/mcp")
 echo "$MC" | grep -q 'last_backup_day' || { echo "$MC" >&2; fail "mcp tools/call"; }
+MAH=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer test-admin' \
+  --data '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"admin_health","arguments":{}}}' "$BASE/mcp")
+echo "$MAH" | grep -q 'schema' || { echo "$MAH" >&2; fail "mcp admin_health"; }
+MAP=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer test-admin' \
+  --data '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"pricing_get","arguments":{"model":"mock-model","provider":"mock","ts":1700000000}}}' "$BASE/mcp")
+echo "$MAP" | grep -q '\\"sell\\"' || { echo "$MAP" >&2; fail "mcp admin pricing sell"; }
+echo "$MAP" | grep -q '\\"cost\\"' || { echo "$MAP" >&2; fail "mcp admin pricing cost"; }
+MAB=$(curl -s --max-time 5 -X POST -H 'Authorization: Bearer test-admin' \
+  --data '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"billing_query","arguments":{"user_id":0,"from_day":0,"to_day":999999}}}' "$BASE/mcp")
+MABJ=$(printf '%s' "$MAB" | sed 's/\\"/"/g')
+echo "$MABJ" | grep -q '"model":"mock-model"' || { echo "$MAB" >&2; fail "mcp admin billing"; }
+
+# 普通 API Key：tools/list 不含 admin_*，只能操作自己账号
+MUT=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $TOKEN" \
+  --data '{"jsonrpc":"2.0","id":10,"method":"tools/list"}' "$BASE/mcp")
+echo "$MUT" | grep -q '"keys_list"' || { echo "$MUT" >&2; fail "mcp user tools/list"; }
+if echo "$MUT" | grep -q '"admin_'; then echo "$MUT" >&2; fail "mcp user tools/list leaked admin"; fi
+MUM=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $TOKEN" \
+  --data '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"me","arguments":{}}}' "$BASE/mcp")
+echo "$MUM" | grep -q 'user_id' || { echo "$MUM" >&2; fail "mcp user me"; }
+MUD=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $TOKEN" \
+  --data '{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"admin_health","arguments":{}}}' "$BASE/mcp")
+echo "$MUD" | grep -q 'permission denied' || { echo "$MUD" >&2; fail "mcp user admin denied"; }
+echo "$MUD" | grep -q -- '-32001' || { echo "$MUD" >&2; fail "mcp user admin deny code"; }
+MUP=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $TOKEN" \
+  --data '{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"pricing_get","arguments":{"model":"mock-model"}}}' "$BASE/mcp")
+MUPJ=$(printf '%s' "$MUP" | sed 's/\\"/"/g')
+echo "$MUPJ" | grep -q '"sell"' || { echo "$MUP" >&2; fail "mcp user pricing sell"; }
+if echo "$MUPJ" | grep -q '"cost"'; then echo "$MUP" >&2; fail "mcp user pricing leaked cost"; fi
+# user_id 参数必须被忽略：传别人的 id 仍只返回自己的用量
+MUB=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $TOKEN" \
+  --data '{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"billing_query","arguments":{"user_id":999,"from_day":0,"to_day":999999}}}' "$BASE/mcp")
+MUBJ=$(printf '%s' "$MUB" | sed 's/\\"/"/g')
+echo "$MUBJ" | grep -q '"model":"mock-model"' || { echo "$MUB" >&2; fail "mcp user billing self scope"; }
+echo "$MUBJ" | grep -q '"requests":6' || { echo "$MUB" >&2; fail "mcp user billing own rows"; }
+MUU=$(curl -s --max-time 5 -X POST -H "Authorization: Bearer $TOKEN" \
+  --data '{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"usage_get","arguments":{}}}' "$BASE/mcp")
+MUUJ=$(printf '%s' "$MUU" | sed 's/\\"/"/g')
+echo "$MUUJ" | grep -q '"requests":6' || { echo "$MUU" >&2; fail "mcp user usage"; }
+MNA=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' -X POST \
+  --data '{"jsonrpc":"2.0","id":16,"method":"initialize"}' "$BASE/mcp")
+[ "$MNA" = "401" ] || fail "mcp without auth expected 401, got $MNA"
 
 # 4f) B1 controller：注册/心跳/配置/状态
 CR=$(curl -s --max-time 5 -X POST --data '{"id":"node-b","role":"edge","addr":"127.0.0.1:1"}' "$BASE/controller/register")
