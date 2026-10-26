@@ -481,6 +481,35 @@ drain 迁移、ingest 幂等 + 区间重算、本地 spool 重放。拓扑、启
 | 结算积压 | 结算先入队，事件循环每 200ms / 512 行批量落库；`/admin/billing` 查前会先 flush |
 | 优雅停机 | `SIGTERM`/`SIGINT`：摘监听 → 收尾在途连接 → flush 批量队列 → 关闭插件池 |
 
+### 8.1 性能基线（单机实测）
+
+44 核容器，客户端与网关同机（`ab` 与服务端抢 CPU，数值偏保守）：
+
+| 场景 | 吞吐 | 尾延迟 |
+|---|---|---|
+| `GET /healthz` keep-alive，1 进程 | 95k–101k rps | p99 1 ms |
+| `GET /healthz` 短连接（每请求一次握手），1 进程 | ≈16k rps | p99 3–5 ms |
+| `GET /v1/models`（Key 校验 + 库查询 + 模型 JSON），keep-alive，1 进程 | ≈22k rps | p99 1 ms |
+| `GET /healthz` keep-alive，4 进程（`SO_REUSEPORT`） | ≈376k rps（3.9×） | — |
+| `GET /v1/models` keep-alive，4 进程 | ≈87k rps（4×） | p99 1 ms |
+| `POST /v1/chat/completions` 非流式，上游 opencode，8 并发 | 3.0 rps | p50 2.2 s |
+| `POST /v1/chat/completions` 流式，8 并发 | 1.7 rps | TTFT p50 4.0 s |
+| `POST /v1/responses` 非流式 / 流式，8 并发 | 3.7 / 1.6 rps | p50 2.0 s / TTFT 4.0 s |
+
+复现：`ab -n 100000 -c 50 -k http://127.0.0.1:PORT/healthz`（静态接口务必开 keep-alive）。
+
+怎么读这张表：
+
+- `/healthz` 是无依赖的“空转基线”——只做「读请求头 → 路由匹配 → 写固定 200」，不碰库和上游，
+  所以 ~10 µs/请求 ≈ 单核事件循环的每请求成本，也是任何单进程接口的吞吐上限。
+- 短连接只有 16k rps，差距全在 `accept` + 握手 + 关闭（~60 µs/连接）。探针与压测客户端都应
+  复用连接；K8s 探针、LB 后端健康检查同理。
+- 协程化（E2–E4c）对静态路由**没有回归**：`AIGW_ASYNC_OFF=1` 与默认各测 3 轮，分别
+  92k–99k 与 93k–101k rps，落在同一噪声区间（±5%）。
+- 静态接口可线性水平扩展（1→4 进程 ≈3.9×，`--port` 相同即可让内核分担连接）；但**上游变慢时
+  加进程没用**：chat/responses 的墙钟由上游决定，网关自身 CPU <1%。协程化的收益体现在并发
+  不再互相排队——同样 8 并发 × 16 请求，墙钟从 25 s 降到 5.4 s。
+
 ---
 
 ## 9. 开发与测试
