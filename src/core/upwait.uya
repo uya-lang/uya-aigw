@@ -22,7 +22,11 @@ fn wait_i32_busy(f: Future<!i32>) !i32 {
         w.clear_io_interest();
         const p: Poll<!i32> = f.poll(&w);
         match p {
-            .Ready(v) => { return v; },
+            .Ready(v) => {
+                // 手动 poll 到 Ready 后必须还帧，否则整条 future 链泄漏。
+                f.release();
+                return v;
+            },
             .Pending(_) => {},
         };
     }
@@ -41,7 +45,11 @@ export fn wait_i32(f: Future<!i32>) !i32 {
         w.clear_io_interest();
         const p: Poll<!i32> = f.poll(&w);
         match p {
-            .Ready(v) => { return v; },
+            .Ready(v) => {
+                // 手动 poll 到 Ready 后必须还帧，否则整条 future 链泄漏。
+                f.release();
+                return v;
+            },
             .Pending(_) => {},
         };
         // 把本轮 poll 登记的 fd 兴趣转成 epoll 注册（最多 4 槽）。

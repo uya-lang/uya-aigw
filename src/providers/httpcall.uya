@@ -528,10 +528,12 @@ export @async_fn fn htc_open_async(cfg: &const HttppConfig, ctx: &HtcCtx,
         var addrs: DnsxAddrs = DnsxAddrs{};
         var fd: i32 = 0;
         if via_proxy {
-            const pdns: Future<!i32> = dnsx_resolve_async(
+            // 直接 `@await <调用>`：不要先存进 `Future` 局部变量再 await。
+            // 这版编译器会为 `const f: Future = call(); @await f` 生成**两次** call()，
+            // 存局部的那份帧没人 release（valgrind 实测每次请求泄漏一条链路）。
+            const pdr: !i32 = @await dnsx_resolve_async(
                 &ctx.proxy.host[0: ctx.proxy.host_len], &ctx.cache,
                 &ctx.resolv[0: ctx.resolv_len], now_ms, &addrs);
-            const pdr: !i32 = @await pdns;
             var prr: i32 = 0;
             prr = pdr catch |_| {
                 return error.HtcNoAddress;
@@ -557,9 +559,8 @@ export @async_fn fn htc_open_async(cfg: &const HttppConfig, ctx: &HtcCtx,
                 return error.HtcConnectFailed;
             }
         } else {
-            const dnsf: Future<!i32> = dnsx_resolve_async(&cfg.host[0: cfg.host_len],
+            const dnsr: !i32 = @await dnsx_resolve_async(&cfg.host[0: cfg.host_len],
                 &ctx.cache, &ctx.resolv[0: ctx.resolv_len], now_ms, &addrs);
-            const dnsr: !i32 = @await dnsf;
             var rr: i32 = 0;
             rr = dnsr catch |_| {
                 return error.HtcNoAddress;
@@ -569,10 +570,9 @@ export @async_fn fn htc_open_async(cfg: &const HttppConfig, ctx: &HtcCtx,
             }
             fd = try @await tcpx_connect_v4_async(&addrs.v4[0], cfg.port, deadline);
         }
-        const tf: Future<!i32> = tlsx_conn_open_async(fd, &cfg.host[0: cfg.host_len],
+        const tr: !i32 = @await tlsx_conn_open_async(fd, &cfg.host[0: cfg.host_len],
             ctx.mode, &ctx.pins[0], ctx.pin_count, &ctx.bundle[0], ctx.bundle_len,
             &ctx.tofu, ctx.allow_learn, now_ms, &call.conn);
-        const tr: !i32 = @await tf;
         var orr: i32 = 0;
         orr = tr catch |_| {
             return error.HtcConnectFailed;
@@ -592,8 +592,7 @@ export @async_fn fn htc_open_async(cfg: &const HttppConfig, ctx: &HtcCtx,
         pptr, plen, stream, &req) {
         return error.HtcBadResponse;
     }
-    const wf: Future<!usize> = tlsx_write_async(&call.conn, req.ptr as &const byte, req.len);
-    const wr: !usize = @await wf;
+    const wr: !usize = @await tlsx_write_async(&call.conn, req.ptr as &const byte, req.len);
     var wfail: bool = false;
     var w: usize = 0;
     w = wr catch |_| {

@@ -81,10 +81,80 @@ export fn tlsx_conn_free(c: &TlsxConn) void {
 const TLSX_HS_SEND_MAX: usize = 32768;
 const TLSX_FLIGHT_MAX: usize = 65536;
 
+/// 裸 fd 读：SDK 的 `https_read_some_async` / `https_write_all_async` 用
+/// `async_box_alloc_current` 装箱，但它们的 `release()` 是空实现 —— 每 `@await`
+/// 一次就泄漏一个 box（valgrind 实测每个上游请求约 10 个、约 900 B）。
+/// 这里用「同步 syscall + std 的 wait future」自己实现，@async_fn 帧会被正常回收。
+@async_fn fn tlsx_raw_read_async(fd: i32, out: &byte, max: usize) Future<!usize> {
+    while true {
+        var blocked: bool = false;
+        var failed: bool = false;
+        var n: usize = 0;
+        const r: !usize = https_read_some(fd, out, max);
+        n = r catch |err| {
+            if @error_id(err) == @error_id(error.ReadWouldBlock) {
+                blocked = true;
+            } else {
+                failed = true;
+            }
+            0 as usize;
+        };
+        if failed {
+            return error.ConnectionClosed;
+        }
+        if blocked {
+            _ = try @await async_wait_readable(fd, 0 as u64);
+            continue;
+        }
+        return n;
+    }
+    return 0 as usize;
+}
+
+/// 裸 fd 写：语义与 SDK 的 `https_write_all_async` 一致（EINTR 重试、
+/// would-block 等可写），但帧归 @async_fn 回收，不会泄漏。
+@async_fn fn tlsx_raw_write_async(fd: i32, src: &const byte, len: usize) Future<!usize> {
+    var off: usize = 0;
+    while off < len {
+        const p: *const byte = @ptr_from_usize(@usize_from_ptr(src as &void) + off) as *const byte;
+        var blocked: bool = false;
+        var failed: bool = false;
+        var retry: bool = false;
+        var n: isize = 0;
+        const wr: !isize = sys_write(fd, p, len - off);
+        n = wr catch |err| {
+            const eid: i32 = @error_id(err) as i32;
+            if eid == EINTR {
+                retry = true;
+            } else if eid == EAGAIN || eid == EWOULDBLOCK {
+                blocked = true;
+            } else {
+                failed = true;
+            }
+            0 as isize;
+        };
+        if retry {
+            continue;
+        }
+        if failed {
+            return error.ConnectionClosed;
+        }
+        if blocked {
+            _ = try @await async_wait_writable(fd, 0 as u64);
+            continue;
+        }
+        if n <= 0 {
+            return error.ConnectionClosed;
+        }
+        off = off +% (n as usize);
+    }
+    return off;
+}
+
 @async_fn fn tlsx_read_exact_async(fd: i32, out: &byte, need: usize) Future<!bool> {
     var off: usize = 0;
     while off < need {
-        const n: usize = try @await https_read_some_async(fd, &out[off], need - off);
+        const n: usize = try @await tlsx_raw_read_async(fd, &out[off], need - off);
         if n == 0 {
             return false;
         }
@@ -159,7 +229,7 @@ fn tlsx_flight_done(flight: &const byte, len: usize) bool {
         return error.TlsxHandshakeFailed;
     }
     if slen > 0 {
-        const w: usize = try @await https_write_all_async(fd, &send[0], slen);
+        const w: usize = try @await tlsx_raw_write_async(fd, &send[0], slen);
         if w != slen {
             return error.TlsxHandshakeFailed;
         }
@@ -191,7 +261,7 @@ fn tlsx_flight_done(flight: &const byte, len: usize) bool {
         return error.TlsxHandshakeFailed;
     }
     if slen > 0 {
-        const w2: usize = try @await https_write_all_async(fd, &send[0], slen);
+        const w2: usize = try @await tlsx_raw_write_async(fd, &send[0], slen);
         if w2 != slen {
             return error.TlsxHandshakeFailed;
         }
@@ -487,7 +557,7 @@ export @async_fn fn tlsx_write_async(c: &TlsxConn, src: &const byte, n: usize) F
         ssl_write(c.ctx, &src[off], chunk, &cipher[0], TLSX_REC_MAX, &clen) catch |_| {
             return error.ConnectionClosed;
         };
-        const w: usize = try @await https_write_all_async(c.fd, &cipher[0], clen);
+        const w: usize = try @await tlsx_raw_write_async(c.fd, &cipher[0], clen);
         if w != clen {
             return error.ConnectionClosed;
         }

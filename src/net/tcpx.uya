@@ -90,6 +90,8 @@ export fn tcpx_connect_v4(ip: &const byte, port: u16, timeout_ms: u32) !i32 {
         deadline = now +% (timeout_ms as u64);
     }
     const fut: Future<!i32> = tcpx_connect_v4_async(ip, port, deadline);
+    // block_on 不会替调用方还帧：手动 poll 的 future 必须显式 release。
+    defer { fut.release(); }
     const fd: i32 = try block_on<i32>(fut);
     return fd;
 }

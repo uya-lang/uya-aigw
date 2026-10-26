@@ -113,10 +113,11 @@ const ROUTE_CTL_HEARTBEAT: i32 = 17;
 const ROUTE_CTL_CONFIG: i32 = 18;
 const ROUTE_CTL_STATUS: i32 = 19;
 
-/// 请求体内联缓冲：≤ 这个长度不分配堆内存。
-const SRV_BODY_INLINE: usize = 32768;
-/// 同时驻留的大请求体上限。每个大包独占一个堆缓冲，请求结束即还；这样即使
-/// 1024 条连接都声明了 `Content-Length: 8MiB`，内存也被 BSS 内联部分兜住。
+/// 请求体不再为每条连接预留内联缓冲：body 在首个字节到达时按需堆分配、
+/// 请求结束立即释放。跨过这个长度才计入「大包在途」名额，用于限制并发
+/// 大包的峰值内存（与旧版 >32 KiB 才升级堆缓冲的行为一致）。
+const SRV_BODY_BIG_AT: usize = 32768;
+/// 同时驻留的大请求体上限。大包各占一个堆缓冲，响应发完即还（不再等连接关闭）。
 const SRV_BIG_MAX: i32 = 32;
 
 /// 请求体上限（字节）。默认与 chat 的 `CHAT_BODY_MAX_DEFAULT` 一致，
@@ -183,12 +184,14 @@ struct SrvConn {
     auth_len: usize,
     path: [byte: 1024],
     path_len: usize,
-    body: [byte: SRV_BODY_INLINE],
-    body_len: usize,
-    /// 请求体超过内联缓冲时才有值（`len` 与 `body_len` 同步）。
+    // 请求体：首个字节到达时才分配，响应发完/连接关闭时释放。
+    // 内存按实际长度增长，因此这里不限制 body 总长度。
     body_big: Buf,
+    body_len: usize,
     /// 非 chunked 时已知的 Content-Length（给堆缓冲估容量）。
     body_hint: usize,
+    /// `body_len` 跨过 `SRV_BODY_BIG_AT` 后是否已占 `g_big_active` 名额。
+    body_counted: bool,
     body_overflow: bool,
     body_busy: bool,
     // 包体
@@ -1802,13 +1805,31 @@ fn srv_up_arm(j: i32) void {
     }
 }
 
+/// 手动驱动的 future 结束/丢弃时必须显式 release。
+///
+/// `@async_fn` 的帧从 async frame pool 借出，`@await` 会自动还帧；主循环里是手动
+/// `poll()`，编译器不会替我们收尾。漏了 release，顶层帧连同它 `await_fut` 挂着的
+/// 整条链（DNS → connect → TLS 握手 → 写请求）一起泄漏（valgrind 实测流式 chat
+/// 每请求约 140 KB）。连接中途断开（`srv_up_abort_ci`）时 future 还停在 Pending，
+/// 同样必须 release —— 不是"停止 poll 即可"。
+fn srv_up_fut_release(j: i32) void {
+    if j < 0 || (j as usize) >= (SRV_UP_MAX as usize) {
+        return;
+    }
+    const job: &SrvUpJob = &g_jobs[j as usize];
+    if job.has_fut {
+        job.fut.release();
+        job.has_fut = false;
+    }
+}
+
 fn srv_up_release(j: i32) void {
     if j < 0 || (j as usize) >= (SRV_UP_MAX as usize) {
         return;
     }
     const job: &SrvUpJob = &g_jobs[j as usize];
     srv_up_disarm(j);
-    job.has_fut = false;
+    srv_up_fut_release(j);
     job.used = false;
     htc_call_free(&job.call);
     chat_plan_free(&job.plan);
@@ -1853,8 +1874,8 @@ fn srv_up_alloc(ci: i32) i32 {
     return 0 - 1;
 }
 
-/// 连接关闭时中止它名下的在途请求（future 帧无法取消，停止 poll 即可，
-/// 至少保证不会往已复用的连接槽写响应）。
+/// 连接关闭时中止它名下的在途请求：release 在途 future，把帧归还 frame pool
+/// （连同它挂着的 DNS/握手链），既避免泄漏，也保证不会往已复用的连接槽写响应。
 fn srv_up_abort_ci(ci: i32) void {
     var j: i32 = 0;
     while j < SRV_UP_MAX {
@@ -1896,7 +1917,7 @@ fn srv_up_poll_one(j: i32, stats: &ServeStats) void {
         srv_up_arm(j);
         return;
     }
-    job.has_fut = false;
+    srv_up_fut_release(j);
     srv_up_disarm(j);
     srv_up_ready(j, is_err, err_id, rc, stats);
 }
@@ -2211,10 +2232,10 @@ fn srv_up_spawn(j: i32, stats: &ServeStats, drive: bool) void {
         return;
     }
     const c: &SrvConn = &g_conns[job.ci as usize];
+    srv_up_fut_release(j);
     htc_call_free(&job.call);
     htc_call_init(&job.call);
     job.phase = SRV_UP_PHASE_OPEN;
-    job.has_fut = false;
     job.armed = 0;
     job.rn = 0;
     job.st = 0;
@@ -2315,6 +2336,7 @@ fn srv_up_stream_next(j: i32, stats: &ServeStats) void {
         return;
     }
     const job: &SrvUpJob = &g_jobs[j as usize];
+    srv_up_fut_release(j);
     job.phase = SRV_UP_PHASE_EVENT;
     job.has_ev = false;
     job.has_fut = true;
@@ -2476,6 +2498,7 @@ fn srv_up_restream_next(j: i32, stats: &ServeStats) void {
         return;
     }
     const job: &SrvUpJob = &g_jobs[j as usize];
+    srv_up_fut_release(j);
     job.phase = SRV_UP_PHASE_EVENT;
     job.has_ev = false;
     job.has_fut = true;
@@ -3224,12 +3247,15 @@ fn srv_body_err_json(status: i32) &[byte] {
     return SRV_JSON_413;
 }
 
-/// 请求体基址：内联或堆缓冲（handler 只认 `srv_body_ptr`/`srv_body_slice`）。
+/// 空 body 的哨兵基址：`body_len == 0` 时 handler 仍可安全切片。
+var g_empty_body: [byte: 1] = [0: 1];
+
+/// 请求体基址：按需分配的堆缓冲（handler 只认 `srv_body_ptr`/`srv_body_slice`）。
 fn srv_body_ptr(c: &SrvConn) &const byte {
     if buf_valid(&c.body_big) {
         return c.body_big.ptr;
     }
-    return &c.body[0];
+    return &g_empty_body[0];
 }
 
 /// 请求体切片（长度 = `body_len`）。
@@ -3237,11 +3263,14 @@ fn srv_body_slice(c: &SrvConn) &[byte] {
     return srv_body_ptr(c)[0: c.body_len];
 }
 
-/// 归还请求体缓冲（新请求开始/连接关闭时调用；可重复）。
+/// 归还请求体缓冲（响应发完/新请求开始/连接关闭时调用；可重复）。
 fn srv_body_reset(c: &SrvConn) void {
     if buf_valid(&c.body_big) {
         buf_free(&c.body_big);
+    }
+    if c.body_counted {
         g_big_active = g_big_active -% 1;
+        c.body_counted = false;
     }
     c.body_len = 0;
     c.body_hint = 0;
@@ -3249,37 +3278,30 @@ fn srv_body_reset(c: &SrvConn) void {
     c.body_busy = false;
 }
 
-/// 内联 → 堆缓冲：非 chunked 按 Content-Length 一次分配到位，chunked 给 4×内联起跳。
-fn srv_body_upgrade(c: &SrvConn) bool {
-    if g_big_active >= SRV_BIG_MAX {
-        c.body_busy = true;
-        return false;
-    }
-    var cap: usize = SRV_BODY_INLINE * 4;
+/// 首个 body 字节到达时按需分配（不再为每条连接预留 32 KiB 内联缓冲，也就不会
+/// 出现「连接只收 1 字节也吃满一整段 BSS」）。容量先按 Content-Length 估，
+/// 单次最多先给 64 KiB，之后交给 buf_reserve 倍增；总长度仍由 `g_body_max`
+/// 决定，这里不加任何额外上限。
+fn srv_body_begin(c: &SrvConn) bool {
+    var cap: usize = 8192;
     if c.body_hint > cap {
         cap = c.body_hint;
+        if cap > 65536 {
+            cap = 65536;
+        }
     }
     if cap > g_body_max {
         cap = g_body_max;
     }
-    if cap < c.body_len {
-        cap = c.body_len;
+    if cap == 0 {
+        cap = 1;
     }
     var b: Buf = buf_new(cap);
     if !buf_valid(&b) {
         c.body_busy = true;
         return false;
     }
-    var i: usize = 0;
-    while i < c.body_len {
-        b.ptr[i] = c.body[i];
-        i = i + 1;
-    }
-    b.len = c.body_len;
-    c.body_big.ptr = b.ptr;
-    c.body_big.len = b.len;
-    c.body_big.cap = b.cap;
-    g_big_active = g_big_active +% 1;
+    c.body_big = b;
     return true;
 }
 
@@ -3290,13 +3312,24 @@ fn srv_body_put(c: &SrvConn, v: byte) bool {
         return false;
     }
     if !buf_valid(&c.body_big) {
-        if c.body_len < SRV_BODY_INLINE {
-            c.body[c.body_len] = v;
-            c.body_len = c.body_len + 1;
-            return true;
-        }
-        if !srv_body_upgrade(c) {
+        if !srv_body_begin(c) {
             return false;
+        }
+    }
+    // 跨过阈值时占「大包在途」名额；已知 Content-Length 则一次预留到位，
+    // 避免大包按倍增长时反复 realloc/拷贝。
+    if !c.body_counted && c.body_len >= SRV_BODY_BIG_AT {
+        if g_big_active >= SRV_BIG_MAX {
+            c.body_busy = true;
+            return false;
+        }
+        c.body_counted = true;
+        g_big_active = g_big_active +% 1;
+        if c.body_hint > c.body_len {
+            if !buf_reserve(&c.body_big, c.body_hint - c.body_len) {
+                c.body_busy = true;
+                return false;
+            }
         }
     }
     if c.body_big.cap <= c.body_len {
@@ -3312,7 +3345,7 @@ fn srv_body_put(c: &SrvConn, v: byte) bool {
 }
 
 /// 排空包体：1=排完，0=还要更多数据，-1=协议错误。
-/// 请求体统一采集（≤ 内联长度用连接内数组，更大走堆缓冲），超上限/槽满只排空。
+/// 请求体统一采集（按需堆缓冲），超上限/大包槽满只排空。
 fn srv_capture(c: &SrvConn, start: usize, take: usize) void {
     if c.body_overflow || c.body_busy {
         return;
@@ -3586,6 +3619,9 @@ fn srv_drive(c: &SrvConn, stats: &ServeStats) void {
             c.state = ST_HEAD;
             c.is_head_req = false;
             c.route = ROUTE_404;
+            // 响应已发完：立即归还 body 缓冲，keep-alive 空闲期不再占着请求体内存
+            // （也把「大包在途」名额尽早还回去，而不是拖到下一条请求或连接关闭）。
+            srv_body_reset(c);
             continue;
         }
         if c.state == ST_SSE {
